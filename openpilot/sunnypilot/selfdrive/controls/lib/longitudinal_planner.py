@@ -10,6 +10,7 @@ import time
 from openpilot.cereal import messaging, custom
 from opendbc.car import structs
 from openpilot.common.constants import CV
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
@@ -32,8 +33,9 @@ class LongitudinalPlannerSP:
     self.scc = SmartCruiseControl()
     self.resolver = SpeedLimitResolver()
     self.sla = SpeedLimitAssist(CP, CP_SP)
-    # Stop signs need openpilot to own the brakes; with the car's own cruise it stays off.
+    # Stop signs need openpilot to own the brakes; with the car's own cruise it stays off. The shadow copy only logs.
     self.stop_sign = StopSignAssist() if CP.openpilotLongitudinalControl else None
+    self.stop_sign_shadow = StopSignAssist(stop_map=self.stop_sign.map if self.stop_sign else None, shadow=True)
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
@@ -68,8 +70,15 @@ class LongitudinalPlannerSP:
                     self.resolver.speed_limit_final_last, has_speed_limit, self.resolver.distance, self.events_sp)
 
     # Stop Sign Assist (GPS fix times are wall-clock)
+    now_s = time.time()  # noqa: TID251
     if self.stop_sign is not None:
-      self.stop_sign.update(sm, long_enabled, long_override, v_ego, a_ego, time.time())  # noqa: TID251
+      self.stop_sign.update(sm, long_enabled, long_override, v_ego, a_ego, now_s)
+    # shadow: as if engaged the whole drive, ignoring the gas; its target goes nowhere. Log-only, so it must never
+    # take the planner down with it.
+    try:
+      self.stop_sign_shadow.update(sm, True, False, sm['carState'].vEgo, a_ego, now_s)
+    except Exception:
+      cloudlog.exception("stop sign shadow update failed")
 
     targets = {
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),

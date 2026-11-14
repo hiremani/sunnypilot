@@ -16,19 +16,24 @@ Stop Sign Assist: a comfortable stop at map stop signs, for cars where openpilot
   point (OSM puts the sign at the junction, not at the stop line). Only once the driving model also plans a stop:
   a map sign may belong to the crossing road, and then the car should only have coasted.
 * Hold: stopped at the sign until the driver presses the gas. It never pulls away by itself.
+
+Shadow mode (StopSignAssistShadow): the same logic on every drive, engaged or not, ignoring the driver's gas, with its
+target never handed to the planner. Its state changes go to the log ("stop_sign" events), to check a car's map signs,
+GPS and model confirmations before letting it brake.
 """
 import math
-import platform
 from enum import IntEnum
 
 from openpilot.common.gps import get_gps_location_service
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_map import StopSignMap, find_stop_ahead
 
 PARAM = "StopSignAssist"
+SHADOW_PARAM = "StopSignAssistShadow"  # run and log only, never touching the speed (any car, any cruise)
 
 COAST_START_M = 45.72    # m (150 ft): lift off the gas at least this far out
 A_COMFORT = 1.0          # m/s^2 planned braking; the planner's cruise floor is -1.2, so this leaves headroom
@@ -73,9 +78,11 @@ def model_wants_stop(model) -> bool:
 
 
 class StopSignAssist:
-  def __init__(self, stop_map: StopSignMap | None = None, params: Params | None = None):
+  def __init__(self, stop_map: StopSignMap | None = None, params: Params | None = None, shadow: bool = False):
     self.params = params or Params()
-    self.enabled = self.params.get_bool(PARAM)
+    self.shadow = shadow
+    self.param = SHADOW_PARAM if shadow else PARAM
+    self.enabled = self.params.get_bool(self.param)
     self.gps_service = get_gps_location_service(self.params)
     self.map = stop_map or StopSignMap()
     self.frame = -1
@@ -127,9 +134,17 @@ class StopSignAssist:
     return None
 
   def update(self, sm, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float, now_s: float) -> None:
+    prev = (self.state, self.node_id)
+    self._update(sm, long_enabled, long_override, v_ego, a_ego, now_s)
+    if (self.state, self.node_id) != prev and self.state != StopSignState.disabled:
+      cloudlog.event("stop_sign", shadow=self.shadow, state=self.state.name, prev=prev[0].name, sign=self.node_id,
+                     dist=round(self.distance, 1), v=round(v_ego, 2), v_target=round(min(self.output_v_target, 99.0), 2),
+                     confirmed=self.confirmed, coast_at=round(coast_distance(v_ego), 1))
+
+  def _update(self, sm, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float, now_s: float) -> None:
     self.frame += 1
     if self.frame % int(PARAMS_UPDATE_PERIOD / DT_MDL) == 0:
-      self.enabled = self.params.get_bool(PARAM)
+      self.enabled = self.params.get_bool(self.param)
 
     self.output_a_target = a_ego
     if not (self.enabled and long_enabled):

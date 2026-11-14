@@ -202,3 +202,32 @@ def test_bad_gps_never_starts_a_stop():
   for g in (gps(LAT0, LON0, fix=False), gps(LAT0, LON0, acc=50.0), gps(LAT0, LON0, t=NOW - 10)):
     ctrl.update(sm_at(g, model(stop=True)), True, False, 10.0, 0.0, NOW)
     assert ctrl.output_v_target == V_CRUISE_UNSET
+
+
+# ---- shadow mode ----
+
+def test_shadow_uses_its_own_param():
+  sign = StopSign(1, *north_of(LAT0, LON0, 30))
+  live_only = StopSignAssist(stop_map=FakeMap([sign]), params=FakeParams({"StopSignAssist": True}), shadow=True)
+  live_only.update(sm_at(gps(LAT0, LON0), model(stop=True)), True, False, 10.0, 0.0, NOW)
+  assert live_only.state == StopSignState.disabled
+  shadow = StopSignAssist(stop_map=FakeMap([sign]), params=FakeParams({"StopSignAssist": False, "StopSignAssistShadow": True}),
+                          shadow=True)
+  shadow.update(sm_at(gps(LAT0, LON0), model(stop=True)), True, False, 10.0, 0.0, NOW)
+  assert shadow.is_active
+
+
+def test_state_changes_are_logged(monkeypatch=None):
+  import openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller as mod
+  events = []
+  orig = mod.cloudlog.event
+  mod.cloudlog.event = lambda name, **kw: events.append((name, kw))
+  try:
+    ctrl = make([StopSign(1, *north_of(LAT0, LON0, 30))])
+    for _ in range(3):
+      ctrl.update(sm_at(gps(LAT0, LON0), model(stop=True)), True, False, 10.0, 0.0, NOW)
+  finally:
+    mod.cloudlog.event = orig
+  assert len(events) == 1  # one transition (idle -> braking/coasting), not one per tick
+  name, kw = events[0]
+  assert name == "stop_sign" and kw["sign"] == 1 and kw["state"] in ("coasting", "braking") and kw["shadow"] is False
