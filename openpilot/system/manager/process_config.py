@@ -68,6 +68,10 @@ def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
 def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("IsLiveStreaming")
 
+def remote_control(started: bool, params: Params, CP: car.CarParams) -> bool:
+  # phone remote-control steering (Fisker): opt-in, RemoteControlEnabled is cleared at every manager start
+  return iscar(started, params, CP) and params.get_bool("RemoteControlEnabled")
+
 def use_copyparty(started, params, CP: car.CarParams) -> bool:
   return bool(params.get_bool("EnableCopyparty"))
 
@@ -191,11 +195,11 @@ procs += [
   # web HUD for an in-car browser (http://sunnypilot.local:8088)
   PythonProcess("webhud", "openpilot.sunnypilot.webhud.server", use_webhud),
   # Fisker remote-control daemon — tiny HTTP server on 0.0.0.0:8899 for the
-  # phone webapp. Scoped to iscar so it only runs when a vehicle is engaged
-  # (same gating as controlsd); the carcontroller is the only consumer of its
-  # output. The server's own init resets state to safe defaults, and the
-  # Params keys are CLEAR_ON_MANAGER_START, so there's no persistence risk.
-  PythonProcess("remote_control_server", "openpilot.sunnypilot.selfdrive.remote_control.remote_control_server", iscar),
+  # phone webapp. Opt-in: it runs only in a car and only while RemoteControlEnabled
+  # is true, and that param is CLEAR_ON_MANAGER_START, so nothing listens after a
+  # boot until the owner turns it on. The carcontroller is the only consumer of its
+  # output and reads the same param as its gate.
+  PythonProcess("remote_control_server", "openpilot.sunnypilot.selfdrive.remote_control.remote_control_server", remote_control),
 ]
 
 if os.path.exists("../../sunnypilot/sunnylink/uploader.py"):

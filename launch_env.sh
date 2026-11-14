@@ -24,4 +24,7 @@ export STAGING_ROOT="/data/safe_staging"
 # Fisker Ocean: FW_VERSIONS is intentionally empty (single-model port, CAN fingerprint
 # is authoritative) and FW_QUERY_CONFIG has zero requests. Skip the VIN/FW query at
 # launch so card comes up promptly on every launch route (systemd, tmux, manual).
+# This is global, not Fisker-only: opendbc's car_helpers.fingerprint() reads it before
+# the car is known (the VIN/FW query runs ahead of the CAN fingerprint), so on any other
+# brand this fork has no VIN and no FW fingerprint. Remove it before using another car.
 export SKIP_FW_QUERY=1

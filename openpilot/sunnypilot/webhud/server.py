@@ -91,6 +91,8 @@ PARAM_ALLOWLIST: dict[str, tuple[type, Callable[[int], bool] | None]] = {
   "FiskerCountryCode": (int, lambda v: 0 <= v <= 999),
   # driver-takeover torque (Nm), applied live by card, so editable while driving; 6.5 = the EPS's own
   "FiskerOverrideTorque": (float, lambda v: takeover_torque_valid(v)),
+  # phone remote-control steering: off at every boot; turning it on starts the server (process_config.remote_control)
+  "RemoteControlEnabled": (bool, None),
 }
 
 
