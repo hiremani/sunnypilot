@@ -34,8 +34,14 @@ class LongitudinalPlannerSP:
     self.resolver = SpeedLimitResolver()
     self.sla = SpeedLimitAssist(CP, CP_SP)
     # Stop signs need openpilot to own the brakes; with the car's own cruise it stays off. The shadow copy only logs.
-    self.stop_sign = StopSignAssist() if CP.openpilotLongitudinalControl else None
-    self.stop_sign_shadow = StopSignAssist(stop_map=self.stop_sign.map if self.stop_sign else None, shadow=True)
+    # Neither may keep plannerd from starting (e.g. code newer than the built params): without them, no stop signs.
+    self.stop_sign = None
+    self.stop_sign_shadow = None
+    try:
+      self.stop_sign = StopSignAssist() if CP.openpilotLongitudinalControl else None
+      self.stop_sign_shadow = StopSignAssist(stop_map=self.stop_sign.map if self.stop_sign else None, shadow=True)
+    except Exception:
+      cloudlog.exception("stop sign assist unavailable")
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
@@ -75,10 +81,11 @@ class LongitudinalPlannerSP:
       self.stop_sign.update(sm, long_enabled, long_override, v_ego, a_ego, now_s)
     # shadow: as if engaged the whole drive, ignoring the gas; its target goes nowhere. Log-only, so it must never
     # take the planner down with it.
-    try:
-      self.stop_sign_shadow.update(sm, True, False, sm['carState'].vEgo, a_ego, now_s)
-    except Exception:
-      cloudlog.exception("stop sign shadow update failed")
+    if self.stop_sign_shadow is not None:
+      try:
+        self.stop_sign_shadow.update(sm, True, False, sm['carState'].vEgo, a_ego, now_s)
+      except Exception:
+        cloudlog.exception("stop sign shadow update failed")
 
     targets = {
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),
