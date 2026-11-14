@@ -71,12 +71,15 @@ COAST_START_M = 45.72    # m (150 ft): lift off the gas at least this far out
 A_COMFORT = 1.0          # m/s^2 planned braking; the planner's cruise floor is -1.2, so this leaves headroom
 COAST_TIME_S = 2.0       # at speed, coast this long before the braking point
 COAST_DV = 0.4           # m/s under the current speed while coasting: ~ -0.4 m/s^2, an EV's gentle lift-off
+MAX_APPROACH_V = 9.0     # m/s (~20 mph): above this the assist doesn't take on a sign (first supervised tests: slow
+                         # approaches only); once active for a sign it carries on
 COAST_FLOOR_V = 2.5      # m/s (~5.6 mph): coasting eases off down to here and no further. Only a confirmed stop brings
                          # the car to a halt; an unconfirmed coast used to decay to 0 and hold the car short of the sign
                          # with no way out but the gas (found with drive_sim's closed loop, 2026-11-14)
 LAG_S = 1.0              # lead the braking profile by the planner's ~1 s speed-loop time constant
 STOP_MARGIN_M = 6.0      # stop this far before the sign's map point
 STOP_V_TARGET = 0.0      # m/s: a complete stop. No rolling-stop option on purpose (NHTSA recall 22V-037, see above)
+PASSED_M = 10.0          # m beyond the sign's map point: dead-reckoned this far past it, the sign is behind the car
 STOPPED_V = 0.3          # m/s: at a stop
 STOPPED_NEAR_M = 20.0    # ...only counts as stopped *at the sign* this close to it
 # the model confirmer (see the docstring): starting values from FrogPilot CEM / sunnypilot DEC, to be tuned from
@@ -182,6 +185,8 @@ class StopSignAssist:
     self.distance = 0.0            # m to the stop point (sign minus margin)
     self.confirmed = False         # the model has planned to slow for this sign (latched until the sign changes)
     self.too_late = False          # ...but only once a comfortable stop was no longer possible: never brake for it
+    self.max_approach_v = MAX_APPROACH_V
+    self.gave_up = 0               # signs left to the driver because a comfortable stop was no longer possible
     self.confirm_filter = FirstOrderFilter(0.0, CONFIRM_FILTER_S, DT_MDL)
     self.cue = StopCue()           # the last frame the confirmer read, for the log
     self.cue_lead = False          # ...and whether a relevant lead made it count as "no cue"
@@ -205,6 +210,16 @@ class StopSignAssist:
     self.cue = StopCue()
     self.cue_lead = False
 
+  def _give_up(self, v_ego: float, why: str) -> None:
+    """No comfortable stop is possible for this sign any more: leave it to the driver, completely (idle, no coasting,
+    no target), and don't take it on again."""
+    cloudlog.event("stop_sign_left_to_driver", shadow=self.shadow, sign=self.node_id, dist=round(self.distance, 1),
+                   v=round(v_ego, 2), why=why)
+    self.gave_up += 1
+    self._finish_sign()
+    self.state = StopSignState.idle
+    self.output_v_target = V_CRUISE_UNSET
+
   def _finish_sign(self) -> None:
     if self.node_id is not None:
       self.done_ids.add(self.node_id)
@@ -226,9 +241,13 @@ class StopSignAssist:
         self._reset_sign()
         self.node_id = ahead.node_id
       return ahead.node_id, ahead.distance - STOP_MARGIN_M
-    # slow or no fix: keep the current sign, counting down the distance travelled
+    # slow or no fix: keep the current sign, counting down the distance travelled, until the car is clearly past it
     if self.node_id is not None:
-      return self.node_id, self.distance - v_ego * DT_MDL
+      dist = self.distance - v_ego * DT_MDL
+      if dist < -(STOP_MARGIN_M + PASSED_M):
+        self._finish_sign()
+        return None
+      return self.node_id, dist
     return None
 
   def update(self, sm, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float, now_s: float) -> None:
@@ -290,16 +309,26 @@ class StopSignAssist:
 
     if not self.confirmed:
       self._confirm(sm, v_ego)
+    if self.too_late:
+      self._give_up(v_ego, "confirmed too late")
+      return
 
     may_brake = self.confirmed and not self.too_late
     if self.state == StopSignState.stopped or (v_ego < STOPPED_V and may_brake and self.distance < STOPPED_NEAR_M):
       # held here until the driver taps the accelerator to proceed (long_override above); never released by itself
       self.state = StopSignState.stopped
       self.output_v_target = STOP_V_TARGET
-    elif not self.is_active and self.distance > coast_distance(v_ego):
+    elif not self.is_active and (self.distance > coast_distance(v_ego) or v_ego > self.max_approach_v):
       self.state = StopSignState.idle
       self.output_v_target = V_CRUISE_UNSET
     else:
+      if not self.is_active and self.distance < braking_distance(v_ego):
+        # Taking a sign on (it just came into range, or the driver just slowed under max_approach_v) with no room left
+        # for a comfortable stop: leave it to the driver, however early the model confirmed. Found with drive_sim's
+        # closed loop: a fast approach taken on late overshot the stop point by 7.6 m.
+        self.too_late = True
+        self._give_up(v_ego, "taken on too close")
+        return
       coast_v = coast_target(v_ego)
       brake_v = braking_v_target(self.distance, v_ego) if may_brake else coast_v
       self.state = StopSignState.braking if brake_v < coast_v else StopSignState.coasting

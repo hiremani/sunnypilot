@@ -121,8 +121,11 @@ def test_picks_nearest_and_respects_skip_and_heading():
 
 # ---- controller ----
 
-def make(signs, enabled=True):
-  return StopSignAssist(stop_map=FakeMap(signs), params=FakeParams({"StopSignAssist": enabled}))
+def make(signs, enabled=True, max_approach_v=99.0):
+  """The controller with the approach-speed cap lifted by default: most tests exercise the profiles at any speed."""
+  ctrl = StopSignAssist(stop_map=FakeMap(signs), params=FakeParams({"StopSignAssist": enabled}))
+  ctrl.max_approach_v = max_approach_v
+  return ctrl
 
 
 def run_approach(ctrl, sign_m, v0, confirm_from_m=1e9, steps=4000):
@@ -199,6 +202,7 @@ def test_braking_profile_is_comfortable():
   ctrl = make([StopSign(1, *north_of(LAT0, LON0, 20 + STOP_MARGIN_M))])
   ctrl.node_id = 1   # already this sign's: a newly found sign starts unconfirmed, and one frame no longer confirms
   ctrl.confirmed = True
+  ctrl.state = StopSignState.coasting   # already taken on this sign
   ctrl.update(sm_at(gps(LAT0, LON0, speed=11.0), model(stop=True)), True, False, 11.0, 0.0, NOW)
   assert ctrl.state == StopSignState.braking
   assert ctrl.output_v_target <= math.sqrt(2 * A_COMFORT * 20) + 1e-6
@@ -297,8 +301,8 @@ def test_one_noisy_frame_does_not_confirm():
 
 def test_constant_speed_plan_never_confirms():
   for v in (6.0, 10.0, 15.0):
-    ctrl = make([StopSign(1, *north_of(LAT0, LON0, 120))])
-    assert approach(ctrl, 120, v, lambda i, v=v: plan(v, should_stop=True), 100 / v) is None, v
+    ctrl = make([StopSign(1, *north_of(LAT0, LON0, 200))])   # far enough to be taken on in time even at 15 m/s
+    assert approach(ctrl, 200, v, lambda i, v=v: plan(v, should_stop=True), 180 / v) is None, v
     assert ctrl.confirm_filter.x == 0.0 and ctrl.state == StopSignState.coasting, v
 
 
@@ -369,6 +373,7 @@ def test_stop_target_is_zero_not_a_rolling_speed():
   ctrl = make([StopSign(1, *north_of(LAT0, LON0, STOP_MARGIN_M + 0.5))])
   ctrl.node_id = 1
   ctrl.confirmed = True
+  ctrl.state = StopSignState.coasting   # already taken on this sign
   ctrl.update(sm_at(gps(LAT0, LON0, speed=2.2), plan(2.2)), True, False, 1.07, 0.0, NOW)
   assert ctrl.state == StopSignState.braking and ctrl.output_v_target == 0.0
 
@@ -376,12 +381,13 @@ def test_stop_target_is_zero_not_a_rolling_speed():
 # ---- shadow mode ----
 
 def test_shadow_uses_its_own_param():
-  sign = StopSign(1, *north_of(LAT0, LON0, 30))
+  sign = StopSign(1, *north_of(LAT0, LON0, 70))   # inside the coast distance at 10 m/s, with room to stop
   live_only = StopSignAssist(stop_map=FakeMap([sign]), params=FakeParams({"StopSignAssist": True}), shadow=True)
   live_only.update(sm_at(gps(LAT0, LON0), model(stop=True)), True, False, 10.0, 0.0, NOW)
   assert live_only.state == StopSignState.disabled
   shadow = StopSignAssist(stop_map=FakeMap([sign]), params=FakeParams({"StopSignAssist": False, "StopSignAssistShadow": True}),
                           shadow=True)
+  shadow.max_approach_v = 99.0
   shadow.update(sm_at(gps(LAT0, LON0), model(stop=True)), True, False, 10.0, 0.0, NOW)
   assert shadow.is_active
 
@@ -392,7 +398,7 @@ def test_state_changes_are_logged(monkeypatch=None):
   orig = mod.cloudlog.event
   mod.cloudlog.event = lambda name, **kw: events.append((name, kw))
   try:
-    ctrl = make([StopSign(1, *north_of(LAT0, LON0, 30))])
+    ctrl = make([StopSign(1, *north_of(LAT0, LON0, 70))])   # with room for a comfortable stop at 10 m/s
     for _ in range(3):
       ctrl.update(sm_at(gps(LAT0, LON0), model(stop=True)), True, False, 10.0, 0.0, NOW)
   finally:
@@ -764,11 +770,11 @@ def test_confirmation_too_late_never_brakes():
   ctrl.state = StopSignState.coasting
   ctrl.confirm_filter.x = 0.99          # the next frame latches
   ctrl.update(sm_at(gps(LAT0, LON0, speed=v), model(stop=True)), True, False, v, 0.0, NOW)
-  assert ctrl.confirmed and ctrl.too_late and 3.0 < braking_distance(v)
-  assert ctrl.state != StopSignState.braking and ctrl.output_v_target > v - 1.0
+  assert ctrl.gave_up == 1 and 1 in ctrl.done_ids and 3.0 < braking_distance(v)
+  assert ctrl.state == StopSignState.idle and ctrl.output_v_target > 200   # left to the driver: no effect on speed
   for _ in range(10):
     ctrl.update(sm_at(gps(LAT0, LON0, speed=v), model(stop=True)), True, False, v, 0.0, NOW)
-    assert ctrl.state != StopSignState.braking
+    assert ctrl.state == StopSignState.idle
 
 
 def test_confirmation_in_time_still_brakes():
@@ -809,6 +815,44 @@ def test_coast_below_the_floor_holds_speed():
   assert coast_target(1.5) == 1.5
   assert coast_target(10.0) == 10.0 - 0.4
 
+
+def test_fast_approach_is_left_to_the_driver():
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import MAX_APPROACH_V, coast_distance
+  v = MAX_APPROACH_V + 1.0
+  near = STOP_MARGIN_M + coast_distance(MAX_APPROACH_V - 1.0) - 5.0   # within coasting range at both speeds
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, near))], max_approach_v=MAX_APPROACH_V)
+  ctrl.update(sm_at(gps(LAT0, LON0, speed=v), model(stop=True)), True, False, v, 0.0, NOW)
+  assert ctrl.state == StopSignState.idle and ctrl.output_v_target > 200
+  v = MAX_APPROACH_V - 1.0                 # slowed down: now it takes the sign on
+  ctrl.update(sm_at(gps(LAT0, LON0, speed=v), model(stop=True)), True, False, v, 0.0, NOW)
+  assert ctrl.is_active
+
+
+def test_sign_taken_on_too_close_is_never_braked_for():
+  # closed loop on route e5: confirmed early while above the approach cap, taken on only once slowed under it, then
+  # braked from too close and overshot by 7.6 m
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import MAX_APPROACH_V, braking_distance
+  v_fast, v_slow = MAX_APPROACH_V + 2.0, MAX_APPROACH_V - 0.5
+  d = braking_distance(v_slow) - 4.0     # no room for a comfortable stop at v_slow
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, STOP_MARGIN_M + d))], max_approach_v=MAX_APPROACH_V)
+  ctrl.node_id = 1
+  ctrl.confirmed = True                  # the model confirmed while the car was still too fast to take it on
+  ctrl.update(sm_at(gps(LAT0, LON0, speed=v_fast), model(stop=True)), True, False, v_fast, 0.0, NOW)
+  assert not ctrl.is_active
+  for _ in range(5):
+    ctrl.update(sm_at(gps(LAT0, LON0, speed=v_slow), model(stop=True)), True, False, v_slow, 0.0, NOW)
+    assert ctrl.state == StopSignState.idle and ctrl.output_v_target > 200
+  assert ctrl.gave_up == 1 and 1 in ctrl.done_ids
+
+
+def test_crawling_past_a_sign_releases_it():
+  # closed loop on route e5: crawling under the GPS speed threshold, a sign behind the car was kept for 1.8 km
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, 30))])
+  ctrl.node_id, ctrl.state, ctrl.distance = 1, StopSignState.coasting, -STOP_MARGIN_M
+  for _ in range(400):   # 20 s at 1.3 m/s, GPS speed too low for its bearing
+    ctrl.update(sm_at(gps(LAT0, LON0, speed=1.3), model()), True, False, 1.3, 0.0, NOW)
+  assert ctrl.node_id is None and 1 in ctrl.done_ids and ctrl.output_v_target > 200
+
 def _as_method(fn):
   import inspect
   import pathlib
@@ -832,3 +876,4 @@ def _test_case():
 
 
 TestStopSign = _test_case()
+
