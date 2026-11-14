@@ -5,7 +5,8 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-drive_sim: replay a recorded drive through the current Stop Sign Assist and lane-turn code and show it on a map.
+drive_sim: replay a recorded drive through the current Stop Sign Assist, lane-turn and turn-planner code and show it
+on a map ("Turn planner" mode: the planner's ghost path from each point it would start a signaled turn).
 
   .venv/bin/python -m openpilot.sunnypilot.tools.drive_sim.server --root ~/Fisker/routes
   then open http://127.0.0.1:8765
@@ -31,6 +32,7 @@ RELOAD = (   # dependencies first
   "openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_map",
   "openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller",
   "openpilot.sunnypilot.selfdrive.controls.lib.lane_turn_desire",
+  "openpilot.sunnypilot.selfdrive.controls.lib.turn_planner",
   "openpilot.sunnypilot.tools.drive_sim.sim",
 )
 
@@ -78,6 +80,8 @@ def make_handler(root: str):
           t1 = time.monotonic()
           if q.get("mode") == "closed":
             out = sim.simulate_closed_loop(data, proceed_wait_s=float(q.get("wait", 2.0)))
+          elif q.get("mode") == "turns":
+            out = sim.simulate_turns(data)
           else:
             out = sim.simulate(data)
           out["timing"] = {"extract_s": round(t1 - t0, 2), "simulate_s": round(time.monotonic() - t1, 2)}

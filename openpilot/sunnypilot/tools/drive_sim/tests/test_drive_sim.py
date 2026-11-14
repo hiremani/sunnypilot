@@ -4,6 +4,7 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+import math
 import os
 import tempfile
 import unittest
@@ -73,3 +74,34 @@ class TestClosedLoop(unittest.TestCase):
     path = sim.build_path(frames)
     self.assertAlmostEqual(path[-1][0], 99 * 8.0 * 0.05, delta=2.0)
     self.assertTrue(all(abs(p[3]) < 1.0 or abs(p[3] - 360) < 1.0 for p in path[3:-3]))   # heading north
+
+
+class TestTurnEvaluation(unittest.TestCase):
+  def _frames(self, right_blinker=True):
+    """North at 4 m/s for 10 s, then a 90 deg right turn (yawRate < 0) over ~5 s, then east."""
+    out, lat, lon, h = [], 37.5, -121.95, 0.0
+    for i in range(400):
+      yaw = -0.3 if 200 <= i < 200 + int(math.radians(90) / 0.3 / 0.05) else 0.0
+      h -= math.degrees(yaw) * 0.05
+      lat += 4.0 * 0.05 * math.cos(math.radians(h)) / 111_195.0
+      lon += 4.0 * 0.05 * math.sin(math.radians(h)) / (111_195.0 * math.cos(math.radians(37.5)))
+      out.append({"t": i * 0.05, "gps": (lat, lon, h % 360, 4.0, True, 1.0, 1_800_000_000_000 + i * 50),
+                  "cs": (4.0, 0.0, 0.0, False, False, right_blinker and 100 <= i < 260, yaw, False, False, False, False),
+                  "lead": (False, 0.0), "lat_active": True, "stop": False, "curv": 0.0, "vel": [4.0] * 33,
+                  "pos": [4.0 * k for k in range(33)], "desire": 0})
+    return out
+
+  def test_recorded_turns_need_the_blinker(self):
+    turns = sim.recorded_turns(self._frames())
+    self.assertEqual(len(turns), 1)
+    self.assertEqual(turns[0]["side"], "right")
+    self.assertAlmostEqual(turns[0]["change"], 90.0, delta=3.0)
+    self.assertEqual(sim.recorded_turns(self._frames(right_blinker=False)), [])
+
+  def test_evaluate_without_map_reports_untriggered(self):
+    with tempfile.TemporaryDirectory() as osm:
+      out = sim.evaluate_turns({"route": "r", "segs": None, "service": "gpsLocation", "frames": self._frames()}, osm_root=osm)
+    self.assertEqual(len(out["turns"]), 1)
+    self.assertFalse(out["turns"][0]["triggered"])
+    self.assertEqual(out["ghosts"], [])
+    self.assertEqual(len(out["tp_state"]), 400)

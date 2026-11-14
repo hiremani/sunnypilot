@@ -23,6 +23,8 @@ from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
+from openpilot.sunnypilot.selfdrive.controls.lib.turn_planner import TurnPlanner
+from openpilot.common.gps import get_gps_location_service
 
 State = log.SelfdriveState.OpenpilotState
 LaneChangeState = log.LaneChangeState
@@ -43,15 +45,25 @@ class Controls(ControlsExt):
 
     self.CI = interfaces[self.CP.carFingerprint](self.CP, self.CP_SP)
 
+    # Map turn assist (sunnypilot): GPS for the turn planner. Never required: a missing or bad fix only means no turn.
+    self.gps_service = get_gps_location_service(self.params)
     self.sm = messaging.SubMaster(['lateralDelay', 'vehicleParameters', 'lateralTorqueParameters', 'modelV2', 'selfdriveState',
                                    'extrinsicsCalibration', 'deviceMotion', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
-                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance'] + self.sm_services_ext,
-                                  poll='selfdriveState')
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', self.gps_service] + self.sm_services_ext,
+                                  poll='selfdriveState', ignore_alive=[self.gps_service], ignore_avg_freq=[self.gps_service],
+                                  ignore_valid=[self.gps_service])
     self.pm = messaging.PubMaster(['carControl', 'controlsState'] + self.pm_services_ext)
 
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
+
+    # Map turn assist: steers a signaled low-speed junction turn from the road tiles (turn_planner.py). Off unless both
+    # MapTurnAssist and LaneTurnDesire are set; re-read about once a second.
+    self.turn_planner = TurnPlanner()
+    self.map_turn_assist = False
+    self.map_turn_curvature: float | None = None
+    self._turn_param_frame = 0
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -69,6 +81,27 @@ class Controls(ControlsExt):
       self.LaC = LatControlTorque(self.CP, self.CP_SP, self.CI, DT_CTRL)
 
     self.LaC = ControlsExt.initialize_lateral_control(self, self.LaC, self.CI, DT_CTRL)
+
+  def update_map_turn(self, CS, CC) -> float | None:
+    """The map turn planner's curvature (1/m, positive turns right, as desiredCurvature) or None. Any failure means no
+    turn: the model keeps steering."""
+    if self._turn_param_frame % 100 == 0:
+      try:   # never let a params problem (e.g. code newer than the built params) take controlsd down
+        self.map_turn_assist = self.params.get_bool("MapTurnAssist") and self.params.get_bool("LaneTurnDesire")
+      except Exception:
+        self.map_turn_assist = False
+    self._turn_param_frame += 1
+    self.map_turn_curvature = None
+    if not self.map_turn_assist:
+      return None
+    try:
+      self.map_turn_curvature = self.turn_planner.update(DT_CTRL, CS.vEgo, CS.yawRate, CS.leftBlinker, CS.rightBlinker,
+                                                         CC.latActive, CS.steeringPressed, self.sm[self.gps_service],
+                                                         CS.steeringTorque)
+    except Exception:
+      cloudlog.exception("map turn planner failed")
+      self.map_turn_curvature = None
+    return self.map_turn_curvature
 
   def update(self):
     self.sm.update(15)
@@ -143,6 +176,9 @@ class Controls(ControlsExt):
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+      turn_curvature = self.update_map_turn(CS, CC)
+      if turn_curvature is not None and CC.latActive:
+        new_desired_curvature = turn_curvature
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
     lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 

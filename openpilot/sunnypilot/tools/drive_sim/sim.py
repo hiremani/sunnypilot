@@ -407,3 +407,200 @@ def simulate_closed_loop(data: dict, proceed_wait_s: float = 2.0) -> dict:
   return {"route": data["route"], "segs": data["segs"], "frames": len(cols["t"]), "mode": "closed",
           "completed": s >= end_s - 1.0, "recorded_s": round(frames[hi]["t"] - frames[lo]["t"], 1), "simulated_s": round(t, 1),
           "path_m": round(end_s, 1), "stops": stops, "cols": cols, "events": events, "signs": judge_signs(smap, track_pts)}
+
+
+# ---- turn planner ----
+
+TURN_YAW_ON = 0.12          # rad/s: a recorded turn starts with the yaw rate above this...
+TURN_YAW_OFF = 0.05         # ...and lasts while it stays above this
+TURN_MIN_DEG = 40.0         # recorded heading change that counts as a turn
+TURN_MAX_V = 9.0            # m/s: turns started faster than this aren't junction turns
+TURN_BLINKER_BEFORE_S = 8.0  # a blinker on the turn's side this long before (or during) it makes it a signaled turn,
+                             # if it was on after the previous recorded turn ended (one blinker, one turn)
+GHOST_TAIL_S = 3.0          # after the planner releases, the ghost keeps rolling (wheel unwinding) at most this long
+GHOST_STRAIGHT_CURV = 0.004  # ...or until its curvature is this small
+REC_AFTER_S = 6.0           # the recorded path compared against runs this long past the recorded turn's end
+
+
+def recorded_turns(frames: list[dict]) -> list[dict]:
+  """The signaled junction turns in a recording: a low-speed heading change >= TURN_MIN_DEG (yaw-rate integral) with
+  the blinker of that side on in the TURN_BLINKER_BEFORE_S before it or during it. Bearing convention: + = right."""
+  from openpilot.common.realtime import DT_MDL
+  out, i, n = [], 0, len(frames)
+  prev_end = -1
+  while i < n:
+    cs = frames[i]["cs"]
+    if abs(cs[6]) > TURN_YAW_ON and cs[0] < TURN_MAX_V:
+      a = i
+      while a > 0 and abs(frames[a - 1]["cs"][6]) > TURN_YAW_OFF:
+        a -= 1
+      j, h = a, 0.0
+      while j < n and abs(frames[j]["cs"][6]) > TURN_YAW_OFF:
+        h += frames[j]["cs"][6] * DT_MDL
+        j += 1
+      change = -math.degrees(h)   # yawRate + = left; bearing change + = right
+      if abs(change) >= TURN_MIN_DEG:
+        side = "right" if change > 0 else "left"
+        k0 = max(0, a - int(TURN_BLINKER_BEFORE_S / DT_MDL), prev_end + 1)
+        col = 5 if side == "right" else 4
+        if any(frames[k]["cs"][col] for k in range(k0, j)):
+          out.append({"start": a, "end": j - 1, "side": side, "change": change})
+        prev_end = j - 1
+      i = j + 1
+    else:
+      i += 1
+  return out
+
+
+def _xy(lat0, lon0, lat, lon):
+  return (math.radians(lon - lon0) * math.cos(math.radians(lat0)) * EARTH_R, math.radians(lat - lat0) * EARTH_R)
+
+
+def _latlon(lat0, lon0, x, y):
+  return (lat0 + math.degrees(y / EARTH_R), lon0 + math.degrees(x / (EARTH_R * math.cos(math.radians(lat0)))))
+
+
+def _dist_to_polyline(p, line) -> float:
+  best = float("inf")
+  for (ax, ay), (bx, by) in zip(line[:-1], line[1:], strict=True):
+    dx, dy = bx - ax, by - ay
+    l2 = dx * dx + dy * dy
+    t = 0.0 if l2 < 1e-9 else max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / l2))
+    best = min(best, math.hypot(p[0] - ax - t * dx, p[1] - ay - t * dy))
+  return best
+
+
+def evaluate_turns(data: dict, tuning=None, osm_root: str | None = None) -> dict:
+  """Run the turn planner over the recording, and from each point where it starts a turn roll a kinematic "ghost" car
+  (heading += v * curvature * dt at the recorded speed) through the curvature it commands, after the car's actuator
+  (delay, then the curvature build-up rate of the wheel-rate and jerk limits). While the ghost turns, the planner is fed
+  the ghost's own yaw rate, so its heading tracking and release act on the ghost. The driver's recorded steering isn't
+  fed in (it would read as an override). Per recorded signaled turn: did the planner trigger, how far from the junction,
+  planned vs actual heading change, and the ghost's max distance from the recorded path and its heading error at the end.
+  """
+  from openpilot.common.realtime import DT_MDL
+  from openpilot.sunnypilot.selfdrive.controls.lib import turn_planner as tp
+
+  frames = data["frames"]
+  src = tp.RoadSource(root=os.path.join(osm_root, "offline") if osm_root else None, sync=True)
+  planner = tp.TurnPlanner(road_source=src, tuning=tuning)
+  delay_n = max(0, round(tp.ACTUATOR_DELAY_S / DT_MDL))
+  left_hold = right_hold = 0
+  ghost = None
+  starts, arms, ends = [], [], []
+  tp_state = []
+  prev_state = tp.IDLE
+  for i, fr in enumerate(frames):
+    lat, lon, bearing, gspeed, has_fix, acc, ts = fr["gps"]
+    v, _, _, _, lb, rb, yaw, *_ = fr["cs"]
+    left_hold = BLINKER_HOLD_FRAMES if lb else max(left_hold - 1, 0)
+    right_hold = BLINKER_HOLD_FRAMES if rb else max(right_hold - 1, 0)
+    gps = SimpleNamespace(latitude=lat, longitude=lon, bearingDeg=bearing, speed=gspeed, hasFix=has_fix,
+                          horizontalAccuracy=acc, unixTimestampMillis=ts)
+    yaw_in = -v * ghost["k_act"] if ghost is not None else yaw
+    cmd = planner.update(DT_MDL, v, yaw_in, left_hold > 0, right_hold > 0, bool(fr["lat_active"]), False, gps)
+    st = planner.state
+    if st == tp.ARMED and prev_state != tp.ARMED:
+      arms.append({"i": i, "dist": planner.dist, "planned": planner.planned, "side": planner.side})
+    if st == tp.TURNING and prev_state != tp.TURNING:
+      ghost = {"i0": i, "lat0": lat, "lon0": lon, "x": 0.0, "y": 0.0, "h": _pre_turn_heading(frames, i), "k_act": 0.0,
+               "queue": [0.0] * delay_n, "pts": [(0.0, 0.0)], "released": None, "planned": planner.planned,
+               "start_dist": planner.log.start_dist, "radius": planner.radius, "side": planner.side,
+               "junction": _latlon(planner.roads.lat0, planner.roads.lon0, *planner.junction_xy)}
+      starts.append(ghost)
+    if prev_state in (tp.ARMED, tp.TURNING) and st not in (tp.ARMED, tp.TURNING):
+      ends.append({"i": i, "reason": planner.log.reason, "from": prev_state})
+    prev_state = st
+    tp_state.append(st)
+    if ghost is not None:
+      if cmd is None and ghost["released"] is None:
+        ghost["released"] = i
+      k_cmd = cmd if cmd is not None else 0.0
+      ghost["queue"].append(k_cmd)
+      k_target = ghost["queue"].pop(0)
+      unwind = abs(k_target) < abs(ghost["k_act"])
+      rate = tp.curvature_rate(v, unwind=unwind) * DT_MDL
+      ghost["k_act"] += max(-rate, min(rate, k_target - ghost["k_act"]))
+      ghost["h"] += math.degrees(v * ghost["k_act"] * DT_MDL)
+      ghost["x"] += v * math.sin(math.radians(ghost["h"])) * DT_MDL
+      ghost["y"] += v * math.cos(math.radians(ghost["h"])) * DT_MDL
+      ghost["pts"].append((ghost["x"], ghost["y"]))
+      if ghost["released"] is not None and (abs(ghost["k_act"]) < GHOST_STRAIGHT_CURV or
+                                            (i - ghost["released"]) * DT_MDL > GHOST_TAIL_S):
+        ghost["i1"] = i
+        ghost = None
+  if ghost is not None:
+    ghost["i1"] = len(frames) - 1
+
+  turns = []
+  for n, rt in enumerate(recorded_turns(frames)):
+    a, b = rt["start"], rt["end"]
+    lo = a - int(15.0 / DT_MDL)
+    g = next((s for s in starts if lo <= s["i0"] <= b), None)
+    arm = next((x for x in arms if lo <= x["i"] <= b), None)
+    end = next((e for e in ends if arm and e["i"] >= arm["i"]), None)
+    row = {"n": n + 1, "t": round(frames[a]["t"], 1), "side": rt["side"], "actual_deg": round(rt["change"], 1),
+           "armed": arm is not None, "arm_dist": round(arm["dist"], 1) if arm else None,
+           "triggered": g is not None, "trigger_dist": None, "planned_deg": round(arm["planned"], 1) if arm else None,
+           "max_lat_err": None, "end_lat_err": None, "end_heading_err": None, "reason": end["reason"] if end else "",
+           "radius": None, "trigger_t": None, "trigger_lead_s": None}
+    if g is not None:
+      i0 = g["i0"]
+      lat0, lon0 = g["lat0"], g["lon0"]
+      rec = []
+      for k in range(max(0, i0 - int(1.0 / DT_MDL)), min(len(frames), b + int(REC_AFTER_S / DT_MDL))):
+        la, lo_, *_ = frames[k]["gps"]
+        rec.append(_xy(lat0, lon0, la, lo_))
+      errs = [_dist_to_polyline(p, rec) for p in g["pts"]]
+      exit_heading = _exit_heading(frames, b)
+      row.update({"trigger_dist": round(g["start_dist"], 1), "max_lat_err": round(max(errs), 2), "end_lat_err": round(errs[-1], 2),
+                  "end_heading_err": round(_angle_diff(g["h"], exit_heading), 1), "radius": round(g["radius"], 1),
+                  "trigger_t": round(frames[i0]["t"], 1), "trigger_lead_s": round(frames[a]["t"] - frames[i0]["t"], 2)})
+      g["n"] = n + 1
+    turns.append(row)
+  ghost_out = [{"n": g.get("n"), "side": g["side"], "i0": g["i0"], "junction": [round(c, 7) for c in g["junction"]],
+                "lat": [round(_latlon(g["lat0"], g["lon0"], x, y)[0], 7) for x, y in g["pts"][::2]],
+                "lon": [round(_latlon(g["lat0"], g["lon0"], x, y)[1], 7) for x, y in g["pts"][::2]]} for g in starts]
+  return {"turns": turns, "ghosts": ghost_out, "tp_state": tp_state}
+
+
+def _pre_turn_heading(frames: list[dict], i: int) -> float:
+  """The ghost's starting heading at frame i: the recorded heading there, unless the recorded driver had already begun
+  turning (then the heading before that began: the planner-driven car would still be going along the road)."""
+  from openpilot.common.realtime import DT_MDL
+  k = i
+  while k > 0 and abs(frames[k]["cs"][6]) > TURN_YAW_OFF and (i - k) * DT_MDL < 10.0:
+    k -= 1
+  return _rec_heading(frames, k)
+
+
+def _exit_heading(frames: list[dict], end: int) -> float:
+  """The recorded heading once the turn is over: the track over the first ~8 m driven after the recorded turn's end."""
+  lat0, lon0, *_ = frames[end]["gps"]
+  for k in range(end + 1, min(len(frames), end + 400)):
+    lat1, lon1, *_ = frames[k]["gps"]
+    if _dist_m(lat0, lon0, lat1, lon1) >= 8.0:
+      dx, dy = _xy(lat0, lon0, lat1, lon1)
+      return math.degrees(math.atan2(dx, dy)) % 360.0
+  return _rec_heading(frames, end)
+
+
+def _rec_heading(frames: list[dict], i: int) -> float:
+  """The recorded car's heading at frame i from its GPS track (the ~6 m behind it), or the GPS course."""
+  lat1, lon1, bearing, *_ = frames[i]["gps"]
+  for k in range(i - 1, max(-1, i - 200), -1):
+    lat0, lon0, *_ = frames[k]["gps"]
+    if _dist_m(lat0, lon0, lat1, lon1) >= 6.0:
+      dx, dy = _xy(lat0, lon0, lat1, lon1)
+      return math.degrees(math.atan2(dx, dy)) % 360.0
+  return bearing
+
+
+def simulate_turns(data: dict, tuning=None) -> dict:
+  """Replay plus the turn planner's evaluation, for the page's "Turn planner" mode."""
+  out = simulate(data)
+  ev = evaluate_turns(data, tuning)
+  out["cols"]["tp_state"] = ev.pop("tp_state")
+  out.update(ev)
+  out["mode"] = "turns"
+  return out
