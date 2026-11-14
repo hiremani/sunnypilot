@@ -29,6 +29,7 @@ from openpilot.common.hardware import HARDWARE
 from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
+from openpilot.sunnypilot.selfdrive.selfdrived.driver_alerts import BlinkerBlindSpot, SpeedLimitPosted
 from openpilot.sunnypilot.selfdrive.car.cruise_helpers import CruiseHelper
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.controller import IntelligentCruiseButtonManagement
 from openpilot.sunnypilot.selfdrive.selfdrived.button_state_tracker import ButtonStateTracker
@@ -115,6 +116,9 @@ class SelfdriveD(CruiseHelper):
 
     # read params
     self.is_metric = self.params.get_bool("IsMetric")
+    self.speed_limit_chime = (self.params.get("SpeedLimitMode", return_default=True) or 0) > 0
+    self.speed_limit_posted = SpeedLimitPosted(DT_CTRL)
+    self.blinker_blind_spot = BlinkerBlindSpot(DT_CTRL)
     self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
     self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
 
@@ -369,6 +373,16 @@ class SelfdriveD(CruiseHelper):
     elif self.sm['modelV2'].meta.laneChangeState in (LaneChangeState.laneChangeStarting,
                                                     LaneChangeState.laneChangeFinishing):
       self.events.add(EventName.laneChange)
+
+    # Blinker on toward an occupied blind spot, at any speed (laneChangeBlocked above covers lane changes only)
+    if self.blinker_blind_spot.update(CS.leftBlinker, CS.rightBlinker, CS.leftBlindspot, CS.rightBlindspot) and \
+       self.sm['modelV2'].meta.laneChangeState != LaneChangeState.preLaneChange:
+      self.events_sp.add(custom.OnroadEventSP.EventName.blindSpotBlinker)
+
+    # Chime when the posted speed limit changes
+    resolver = self.sm['longitudinalPlanSP'].speedLimit.resolver
+    if self.speed_limit_posted.update(resolver.speedLimit, resolver.speedLimitValid, CS.vEgo) and self.speed_limit_chime:
+      self.events_sp.add(custom.OnroadEventSP.EventName.speedLimitPosted)
 
     # Handle lane turn
     lane_turn_direction = self.sm['modelDataV2SP'].laneTurnDirection
@@ -663,6 +677,7 @@ class SelfdriveD(CruiseHelper):
   def params_thread(self, evt):
     while not evt.is_set():
       self.is_metric = self.params.get_bool("IsMetric")
+      self.speed_limit_chime = (self.params.get("SpeedLimitMode", return_default=True) or 0) > 0
       self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
       self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
       self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl

@@ -38,6 +38,16 @@ def speed_limit_adjust_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.
     Priority.LOW, VisualAlert.none, AudibleAlert.none, 4.)
 
 
+def speed_limit_posted_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
+  limit = sm['longitudinalPlanSP'].speedLimit.resolver.speedLimit
+  speed = round(limit * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH))
+  return Alert(
+    f'Speed limit {speed} {"km/h" if metric else "mph"}',
+    "",
+    AlertStatus.normal, AlertSize.small,
+    Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 3.)
+
+
 def speed_limit_pre_active_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
   speed_conv = CV.MS_TO_KPH if metric else CV.MS_TO_MPH
   v_cruise_cluster = CS.vCruiseCluster
@@ -215,6 +225,18 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "",
       AlertStatus.normal, AlertSize.small,
       Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 5.),
+  },
+
+  EventNameSP.speedLimitPosted: {
+    ET.WARNING: speed_limit_posted_alert,
+  },
+
+  EventNameSP.blindSpotBlinker: {
+    ET.WARNING: Alert(
+      "Car in Blind Spot",
+      "",
+      AlertStatus.userPrompt, AlertSize.small,
+      Priority.MID, VisualAlert.none, AudibleAlert.promptRepeat, .1),
   },
 
   EventNameSP.speedLimitChanged: {
