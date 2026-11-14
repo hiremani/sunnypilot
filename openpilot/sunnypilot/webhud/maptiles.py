@@ -131,7 +131,7 @@ FEATURE_QUERY = """[out:json][timeout:120];
 );
 out body;"""
 KEEP_TAGS = ("highway", "railway", "direction", "traffic_signals:direction", "traffic_signals", "crossing", "crossing:markings",
-             "stop", "traffic_calming")
+             "stop", "traffic_calming", "stop:direction", "traffic_sign:direction")
 USER_AGENT = "sunnypilot-webhud/1.0 (map features; github.com/sunnypilot/sunnypilot)"
 
 

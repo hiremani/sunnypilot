@@ -12,17 +12,48 @@ Stop Sign Assist: a comfortable stop at map stop signs, for cars where openpilot
 
 * Coast: from 150 ft out (further at speed, so the braking that follows stays gentle) the target drops just
   under the current speed: no throttle, a lift-off slowdown.
-* Brake: a constant-deceleration profile, v = sqrt(2 * A_COMFORT * d), ending STOP_MARGIN before the sign's map
-  point (OSM puts the sign at the junction, not at the stop line). Only once the driving model also plans a stop:
-  a map sign may belong to the crossing road, and then the car should only have coasted.
-* Hold: stopped at the sign until the driver presses the gas. It never pulls away by itself.
+* Brake: a constant-deceleration profile, v = sqrt(2 * A_COMFORT * d), ending at zero speed STOP_MARGIN before the
+  sign's map point (OSM puts the sign at the junction, not at the stop line). Only once the driving model also
+  plans to slow for it (the confirmer below): a map sign may belong to the crossing road, and then the car should
+  only have coasted.
+* The stop is a complete stop: the target is STOP_V_TARGET = 0 and there is deliberately no rolling-stop option.
+  NHTSA recall 22V-037 treated a system that rolled through all-way stops at up to 5.6 mph as a safety defect,
+  with no incident reported; what the driver does at a sign is no standard for what the system may do.
+* Hold: stopped at the sign until the driver taps the accelerator to proceed (the planner's gas override). It never
+  pulls away by itself: whether the junction is clear is the driver's call.
+
+The confirmer (model_stop_cue, StopSignAssist._confirm). The model has no stop sign output, and
+modelV2.action.shouldStop is no approach signal: it is the standstill-hold flag (v_ego < 0.3 m/s and a small desired
+acceleration), false by construction while the car still moves. A fixed "the plan dips below 1.5 m/s" test fires
+late or never. So, as FrogPilot (Conditional Experimental Mode) and sunnypilot DEC do, the plan's *shape* is read,
+scaled to the current speed, from modelV2 alone:
+  (a) planned-speed ratio: min(velocity.x) <= CONFIRM_SLOW_RATIO * v_ego, or min(velocity.x) < CONFIRM_STOP_V (the
+      floor that keeps it working at low speed);
+  (b) plan end-point shortfall: position.x[-1] short of DEC's speed-indexed expected distance (dec/constants.py
+      SLOW_DOWN_BP / SLOW_DOWN_DIST) by at least CONFIRM_SHORTFALL of it. DEC's table is generous at low speed (32 m
+      at standstill), so this one is only read from CONFIRM_SHORTFALL_MIN_V up.
+Either cue is one raw frame. Raw frames go through a first-order filter (CONFIRM_FILTER_S) and confirm at
+CONFIRM_THRESHOLD, about one time constant of continuous agreement, so a noisy frame confirms nothing. Frames with
+a relevant lead (radarState.leadOne within the plan's length + LEAD_MARGIN_M) count as "no cue": the plan is then
+slowing for the car in front, and the lead policy handles a queue. Frames are only read once the sign is within
+confirm_distance (the coast distance plus one filter time constant of travel): a slowdown 300 m before a sign is
+not about that sign. Confirmation latches per sign (self.confirmed) and resets with the sign.
+THESE THRESHOLDS ARE STARTING VALUES taken from those forks, not measured on this car or model: tune them from
+labelled shadow-drive passes (full stop / rolling stop / no response per map sign; the "stop_sign" and
+"stop_sign_confirmed" events carry the raw and filtered values), and again after a driving-model change. Driver-
+driven passes flatter the confirmer: the model sees the driver's own braking.
 
 Shadow mode (StopSignAssistShadow): the same logic on every drive, engaged or not, ignoring the driver's gas, with its
-target never handed to the planner. Its state changes go to the log ("stop_sign" events), to check a car's map signs,
-GPS and model confirmations before letting it brake.
+target never handed to the planner. Its state changes go to the log ("stop_sign" events, plus "stop_sign_confirmed"
+when the confirmer latches), to check a car's map signs, GPS and model confirmations before letting it brake.
 """
 import math
+from dataclasses import dataclass
 from enum import IntEnum
+
+import numpy as np
+
+from openpilot.common.filter_simple import FirstOrderFilter
 
 from openpilot.common.gps import get_gps_location_service
 from openpilot.common.params import Params
@@ -30,6 +61,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
+from openpilot.sunnypilot.selfdrive.controls.lib.dec.constants import WMACConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_map import StopSignMap, find_stop_ahead
 
 PARAM = "StopSignAssist"
@@ -41,9 +73,18 @@ COAST_TIME_S = 2.0       # at speed, coast this long before the braking point
 COAST_DV = 0.4           # m/s under the current speed while coasting: ~ -0.4 m/s^2, an EV's gentle lift-off
 LAG_S = 1.0              # lead the braking profile by the planner's ~1 s speed-loop time constant
 STOP_MARGIN_M = 6.0      # stop this far before the sign's map point
+STOP_V_TARGET = 0.0      # m/s: a complete stop. No rolling-stop option on purpose (NHTSA recall 22V-037, see above)
 STOPPED_V = 0.3          # m/s: at a stop
 STOPPED_NEAR_M = 20.0    # ...only counts as stopped *at the sign* this close to it
-MODEL_STOP_V = 1.5       # m/s: the model's plan dips below this => it wants to stop
+# the model confirmer (see the docstring): starting values from FrogPilot CEM / sunnypilot DEC, to be tuned from
+# labelled shadow-drive passes
+CONFIRM_SLOW_RATIO = 0.70        # (a) the plan's slowest point is at most this fraction of the current speed...
+CONFIRM_STOP_V = 1.0             # m/s ...or below this, whatever the current speed
+CONFIRM_SHORTFALL = 0.30         # (b) the plan ends this fraction short of DEC's expected distance for the speed
+CONFIRM_SHORTFALL_MIN_V = 5.0    # m/s: (b) is not read below this (DEC's table exceeds a steady plan at low speed)
+CONFIRM_FILTER_S = 1.5           # s: time constant of the filter over the raw cue
+CONFIRM_THRESHOLD = 1.0 - 1.0 / math.e   # ~0.63: the filter gets here after ~CONFIRM_FILTER_S of continuous cue
+LEAD_MARGIN_M = 10.0             # a lead no further than the plan's end + this is why the plan slows: no cue
 GPS_MAX_AGE_S = 2.0
 GPS_MAX_ACCURACY_M = 15.0
 MIN_GPS_SPEED = 2.0      # m/s: GPS bearing is unreliable below this, so hold on to the last sign
@@ -66,15 +107,55 @@ def braking_distance(v_ego: float) -> float:
 
 
 def braking_v_target(dist_to_stop: float, v_ego: float) -> float:
+  """The braking profile's speed target: it ends at STOP_V_TARGET (zero) at the stop point, never at a rolling speed."""
   d = max(dist_to_stop - v_ego * LAG_S, 0.0)
-  return math.sqrt(2 * A_COMFORT * d)
+  return max(math.sqrt(2 * A_COMFORT * d), STOP_V_TARGET)
 
 
-def model_wants_stop(model) -> bool:
-  if model.action.shouldStop:
-    return True
-  vel = model.velocity.x
-  return len(vel) > 0 and min(vel) < MODEL_STOP_V
+def confirm_distance(v_ego: float) -> float:
+  """The confirmer listens from here in: early enough for the filter to settle before the coast begins."""
+  return coast_distance(v_ego) + v_ego * CONFIRM_FILTER_S
+
+
+@dataclass(frozen=True)
+class StopCue:
+  """One model frame read for "the plan slows for something ahead". raw is what the filter is fed."""
+  v_min: float | None = None       # m/s: the slowest point of the plan; None without a plan
+  shortfall: float = 0.0           # fraction of the expected distance the plan's end falls short by (0 when not read)
+  slowing: bool = False            # cue (a)
+  short: bool = False              # cue (b)
+
+  @property
+  def raw(self) -> bool:
+    return self.slowing or self.short
+
+
+def model_stop_cue(model, v_ego: float) -> StopCue:
+  """Does this frame's plan slow for something ahead? From modelV2 velocity.x / position.x only, scaled to v_ego.
+  action.shouldStop is deliberately not read (a standstill-hold flag, see the docstring)."""
+  vel = getattr(getattr(model, "velocity", None), "x", None)
+  pos = getattr(getattr(model, "position", None), "x", None)
+  v_min = float(min(vel)) if vel is not None and len(vel) > 0 else None
+  slowing = v_min is not None and (v_min <= CONFIRM_SLOW_RATIO * v_ego or v_min < CONFIRM_STOP_V)
+  shortfall = 0.0
+  if pos is not None and len(pos) > 0 and v_ego >= CONFIRM_SHORTFALL_MIN_V:
+    expected = float(np.interp(v_ego * 3.6, WMACConstants.SLOW_DOWN_BP, WMACConstants.SLOW_DOWN_DIST))
+    shortfall = max(0.0, 1.0 - float(pos[-1]) / expected)
+  return StopCue(v_min, shortfall, slowing, shortfall >= CONFIRM_SHORTFALL)
+
+
+def lead_relevant(sm, model) -> bool:
+  """A lead close enough to be what the plan slows for. False when radarState isn't there (a test's dict, a
+  SubMaster without it)."""
+  try:
+    lead = sm['radarState'].leadOne
+  except (KeyError, AttributeError, TypeError):
+    return False
+  if not getattr(lead, "present", getattr(lead, "status", False)):
+    return False
+  pos = getattr(getattr(model, "position", None), "x", None)
+  plan_end = float(pos[-1]) if pos is not None and len(pos) > 0 else 0.0
+  return bool(lead.dRel <= max(plan_end, 0.0) + LEAD_MARGIN_M)
 
 
 class StopSignAssist:
@@ -90,7 +171,10 @@ class StopSignAssist:
     self.state = StopSignState.disabled
     self.node_id: int | None = None
     self.distance = 0.0            # m to the stop point (sign minus margin)
-    self.confirmed = False         # the model has planned a stop for this sign
+    self.confirmed = False         # the model has planned to slow for this sign (latched until the sign changes)
+    self.confirm_filter = FirstOrderFilter(0.0, CONFIRM_FILTER_S, DT_MDL)
+    self.cue = StopCue()           # the last frame the confirmer read, for the log
+    self.cue_lead = False          # ...and whether a relevant lead made it count as "no cue"
     self.done_ids: set[int] = set()
 
     self.output_v_target = V_CRUISE_UNSET
@@ -106,6 +190,9 @@ class StopSignAssist:
     self.node_id = None
     self.distance = 0.0
     self.confirmed = False
+    self.confirm_filter.x = 0.0
+    self.cue = StopCue()
+    self.cue_lead = False
 
   def _finish_sign(self) -> None:
     if self.node_id is not None:
@@ -139,7 +226,28 @@ class StopSignAssist:
     if (self.state, self.node_id) != prev and self.state != StopSignState.disabled:
       cloudlog.event("stop_sign", shadow=self.shadow, state=self.state.name, prev=prev[0].name, sign=self.node_id,
                      dist=round(self.distance, 1), v=round(v_ego, 2), v_target=round(min(self.output_v_target, 99.0), 2),
-                     confirmed=self.confirmed, coast_at=round(coast_distance(v_ego), 1))
+                     confirmed=self.confirmed, coast_at=round(coast_distance(v_ego), 1), **self._confirm_log())
+
+  def _confirm_log(self) -> dict:
+    """The confirmer's raw and filtered values, for tuning its thresholds from shadow drives."""
+    return {"confirm_raw": self.cue.raw, "confirm_filt": round(self.confirm_filter.x, 3),
+            "plan_v_min": None if self.cue.v_min is None else round(self.cue.v_min, 2),
+            "plan_shortfall": round(self.cue.shortfall, 3), "lead": self.cue_lead}
+
+  def _confirm(self, sm, v_ego: float) -> None:
+    """Feed this frame to the confirmer and latch self.confirmed for the current sign once the filter agrees."""
+    if not (self.is_active or self.distance <= confirm_distance(v_ego)):
+      self.confirm_filter.x = 0.0   # too far out for a slowdown to be about this sign
+      self.cue, self.cue_lead = StopCue(), False
+      return
+    model = sm['modelV2']
+    self.cue = model_stop_cue(model, v_ego)
+    self.cue_lead = self.cue.raw and lead_relevant(sm, model)
+    self.confirm_filter.update(float(self.cue.raw and not self.cue_lead))
+    if self.confirm_filter.x >= CONFIRM_THRESHOLD:
+      self.confirmed = True
+      cloudlog.event("stop_sign_confirmed", shadow=self.shadow, sign=self.node_id, dist=round(self.distance, 1),
+                     v=round(v_ego, 2), state=self.state.name, **self._confirm_log())
 
   def _update(self, sm, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float, now_s: float) -> None:
     self.frame += 1
@@ -165,12 +273,13 @@ class StopSignAssist:
       return
     _, self.distance = located
 
-    if not self.confirmed and model_wants_stop(sm['modelV2']):
-      self.confirmed = True
+    if not self.confirmed:
+      self._confirm(sm, v_ego)
 
     if self.state == StopSignState.stopped or (v_ego < STOPPED_V and self.confirmed and self.distance < STOPPED_NEAR_M):
+      # held here until the driver taps the accelerator to proceed (long_override above); never released by itself
       self.state = StopSignState.stopped
-      self.output_v_target = 0.0
+      self.output_v_target = STOP_V_TARGET
     elif not self.is_active and self.distance > coast_distance(v_ego):
       self.state = StopSignState.idle
       self.output_v_target = V_CRUISE_UNSET

@@ -11,12 +11,13 @@ from types import SimpleNamespace
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import (
-  A_COMFORT, COAST_START_M, STOP_MARGIN_M, StopSignAssist, StopSignState,
+  A_COMFORT, COAST_START_M, CONFIRM_FILTER_S, CONFIRM_THRESHOLD, STOP_MARGIN_M, STOP_V_TARGET, StopSignAssist,
+  StopSignState, braking_v_target, confirm_distance, lead_relevant, model_stop_cue,
 )
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign import road_geometry
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.road_geometry import RoadGeometry, WayAtNode
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_direction import (
-  Applies, angle_diff, approaches_from_ways, parse_direction, sign_applies,
+  Applies, angle_diff, approaches_from_ways, parse_direction, sign_applies, travel_from_facing,
 )
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_map import (
   EARTH_R, StopSign, StopSignMap, find_stop_ahead, resolve_approaches, stop_signs_from_cell,
@@ -55,12 +56,36 @@ def gps(lat, lon, bearing=0.0, speed=10.0, fix=True, acc=3.0, t=NOW):
                          horizontalAccuracy=acc, unixTimestampMillis=int(t * 1e3))
 
 
+T_IDXS = [10.0 * (i / 32) ** 2 for i in range(33)]   # the model plan's time base (ModelConstants.T_IDXS)
+
+
+def plan(v0, decel=0.0, v_floor=0.0, should_stop=False):
+  """A model plan from v0 slowing at `decel` m/s^2 down to v_floor (decel 0: a steady plan)."""
+  vel, pos, x = [], [], 0.0
+  for i, t in enumerate(T_IDXS):
+    v = max(v0 - decel * t, v_floor)
+    if i:
+      x += (vel[-1] + v) / 2 * (t - T_IDXS[i - 1])
+    vel.append(v)
+    pos.append(x)
+  return SimpleNamespace(action=SimpleNamespace(shouldStop=should_stop), velocity=SimpleNamespace(x=vel),
+                         position=SimpleNamespace(x=pos))
+
+
 def model(stop=False, min_v=10.0):
-  return SimpleNamespace(action=SimpleNamespace(shouldStop=stop), velocity=SimpleNamespace(x=[min_v] * 33))
+  """stop: a plan that comes to a halt within a few metres; otherwise a steady plan at min_v."""
+  return plan(1.0, decel=1.0) if stop else plan(min_v)
 
 
-def sm_at(g, m):
-  return {"gpsLocation": g, "modelV2": m}
+def sm_at(g, m, lead=None):
+  sm = {"gpsLocation": g, "modelV2": m}
+  if lead is not None:
+    sm["radarState"] = SimpleNamespace(leadOne=lead)
+  return sm
+
+
+def lead_at(d_rel, present=True):
+  return SimpleNamespace(present=present, dRel=d_rel)
 
 
 # ---- map lookup ----
@@ -172,6 +197,7 @@ def test_comfortable_stop_before_the_sign():
 def test_braking_profile_is_comfortable():
   # the target follows v^2 = 2 a d: at 20 m to go it should ask for ~sqrt(2 * 1.0 * 20) = 6.3 m/s or less
   ctrl = make([StopSign(1, *north_of(LAT0, LON0, 20 + STOP_MARGIN_M))])
+  ctrl.node_id = 1   # already this sign's: a newly found sign starts unconfirmed, and one frame no longer confirms
   ctrl.confirmed = True
   ctrl.update(sm_at(gps(LAT0, LON0, speed=11.0), model(stop=True)), True, False, 11.0, 0.0, NOW)
   assert ctrl.state == StopSignState.braking
@@ -208,6 +234,143 @@ def test_bad_gps_never_starts_a_stop():
   for g in (gps(LAT0, LON0, fix=False), gps(LAT0, LON0, acc=50.0), gps(LAT0, LON0, t=NOW - 10)):
     ctrl.update(sm_at(g, model(stop=True)), True, False, 10.0, 0.0, NOW)
     assert ctrl.output_v_target == V_CRUISE_UNSET
+
+
+# ---- model confirmation ----
+
+def test_stop_cue_reads_the_shape_of_the_plan():
+  # slowing 10 -> 6 m/s: nowhere near a stop, yet the plan's slowest point is under 70% of the current speed
+  cue = model_stop_cue(plan(10.0, decel=1.0, v_floor=6.0), 10.0)
+  assert cue.slowing and cue.raw and abs(cue.v_min - 6.0) < 1e-6
+  assert not model_stop_cue(plan(10.0, decel=1.0, v_floor=7.5), 10.0).raw       # a mild slowdown is not a cue
+  # the floor keeps it working at low speed: 1.2 -> 0.9 m/s is no 30% drop, but the plan is all but stopped
+  assert model_stop_cue(plan(1.2, decel=0.5, v_floor=0.9), 1.2).slowing
+  # a steady plan is no cue at any speed, whichever test reads it (the end-point test is off at low speed)
+  for v in (0.5 + 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0, 30.0):
+    cue = model_stop_cue(plan(v), v)
+    assert not cue.raw, (v, cue)
+  # end-point shortfall on its own: speeds that stay above the ratio test but a plan that ends well short
+  short = plan(10.0)
+  short.position.x = [x * 0.6 for x in short.position.x]
+  cue = model_stop_cue(short, 10.0)
+  assert cue.short and not cue.slowing and cue.raw and 0.3 < cue.shortfall < 0.5
+  short.position.x = [x * 0.85 for x in plan(10.0).position.x]
+  assert not model_stop_cue(short, 10.0).raw
+  # shouldStop is a standstill-hold flag, not a cue; an empty or missing plan is no cue either
+  assert not model_stop_cue(plan(10.0, should_stop=True), 10.0).raw
+  empty = SimpleNamespace(action=SimpleNamespace(shouldStop=True), velocity=SimpleNamespace(x=[]), position=SimpleNamespace(x=[]))
+  assert not model_stop_cue(empty, 10.0).raw and not model_stop_cue(SimpleNamespace(), 10.0).raw
+
+
+def approach(ctrl, sign_m, v, model_at, seconds, lead=None):
+  """Drive north at a constant v toward a sign, model_at(frame) giving each frame's plan. Returns the frame at which
+  the controller confirmed (None if it never did)."""
+  confirmed_at = None
+  for i in range(int(seconds / DT_MDL)):
+    lat, lon = north_of(LAT0, LON0, v * DT_MDL * i)
+    ctrl.update(sm_at(gps(lat, lon, speed=v), model_at(i), lead), True, False, v, 0.0, NOW)
+    if ctrl.confirmed and confirmed_at is None:
+      confirmed_at = i
+  return confirmed_at
+
+
+def test_confirms_on_a_decelerating_plan_long_before_a_stop():
+  # 10 m/s, the model planning to slow to 4 m/s: its plan never dips under the old fixed 1.5 m/s test
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, 90))])
+  at = approach(ctrl, 90, 10.0, lambda i: plan(10.0, decel=1.0, v_floor=4.0), 4.0)
+  assert at is not None and ctrl.confirm_filter.x >= CONFIRM_THRESHOLD
+  # ...after about one filter time constant of agreement, still at full speed
+  assert CONFIRM_FILTER_S - 0.2 <= at * DT_MDL <= CONFIRM_FILTER_S + 0.3, at
+  assert ctrl.state == StopSignState.braking or ctrl.output_v_target < 10.0
+
+
+def test_one_noisy_frame_does_not_confirm():
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, 90))])
+  stop_frames = {10}
+  at = approach(ctrl, 90, 10.0, lambda i: plan(10.0, decel=3.0) if i in stop_frames else plan(10.0), 4.0)
+  assert at is None and not ctrl.confirmed and ctrl.confirm_filter.x < 0.1
+  # nor does a cue that flickers a quarter of the time
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, 90))])
+  at = approach(ctrl, 90, 10.0, lambda i: plan(10.0, decel=3.0) if i % 4 == 0 else plan(10.0), 4.0)
+  assert at is None and ctrl.confirm_filter.x < CONFIRM_THRESHOLD
+
+
+def test_constant_speed_plan_never_confirms():
+  for v in (6.0, 10.0, 15.0):
+    ctrl = make([StopSign(1, *north_of(LAT0, LON0, 120))])
+    assert approach(ctrl, 120, v, lambda i, v=v: plan(v, should_stop=True), 100 / v) is None, v
+    assert ctrl.confirm_filter.x == 0.0 and ctrl.state == StopSignState.coasting, v
+
+
+def test_relevant_lead_excludes_the_cue():
+  slowing = lambda i: plan(10.0, decel=1.0)   # stops in 50 m  # noqa: E731
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, 90))])
+  assert approach(ctrl, 90, 10.0, slowing, 4.0, lead=lead_at(30.0)) is None     # the plan slows for the car in front
+  assert ctrl.confirm_filter.x == 0.0 and ctrl.cue.raw and ctrl.cue_lead
+  # a lead far beyond where the plan ends, or none, is not the reason
+  for lead in (lead_at(120.0), lead_at(30.0, present=False), None):
+    ctrl = make([StopSign(1, *north_of(LAT0, LON0, 90))])
+    assert approach(ctrl, 90, 10.0, slowing, 4.0, lead=lead) is not None, lead
+  assert lead_relevant(sm_at(None, plan(10.0, decel=1.0), lead_at(55.0)), plan(10.0, decel=1.0))
+  assert not lead_relevant(sm_at(None, plan(10.0, decel=1.0)), plan(10.0, decel=1.0))   # no radarState in sm
+
+
+def test_confirmation_latches_and_resets_per_sign():
+  first, second = StopSign(1, *north_of(LAT0, LON0, 60)), StopSign(2, *north_of(LAT0, LON0, 260))
+  ctrl = make([first, second])
+  # the cue is there for 2 s, then gone: the first sign stays confirmed
+  assert approach(ctrl, 60, 5.0, lambda i: plan(5.0, decel=1.0) if i < 40 else plan(5.0), 4.0) is not None
+  assert ctrl.node_id == 1 and ctrl.confirmed
+  ctrl.update(sm_at(gps(*north_of(LAT0, LON0, 20), speed=5.0), plan(5.0)), True, True, 5.0, 0.0, NOW)   # gas: sign 1 is done
+  assert ctrl.node_id == 2 and not ctrl.confirmed and ctrl.confirm_filter.x == 0.0
+
+
+def test_slowdown_far_from_the_sign_is_not_about_it():
+  v = 10.0
+  far = confirm_distance(v) + STOP_MARGIN_M + 60
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, far))])
+  assert approach(ctrl, far, v, lambda i: plan(v, decel=1.0), 3.0) is None      # 30 m travelled: still out of range
+  assert ctrl.node_id == 1 and ctrl.confirm_filter.x == 0.0
+  assert approach(ctrl, far, v, lambda i: plan(v, decel=1.0), 3.0) is None      # (the helper restarts from LAT0)
+  near = StopSign(1, *north_of(LAT0, LON0, confirm_distance(v) + STOP_MARGIN_M - 5))
+  ctrl = make([near])
+  assert approach(ctrl, 0, v, lambda i: plan(v, decel=1.0), 3.0) is not None
+
+
+def test_confirmation_is_logged(monkeypatch=None):
+  import openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller as mod
+  events = []
+  orig = mod.cloudlog.event
+  mod.cloudlog.event = lambda name, **kw: events.append((name, kw))
+  try:
+    ctrl = make([StopSign(1, *north_of(LAT0, LON0, 90))])
+    approach(ctrl, 90, 10.0, lambda i: plan(10.0, decel=1.0, v_floor=4.0), 4.0)
+  finally:
+    mod.cloudlog.event = orig
+  latched = [kw for name, kw in events if name == "stop_sign_confirmed"]
+  assert len(latched) == 1   # once per sign
+  kw = latched[0]
+  assert kw["sign"] == 1 and kw["v"] == 10.0 and 55.0 < kw["dist"] < 75.0 and kw["shadow"] is False
+  assert kw["confirm_raw"] is True and kw["confirm_filt"] >= round(CONFIRM_THRESHOLD, 3) and kw["plan_v_min"] == 4.0
+  # every state change carries the confirmer's raw and filtered values
+  changes = [kw for name, kw in events if name == "stop_sign"]
+  assert changes and all({"confirm_raw", "confirm_filt", "plan_v_min", "plan_shortfall", "lead"} <= kw.keys() for kw in changes)
+  assert changes[0]["confirm_filt"] < CONFIRM_THRESHOLD and changes[0]["confirmed"] is False
+  assert changes[-1]["state"] == "braking" and changes[-1]["confirmed"] is True
+
+
+def test_stop_target_is_zero_not_a_rolling_speed():
+  assert STOP_V_TARGET == 0.0
+  assert braking_v_target(0.0, 0.0) == 0.0 and braking_v_target(-3.0, 2.0) == 0.0 and braking_v_target(1.5, 2.0) == 0.0
+  # the profile only ever falls toward zero as the stop point nears
+  targets = [braking_v_target(d, 0.0) for d in (30.0, 10.0, 3.0, 1.0, 0.1, 0.0)]
+  assert targets == sorted(targets, reverse=True) and targets[-1] == 0.0
+  # a rolling approach (2.4 mph) at the stop point is still asked for zero, and the hold is at zero
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, STOP_MARGIN_M + 0.5))])
+  ctrl.node_id = 1
+  ctrl.confirmed = True
+  ctrl.update(sm_at(gps(LAT0, LON0, speed=2.2), plan(2.2)), True, False, 1.07, 0.0, NOW)
+  assert ctrl.state == StopSignState.braking and ctrl.output_v_target == 0.0
 
 
 # ---- shadow mode ----
@@ -285,7 +448,8 @@ def test_parse_direction():
   assert parse_direction("NE") == (45.0,) and parse_direction("nnw") == (337.5,)
   assert parse_direction("N;S") == (0.0, 180.0)
   assert parse_direction("Forward") == "forward" and parse_direction("backward") == "backward"
-  for bad in (None, "", "both", "all", "45-135", "nan", 90):
+  assert parse_direction("both") == "both" and parse_direction(" Both ") == "both"
+  for bad in (None, "", "all", "45-135", "nan", 90):
     assert parse_direction(bad) is None, bad
 
 
@@ -312,37 +476,119 @@ def test_compass_directions_are_unknown_until_verified():
 
 
 @trusting_compass
-def test_numeric_direction():
-  north_bound = tagged(1, *north_of(LAT0, LON0, 80), direction="0")
-  assert sign_applies(north_bound, 0.0) == Applies.YES
-  assert sign_applies(north_bound, 350.0) == Applies.YES        # wraps around north
-  assert sign_applies(north_bound, 90.0) == Applies.NO          # crossing traffic
-  assert sign_applies(north_bound, 180.0) == Applies.NO         # oncoming
-  assert sign_applies(north_bound, 70.0) == Applies.UNKNOWN     # in between: no decision
+def test_numeric_direction_is_the_way_the_sign_faces():
+  # were compass values ever trusted, they'd be read as the wiki defines them: the sign FACES that way, so the
+  # traffic it holds travels the opposite way ("traveling north ... the sign is facing south ... direction=180")
+  assert travel_from_facing((180.0, 350.0)) == (0.0, 170.0)
+  faces_south = tagged(1, *north_of(LAT0, LON0, 80), direction="180")   # holds northbound traffic
+  assert faces_south.approaches == (0.0,)
+  assert sign_applies(faces_south, 0.0) == Applies.YES
+  assert sign_applies(faces_south, 350.0) == Applies.YES       # wraps around north
+  assert sign_applies(faces_south, 90.0) == Applies.NO         # crossing traffic
+  assert sign_applies(faces_south, 180.0) == Applies.NO        # oncoming
+  assert sign_applies(faces_south, 70.0) == Applies.UNKNOWN    # in between: no decision
   # find_stop_ahead skips it for a car the sign isn't for, keeps it for one it is
-  assert find_stop_ahead(LAT0, LON0, 0.0, [north_bound]).node_id == 1
-  south_bound = tagged(2, *north_of(LAT0, LON0, 80), direction="180")
-  assert find_stop_ahead(LAT0, LON0, 0.0, [south_bound]) is None
+  assert find_stop_ahead(LAT0, LON0, 0.0, [faces_south]).node_id == 1
+  faces_north = tagged(2, *north_of(LAT0, LON0, 80), direction="0")     # holds southbound traffic
+  assert find_stop_ahead(LAT0, LON0, 0.0, [faces_north]) is None
+  # the road-tile path reads them the same way
+  assert approaches_from_ways("180", [WayAtNode(10, "residential", 1, 3, 0.0, 180.0)]) == (0.0,)
 
 
 @trusting_compass
-def test_cardinal_direction():
-  sign = tagged(1, *east_of(LAT0, LON0, 60), direction="E")
+def test_cardinal_direction_is_the_way_the_sign_faces():
+  sign = tagged(1, *east_of(LAT0, LON0, 60), direction="W")   # faces west: holds eastbound traffic
   assert sign.approaches == (90.0,)
   assert find_stop_ahead(LAT0, LON0, 90.0, [sign]).node_id == 1
-  west = tagged(2, *east_of(LAT0, LON0, 60), direction="W")
-  assert find_stop_ahead(LAT0, LON0, 90.0, [west]) is None
+  east = tagged(2, *east_of(LAT0, LON0, 60), direction="E")
+  assert find_stop_ahead(LAT0, LON0, 90.0, [east]) is None
   assert sign_applies(tagged(3, LAT0, LON0, direction="NE;SW"), 225.0) == Applies.YES
 
 
 def test_all_way_stop_always_applies():
-  sign = tagged(1, *north_of(LAT0, LON0, 80), direction="180", stop="all")
-  assert sign.all_way and sign_applies(sign, 0.0) == Applies.YES
+  for direction in (None, "180", "0", "both", "45-135"):
+    tags = {"stop": "all"} if direction is None else {"stop": "all", "direction": direction}
+    sign = tagged(1, *north_of(LAT0, LON0, 80), **tags)
+    assert sign.all_way and sign.approaches is None and not sign.needs_geometry, direction
+    for bearing in (0.0, 90.0, 180.0):
+      assert sign_applies(sign, bearing) == Applies.YES, (direction, bearing)
+    assert find_stop_ahead(LAT0, LON0, 0.0, [sign]).node_id == 1, direction
+
+
+@trusting_compass
+def test_all_way_stop_is_never_narrowed_by_a_compass_value():
+  for direction in ("0", "180", "E"):
+    sign = tagged(1, *north_of(LAT0, LON0, 80), direction=direction, stop="all")
+    assert sign.approaches is None and sign_applies(sign, 0.0) == Applies.YES, direction
+    assert approaches_from_ways(direction, [WayAtNode(10, "residential", 1, 3, 0.0, 180.0)], explicit_only=True) is None
+
+
+def test_all_way_stop_with_explicit_direction_holds_one_approach():
+  # stop=all is put on every per-approach node of a detailed all-way stop: forward/backward on a single way outranks it
+  mid_way = [WayAtNode(10, "residential", 1, 3, forward_bearing=0.0, backward_bearing=180.0)]
+  junction = mid_way + [WayAtNode(11, "residential", 4, 9, 90.0, 270.0)]
+  fwd = tagged(1, *north_of(LAT0, LON0, 80), stop="all", direction="forward")
+  bwd = tagged(2, *north_of(LAT0, LON0, 80), stop="all", direction="backward")
+  assert fwd.needs_geometry and bwd.needs_geometry and sign_applies(bwd, 0.0) == Applies.YES   # unresolved: all approaches
+  assert approaches_from_ways("backward", mid_way, explicit_only=True) == (180.0,)
+  bwd_resolved = replace(bwd, approaches=(180.0,))
+  assert sign_applies(bwd_resolved, 0.0) == Applies.NO      # forward traffic: the opposing approach's node
+  assert sign_applies(bwd_resolved, 180.0) == Applies.YES
+  assert find_stop_ahead(LAT0, LON0, 0.0, [bwd_resolved]) is None
+  assert find_stop_ahead(LAT0, LON0, 0.0, [replace(fwd, approaches=(0.0,))]).node_id == 1
+  # nothing but an explicit forward/backward on a single way narrows it
+  assert approaches_from_ways("backward", junction, explicit_only=True) is None   # a junction node
+  assert approaches_from_ways("backward", None, explicit_only=True) is None       # no road tile
+  minor_end = WayAtNode(10, "residential", 4, 5, forward_bearing=0.0, backward_bearing=None)
+  major = WayAtNode(11, "secondary", 3, 9, forward_bearing=90.0, backward_bearing=270.0)
+  assert approaches_from_ways(None, [minor_end, major], explicit_only=True) is None
+  assert approaches_from_ways(None, [minor_end], explicit_only=True) is None
+
+
+def test_direction_both_applies_to_both_directions():
+  sign = tagged(1, *north_of(LAT0, LON0, 80), direction="both")
+  assert sign.approaches is None and not sign.needs_geometry
+  for bearing in (0.0, 180.0, 90.0):
+    assert sign_applies(sign, bearing) == Applies.YES, bearing
   assert find_stop_ahead(LAT0, LON0, 0.0, [sign]).node_id == 1
+  assert approaches_from_ways("both", [WayAtNode(10, "residential", 1, 3, 0.0, 180.0, 5.0, 200.0)]) is None   # not narrowed
+
+
+def test_direction_fallback_keys():
+  where = north_of(LAT0, LON0, 80)
+  assert tagged(1, *where, **{"stop:direction": "backward"}).direction == "backward"
+  assert tagged(1, *where, **{"traffic_sign:direction": "Forward"}).direction == "Forward"
+  # `direction` wins when present, then stop:direction
+  both_keys = {"direction": "forward", "stop:direction": "backward", "traffic_sign:direction": "both"}
+  assert tagged(1, *where, **both_keys).direction == "forward"
+  assert tagged(1, *where, **{"stop:direction": "backward", "traffic_sign:direction": "both"}).direction == "backward"
+  assert tagged(1, *where, **{"direction": 5, "stop:direction": "backward"}).direction == "backward"   # not a string
+  assert tagged(1, *where).direction is None
+  # ...and they resolve like `direction` does
+  way = [WayAtNode(10, "residential", 1, 3, forward_bearing=0.0, backward_bearing=180.0)]
+  sign = resolve_approaches([tagged(1, *where, **{"stop:direction": "backward"})], SimpleNamespace(ways_at=lambda lat, lon: way))[0]
+  assert sign.approaches == (180.0,) and find_stop_ahead(LAT0, LON0, 0.0, [sign]) is None
+  assert sign_applies(tagged(1, *where, **{"traffic_sign:direction": "both"}), 0.0) == Applies.YES
+
+
+def test_untagged_mid_way_stop_holds_traffic_toward_the_nearer_end():
+  def mid(start_m, end_m):
+    return [WayAtNode(10, "residential", 2, 5, forward_bearing=0.0, backward_bearing=180.0, start_m=start_m, end_m=end_m)]
+  assert approaches_from_ways(None, mid(200.0, 8.0)) == (0.0,)       # the end is the junction: travel in node order
+  assert approaches_from_ways(None, mid(8.0, 200.0)) == (180.0,)     # the start is: travel against node order
+  assert approaches_from_ways(None, mid(40.0, 80.0)) == (180.0,)     # just inside both limits
+  # no end is clearly nearer: UNKNOWN
+  assert approaches_from_ways(None, mid(100.0, 100.0)) is None       # the middle of the block
+  assert approaches_from_ways(None, mid(30.0, 45.0)) is None         # near, but not at most half the other distance
+  assert approaches_from_ways(None, mid(41.0, 500.0)) is None        # clearly nearer, but too far to be its stop line
+  assert approaches_from_ways(None, mid(None, None)) is None         # geometry without distances
+  # a stop=all node is not narrowed by the rule, and an unreadable direction is not guessed around
+  assert approaches_from_ways(None, mid(200.0, 8.0), explicit_only=True) is None
+  assert approaches_from_ways("45-135", mid(200.0, 8.0)) is None
 
 
 def test_unknown_direction_keeps_the_sign():
-  for tags in ({}, {"direction": "both"}, {"direction": "forward"}, {"stop": "minor"}):
+  for tags in ({}, {"direction": "45-135"}, {"direction": "forward"}, {"stop": "minor"}):
     sign = tagged(1, *north_of(LAT0, LON0, 80), **tags)
     assert sign.approaches is None and sign_applies(sign, 0.0) == Applies.UNKNOWN, tags
     assert find_stop_ahead(LAT0, LON0, 0.0, [sign]).node_id == 1, tags
@@ -417,6 +663,10 @@ def test_road_geometry_finds_the_ways_at_a_node(tmp_path):
   assert [(w.way_id, w.highway, w.index, w.count) for w in ways] == [(10, "residential", 2, 3), (11, "secondary", 1, 3)]
   assert abs(ways[0].forward_bearing - 0.0) < 0.5 and ways[0].backward_bearing is None
   assert abs(ways[1].forward_bearing - 90.0) < 0.5 and abs(ways[1].backward_bearing - 270.0) < 0.5
+  assert abs(ways[0].start_m - 100.0) < 0.5 and ways[0].end_m == 0.0      # distance along the way to each end
+  assert abs(ways[1].start_m - 100.0) < 0.5 and abs(ways[1].end_m - 100.0) < 0.5
+  mid = geo.ways_at(*north_of(TLAT, TLON, -40))
+  assert len(mid) == 1 and abs(mid[0].start_m - 60.0) < 0.5 and abs(mid[0].end_m - 40.0) < 0.5
   assert geo.ways_at(*north_of(TLAT, TLON, -70)) == []         # on no node
   assert RoadGeometry(root=str(tmp_path / "none")).ways_at(*j) is None
 
@@ -442,6 +692,39 @@ def test_two_way_stop_skipped_from_the_major_road(tmp_path):
   assert find_stop_ahead(*south, 0.0, [bwd]) is None
   north = north_of(TLAT, TLON, 20)
   assert find_stop_ahead(*north, 180.0, [bwd]).node_id == 4
+
+
+def test_opposing_approach_node_skipped_after_the_junction(tmp_path):
+  # a north-south road through a junction at j, drawn south -> north and split at j, with each approach's stop node
+  # 8 m before the junction: `near` holds northbound traffic, `beyond` (8 m past j) holds southbound traffic
+  j = (TLAT, TLON)
+  near, beyond = north_of(TLAT, TLON, -8), north_of(TLAT, TLON, 8)
+  half = north_of(TLAT, TLON, 150)   # a node in the middle of the northern block
+  write_tile(str(tmp_path), [(10, 12, [north_of(TLAT, TLON, -300), near, j]),
+                             (11, 12, [j, beyond, half, north_of(TLAT, TLON, 300)]),
+                             (12, 12, [east_of(TLAT, TLON, -100), j, east_of(TLAT, TLON, 100)])])
+  geo = RoadGeometry(root=str(tmp_path))
+  south = north_of(TLAT, TLON, -80)
+  for tags in ({}, {"stop": "all", "direction": "forward"}, {"stop": "all", "direction": "backward"}, {"stop": "all"}):
+    a, b, c = resolve_approaches([tagged(1, *near, **tags), tagged(2, *beyond, **tags), tagged(3, *half, **tags)], geo)
+    if tags == {"stop": "all"}:
+      # an all-way stop with no direction holds every approach, as before
+      assert a.approaches is None and b.approaches is None
+      assert find_stop_ahead(*south, 0.0, [b]).node_id == 2
+    elif tags.get("direction") == "forward":
+      # both nodes tagged forward: both hold northbound traffic, stop=all or not
+      assert find_stop_ahead(*south, 0.0, [b]).node_id == 2
+    elif tags.get("direction") == "backward":
+      assert find_stop_ahead(*south, 0.0, [a, b]) is None                     # stop=all, yet not for forward traffic
+      assert find_stop_ahead(*north_of(TLAT, TLON, 80), 180.0, [a, b]).node_id == 2
+    else:
+      # untagged: the nearest-junction rule. Northbound stops at `near` and not again at `beyond`
+      assert angle_diff(a.approaches[0], 0.0) < 0.5 and angle_diff(b.approaches[0], 180.0) < 0.5
+      assert find_stop_ahead(*south, 0.0, [a, b]).node_id == 1
+      assert find_stop_ahead(*south, 0.0, [b]) is None
+      assert find_stop_ahead(*north_of(TLAT, TLON, 80), 180.0, [a, b]).node_id == 2
+      assert c.approaches is None                                             # mid-block: can't tell, kept
+      assert find_stop_ahead(*north_of(TLAT, TLON, 100), 0.0, [c]).node_id == 3
 
 
 def test_stop_sign_map_resolves_in_the_background(tmp_path):

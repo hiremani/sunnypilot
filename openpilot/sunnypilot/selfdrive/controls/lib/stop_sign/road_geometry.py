@@ -8,6 +8,7 @@ The ways a map point lies on, from sunnypilot mapd's offline road tiles: the fil
 (webhud/maptiles.py MapTiles: <mapd root>/offline/<lat>/<lon>/<minLat>_<minLon>_<maxLat>_<maxLon>, one packed
 Cap'n Proto message per 0.25 deg tile). Each Way keeps its OSM id, highway class, bounding box and its nodes'
 coordinates *in OSM node order* (road_tile.capnp), which is what an OSM direction=forward|backward is relative to.
+The distance along the way from the node to each end is reported too (the nearest-junction rule for untagged signs).
 Ways carry coordinates, not node ids, so a sign node is matched to a way node by position (both datasets copy
 the same OSM node, so they agree to well under a metre).
 
@@ -36,6 +37,7 @@ RANK = {"motorway": 0, "motorway_link": 0, "trunk": 0, "trunk_link": 0, "primary
         "living_street": 4}
 NODE_SNAP_M = 1.0          # a sign this close to a way's node sits on that node
 M_PER_DEG = 111_320.0
+EARTH_R = 6371000.0
 MAX_TILES = 2              # decoded tiles kept (a 3 x 3 feature-cell window spans at most 4 tiles, usually 1)
 TRAVERSAL_LIMIT_WORDS = 1 << 40
 
@@ -49,6 +51,8 @@ class WayAtNode:
   count: int                       # nodes in the way
   forward_bearing: float | None    # deg, travel arriving at the node in node order (i-1 -> i); None at the first node
   backward_bearing: float | None   # deg, travel arriving against node order (i+1 -> i); None at the last node
+  start_m: float | None = None     # m along the way from its first node to this one
+  end_m: float | None = None       # m along the way from this node to its last one
 
 
 def bearing_deg(lat0: float, lon0: float, lat1: float, lon1: float) -> float:
@@ -56,6 +60,13 @@ def bearing_deg(lat0: float, lon0: float, lat1: float, lon1: float) -> float:
   dx = math.radians(lon1 - lon0) * math.cos(math.radians((lat0 + lat1) / 2))
   dy = math.radians(lat1 - lat0)
   return math.degrees(math.atan2(dx, dy)) % 360.0
+
+
+def distance_m(lat0: float, lon0: float, lat1: float, lon1: float) -> float:
+  """Metres between two nearby points (equirectangular, the same approximation as bearing_deg)."""
+  dx = math.radians(lon1 - lon0) * math.cos(math.radians((lat0 + lat1) / 2))
+  dy = math.radians(lat1 - lat0)
+  return math.hypot(dx, dy) * EARTH_R
 
 
 def _load_schema():
@@ -97,7 +108,8 @@ class RoadTile:
       fwd = bearing_deg(*pts[hit - 1], *pts[hit]) if hit > 0 else None
       bwd = bearing_deg(*pts[hit + 1], *pts[hit]) if hit < n - 1 else None
       cls = HIGHWAY_CLASSES[w.highway] if w.highway < len(HIGHWAY_CLASSES) else "unknown"
-      out.append(WayAtNode(int(w.id), cls, hit, n, fwd, bwd))
+      seg = [distance_m(*pts[i], *pts[i + 1]) for i in range(n - 1)]
+      out.append(WayAtNode(int(w.id), cls, hit, n, fwd, bwd, sum(seg[:hit]), sum(seg[hit:])))
     return out
 
 

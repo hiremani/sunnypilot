@@ -9,7 +9,8 @@ MapFeatures: highway=stop nodes, FEAT_DEG cells under <mapd root>/features/). Ce
 missing, on a background thread, so the 20 Hz planner never waits on disk or the network.
 
 A sign that clearly holds another direction of travel (stop_sign_direction.py: its direction tag, or the road it
-sits on in mapd's road tiles, road_geometry.py) is skipped; one that can't be told apart is kept as before. A cell's
+sits on in mapd's road tiles, road_geometry.py) is skipped; one that can't be told apart is kept as before. That
+includes a stop=all node with an explicit forward/backward: it is one approach's node of an all-way stop. A cell's
 signs are usable as soon as the cell is read; the road-tile lookup that follows, on the same background thread,
 only adds the approaches it could resolve.
 """
@@ -23,7 +24,7 @@ from dataclasses import dataclass, replace
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.road_geometry import RoadGeometry
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_direction import (
-  Applies, approaches_from_tags, approaches_from_ways, sign_applies,
+  Applies, approaches_from_tags, approaches_from_ways, direction_from_tags, is_both, is_relative, sign_applies,
 )
 from openpilot.sunnypilot.webhud.maptiles import FEAT_DEG, MapFeatures
 
@@ -40,13 +41,15 @@ class StopSign:
   node_id: int
   lat: float
   lon: float
-  direction: str | None = None                   # the OSM direction tag, as mapped
-  all_way: bool = False                          # stop=all
+  direction: str | None = None                   # the OSM direction tag (or a synonym key's value), as mapped
+  all_way: bool = False                          # stop=all: every approach, unless an explicit forward/backward resolves
   approaches: tuple[float, ...] | None = None    # bearings of the traffic it holds; None: not known
 
   @property
   def needs_geometry(self) -> bool:
-    return not self.all_way and self.approaches is None
+    if self.approaches is not None or is_both(self.direction):
+      return False
+    return is_relative(self.direction) if self.all_way else True
 
 
 @dataclass(frozen=True)
@@ -64,19 +67,21 @@ def stop_signs_from_cell(cell: dict) -> list[StopSign]:
     except (TypeError, ValueError):
       continue
     if isinstance(tags, dict) and tags.get("highway") == "stop":
-      direction = tags.get("direction")
-      direction = direction if isinstance(direction, str) else None
-      out.append(StopSign(int(node_id), float(lat), float(lon), direction, tags.get("stop") == "all",
-                          approaches_from_tags(direction)))
+      direction = direction_from_tags(tags)
+      all_way = tags.get("stop") == "all"
+      # only an explicit forward/backward (road tiles, resolve_approaches) narrows an all-way stop, never a compass value
+      out.append(StopSign(int(node_id), float(lat), float(lon), direction, all_way,
+                          None if all_way else approaches_from_tags(direction)))
   return out
 
 
 def resolve_approaches(signs: list[StopSign], geometry: RoadGeometry) -> list[StopSign]:
-  """The signs with what the road tiles add: approaches for forward/backward and untagged signs. Blocking."""
+  """The signs with what the road tiles add: approaches for forward/backward and untagged signs (for a stop=all sign,
+  an explicit forward/backward only). Blocking."""
   out = []
   for s in signs:
     if s.needs_geometry:
-      approaches = approaches_from_ways(s.direction, geometry.ways_at(s.lat, s.lon))
+      approaches = approaches_from_ways(s.direction, geometry.ways_at(s.lat, s.lon), explicit_only=s.all_way)
       if approaches is not None:
         s = replace(s, approaches=approaches)
     out.append(s)
@@ -96,7 +101,7 @@ def find_stop_ahead(lat: float, lon: float, bearing_deg: float, signs, skip_ids=
     if s.node_id in skip_ids:
       continue
     if sign_applies(s, bearing_deg) == Applies.NO:
-      continue   # for another direction of travel (a crossing road's two-way stop)
+      continue   # for another direction of travel (a crossing road's two-way stop, the opposing approach's node)
     dx = math.radians(s.lon - lon) * cos_lat * EARTH_R  # east, m
     dy = math.radians(s.lat - lat) * EARTH_R            # north, m
     along = dx * hx + dy * hy
