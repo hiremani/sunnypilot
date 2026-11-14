@@ -122,3 +122,47 @@ class TestDesireHelperIntegration(OpenpilotTestCase):
     assert dh.lane_change_state == LaneChangeState.preLaneChange
     assert dh.lane_change_direction == LaneChangeDirection.left
     assert dh.desire == log.Desire.none
+
+
+class TestLaneTurnEndsAfterTheTurn(OpenpilotTestCase):
+  """On-vehicle 2026-11-14: with the blinker still on after a completed turn, the desire stayed on and the car tried
+  to turn again. Once the heading has rotated TURN_DONE_RAD the desire ends until that blinker goes off."""
+
+  def make(self):
+    from openpilot.common.realtime import DT_MDL
+    controller = LaneTurnController(DesireHelper())
+    controller.enabled = True
+    controller.lane_turn_value = LANE_CHANGE_SPEED_MIN
+    return controller, DT_MDL
+
+  def test_desire_ends_once_turned_and_waits_for_the_blinker(self):
+    import math
+    from openpilot.sunnypilot.selfdrive.controls.lib.lane_turn_desire import TURN_DONE_RAD
+    c, dt = self.make()
+    yaw = -0.5   # rad/s, a right turn (sign doesn't matter)
+    steps_to_done = math.ceil(TURN_DONE_RAD / (abs(yaw) * dt))
+    for _ in range(steps_to_done - 1):
+      c.update_lane_turn(False, False, False, True, 4.0, yaw_rate=yaw)
+      assert c.get_turn_direction() == TurnDirection.turnRight
+    c.update_lane_turn(False, False, False, True, 4.0, yaw_rate=yaw)
+    assert c.get_turn_direction() == TurnDirection.none          # turned: done
+    for _ in range(40):                                          # blinker still on, driving straight on the new road
+      c.update_lane_turn(False, False, False, True, 5.0, yaw_rate=0.0)
+      assert c.get_turn_direction() == TurnDirection.none
+    c.update_lane_turn(False, False, False, False, 5.0)          # blinker off
+    c.update_lane_turn(False, False, False, True, 5.0)           # next turn
+    assert c.get_turn_direction() == TurnDirection.turnRight
+
+  def test_straight_driving_keeps_the_desire(self):
+    c, _ = self.make()
+    for _ in range(200):
+      c.update_lane_turn(False, False, True, False, 4.0, yaw_rate=0.02)
+    assert c.get_turn_direction() == TurnDirection.turnLeft
+
+  def test_other_blinker_starts_a_new_turn(self):
+    c, dt = self.make()
+    for _ in range(100):
+      c.update_lane_turn(False, False, False, True, 4.0, yaw_rate=0.5)
+    assert c.get_turn_direction() == TurnDirection.none
+    c.update_lane_turn(False, False, True, False, 4.0, yaw_rate=0.0)
+    assert c.get_turn_direction() == TurnDirection.turnLeft
