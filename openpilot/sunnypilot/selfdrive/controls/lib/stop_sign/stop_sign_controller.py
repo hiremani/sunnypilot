@@ -172,6 +172,7 @@ class StopSignAssist:
     self.node_id: int | None = None
     self.distance = 0.0            # m to the stop point (sign minus margin)
     self.confirmed = False         # the model has planned to slow for this sign (latched until the sign changes)
+    self.too_late = False          # ...but only once a comfortable stop was no longer possible: never brake for it
     self.confirm_filter = FirstOrderFilter(0.0, CONFIRM_FILTER_S, DT_MDL)
     self.cue = StopCue()           # the last frame the confirmer read, for the log
     self.cue_lead = False          # ...and whether a relevant lead made it count as "no cue"
@@ -190,6 +191,7 @@ class StopSignAssist:
     self.node_id = None
     self.distance = 0.0
     self.confirmed = False
+    self.too_late = False
     self.confirm_filter.x = 0.0
     self.cue = StopCue()
     self.cue_lead = False
@@ -246,8 +248,12 @@ class StopSignAssist:
     self.confirm_filter.update(float(self.cue.raw and not self.cue_lead))
     if self.confirm_filter.x >= CONFIRM_THRESHOLD:
       self.confirmed = True
+      # Too late for a comfortable stop: never brake for it. On route 000000e5 (2026-11-14) a cross-street sign
+      # confirmed at 2.6 m and 24 mph; braking to a stop from there would be an emergency stop at a junction the driver
+      # was driving through. The driver handles this sign.
+      self.too_late = self.distance < braking_distance(v_ego)
       cloudlog.event("stop_sign_confirmed", shadow=self.shadow, sign=self.node_id, dist=round(self.distance, 1),
-                     v=round(v_ego, 2), state=self.state.name, **self._confirm_log())
+                     v=round(v_ego, 2), state=self.state.name, too_late=self.too_late, **self._confirm_log())
 
   def _update(self, sm, long_enabled: bool, long_override: bool, v_ego: float, a_ego: float, now_s: float) -> None:
     self.frame += 1
@@ -276,7 +282,8 @@ class StopSignAssist:
     if not self.confirmed:
       self._confirm(sm, v_ego)
 
-    if self.state == StopSignState.stopped or (v_ego < STOPPED_V and self.confirmed and self.distance < STOPPED_NEAR_M):
+    may_brake = self.confirmed and not self.too_late
+    if self.state == StopSignState.stopped or (v_ego < STOPPED_V and may_brake and self.distance < STOPPED_NEAR_M):
       # held here until the driver taps the accelerator to proceed (long_override above); never released by itself
       self.state = StopSignState.stopped
       self.output_v_target = STOP_V_TARGET
@@ -285,6 +292,6 @@ class StopSignAssist:
       self.output_v_target = V_CRUISE_UNSET
     else:
       coast_v = max(v_ego - COAST_DV, 0.0)
-      brake_v = braking_v_target(self.distance, v_ego) if self.confirmed else coast_v
+      brake_v = braking_v_target(self.distance, v_ego) if may_brake else coast_v
       self.state = StopSignState.braking if brake_v < coast_v else StopSignState.coasting
       self.output_v_target = min(coast_v, brake_v)

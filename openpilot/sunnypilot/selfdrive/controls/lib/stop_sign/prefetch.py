@@ -5,8 +5,10 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
-Download the map stop signs (webhud MapFeatures tiles) for an area ahead of time, on Wi-Fi, so Stop Sign Assist
-doesn't depend on fetching them mid-drive.
+Download what Stop Sign Assist reads for an area ahead of time, on Wi-Fi, so it doesn't depend on fetching mid-drive:
+the map stop signs (webhud MapFeatures tiles, from Overpass) and the road tiles the direction filter resolves
+forward/backward against (webhud MapTiles, the same mapd cells from map-data.pfeifer.dev). Without road tiles every
+forward/backward sign is UNKNOWN and cross-street signs are acted on (route 000000e5, 2026-11-14).
 
   prefetch.py --around LAT LON [--radius-km 15]
   prefetch.py --route 000000e3--e8d98c1676        (every tile a recorded drive passed through)
@@ -17,7 +19,8 @@ import math
 import sys
 import time
 
-from openpilot.sunnypilot.webhud.maptiles import FEAT_TILE_DEG, MapFeatures
+from openpilot.sunnypilot.webhud.maptiles import FEAT_TILE_DEG, MapFeatures, MapTiles, tile_name
+
 
 KM_PER_DEG_LAT = 111.32
 
@@ -28,6 +31,15 @@ def tiles_around(lat: float, lon: float, radius_km: float) -> list[tuple[int, in
   t0, t1 = math.floor((lat - dlat) / FEAT_TILE_DEG), math.floor((lat + dlat) / FEAT_TILE_DEG)
   u0, u1 = math.floor((lon - dlon) / FEAT_TILE_DEG), math.floor((lon + dlon) / FEAT_TILE_DEG)
   return [(t, u) for t in range(t0, t1 + 1) for u in range(u0, u1 + 1)]
+
+
+def road_tiles_for(feature_tiles: list[tuple[int, int]]) -> list[tuple[int, int, str]]:
+  """The mapd road tiles covering the given feature tiles (both are 0.25 deg on the same grid): (cell lat, cell lon, name)."""
+  out = set()
+  for tlat, tlon in feature_tiles:
+    lat, lon = (tlat + 0.5) * FEAT_TILE_DEG, (tlon + 0.5) * FEAT_TILE_DEG   # the tile's centre
+    out.add(tile_name(lat, lon))
+  return sorted(out)
 
 
 def tiles_for_route(route: str) -> list[tuple[int, int]]:
@@ -66,8 +78,18 @@ def main() -> int:
       failed.append(t)
     if i + 1 < len(todo):
       time.sleep(args.pause_s)
-  print(f"done: {len(todo) - len(failed)} fetched, {len(failed)} failed {failed if failed else ''}")
-  return 1 if failed else 0
+  print(f"stop signs: {len(todo) - len(failed)} fetched, {len(failed)} failed {failed if failed else ''}")
+
+  roads = MapTiles()
+  road_failed = []
+  road_tiles = road_tiles_for(tiles)
+  for clat, clon, name in road_tiles:
+    ok = roads.tile_path(clat, clon, name) is not None   # downloads its 2 x 2 deg cell once, if missing
+    print(f"road tile {clat}/{clon}/{name}: {'ok' if ok else 'FAILED'}", flush=True)
+    if not ok:
+      road_failed.append(name)
+  print(f"road tiles: {len(road_tiles) - len(road_failed)} of {len(road_tiles)} on disk")
+  return 1 if failed or road_failed else 0
 
 
 if __name__ == "__main__":

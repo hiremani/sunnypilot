@@ -754,6 +754,42 @@ def test_stop_sign_map_resolves_in_the_background(tmp_path):
 # tools/test_runner.py is unittest based and only collects TestCase methods: expose every test_* function above as
 # one, handing a fresh temporary directory to those that take tmp_path (as pytest would).
 
+
+def test_confirmation_too_late_never_brakes():
+  # route 000000e5: a cross-street sign confirmed at 2.6 m and 24 mph. Too late for a comfortable stop: coast, don't brake
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import braking_distance
+  v = 10.7   # 24 mph
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, STOP_MARGIN_M + 3.0))])
+  ctrl.node_id = 1
+  ctrl.state = StopSignState.coasting
+  ctrl.confirm_filter.x = 0.99          # the next frame latches
+  ctrl.update(sm_at(gps(LAT0, LON0, speed=v), model(stop=True)), True, False, v, 0.0, NOW)
+  assert ctrl.confirmed and ctrl.too_late and 3.0 < braking_distance(v)
+  assert ctrl.state != StopSignState.braking and ctrl.output_v_target > v - 1.0
+  for _ in range(10):
+    ctrl.update(sm_at(gps(LAT0, LON0, speed=v), model(stop=True)), True, False, v, 0.0, NOW)
+    assert ctrl.state != StopSignState.braking
+
+
+def test_confirmation_in_time_still_brakes():
+  v = 8.0
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, STOP_MARGIN_M + 60.0))])
+  ctrl.node_id = 1
+  ctrl.state = StopSignState.coasting
+  ctrl.confirm_filter.x = 0.99
+  ctrl.update(sm_at(gps(LAT0, LON0, speed=v), model(stop=True)), True, False, v, 0.0, NOW)
+  assert ctrl.confirmed and not ctrl.too_late
+
+
+def test_prefetch_road_tiles_match_the_road_tile_grid():
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.prefetch import road_tiles_for, tiles_around
+  from openpilot.sunnypilot.webhud.maptiles import tile_name
+  tiles = tiles_around(37.5167, -121.9579, 2.0)
+  roads = road_tiles_for(tiles)
+  assert tile_name(37.5167, -121.9579) in roads          # the tile the car is on
+  assert len(roads) == len(tiles)                        # one road tile per 0.25 deg feature tile
+
+
 def _as_method(fn):
   import inspect
   import pathlib
