@@ -61,6 +61,10 @@
   <h1>Drive Sim</h1>
   <select id="route"></select>
   <input id="segs" placeholder="segments, e.g. 5-9" size="14">
+  <select id="mode" title="replay: the recording drives, the code reports; closed loop: the simulated car obeys Stop Sign Assist">
+    <option value="replay">Replay</option><option value="closed">Closed loop</option>
+  </select>
+  <label title="closed loop: seconds the driver waits at a stop before tapping the accelerator">wait <input id="wait" type="number" value="2" min="0" step="0.5" style="width:56px">s</label>
   <button id="run" class="primary">Run</button>
   <label><input type="checkbox" id="follow" checked> follow car</label>
   <span id="status">loading routes…</span>
@@ -123,18 +127,20 @@ async function loadRoutes() {
   const saved = lsGet('route', '');
   if (r.routes.some(x => x.route === saved)) sel.value = saved;
   $('segs').value = lsGet('segs', '');
+  $('mode').value = lsGet('mode', 'replay');
   $('status').textContent = `${r.routes.length} routes in ${r.root}`;
 }
 
 async function run() {
-  const route = $('route').value, segs = $('segs').value.trim();
-  lsSet('route', route); lsSet('segs', segs);
+  const route = $('route').value, segs = $('segs').value.trim(), mode = $('mode').value, wait = $('wait').value;
+  lsSet('route', route); lsSet('segs', segs); lsSet('mode', mode);
   $('status').textContent = 'running current code…'; $('error').textContent = '';
-  const res = await fetch(`/api/sim?route=${encodeURIComponent(route)}&segs=${encodeURIComponent(segs)}`);
+  const res = await fetch(`/api/sim?route=${encodeURIComponent(route)}&segs=${encodeURIComponent(segs)}&mode=${mode}&wait=${encodeURIComponent(wait)}`);
   const out = await res.json();
   if (!res.ok) { $('status').textContent = 'error'; $('error').textContent = out.error + '\n' + (out.trace || ''); return; }
   sim = out;
-  $('status').textContent = `${out.frames} frames · parse ${out.timing.extract_s}s · sim ${out.timing.simulate_s}s · ran ${new Date().toLocaleTimeString()}`;
+  const loop = out.mode === 'closed' ? ` · closed loop: ${out.simulated_s}s vs ${out.recorded_s}s recorded${out.completed ? '' : ' · STOPPED SHORT of the route end'}` : '';
+  $('status').textContent = `${out.frames} frames · parse ${out.timing.extract_s}s · sim ${out.timing.simulate_s}s${loop} · ran ${new Date().toLocaleTimeString()}`;
   draw();
 }
 
@@ -175,6 +181,11 @@ function draw() {
     'coasting time': (c.state.filter(s => s === 'coasting').length / 20).toFixed(1) + ' s',
     'too-late confirms': sim.events.filter(e => e.too_late).length,
     'turn desire time': (c.turn.filter(Boolean).length / 20).toFixed(1) + ' s',
+    ...(sim.mode === 'closed' ? {
+      'mode': 'closed loop', 'route length': (sim.path_m / 1609.34).toFixed(2) + ' mi',
+      'time: simulated / recorded': `${sim.simulated_s} / ${sim.recorded_s} s`,
+      'assist stops': sim.stops.length ? sim.stops.map(x => `${x.t.toFixed(0)}s @${x.dist} m`).join(', ') : 'none',
+    } : { 'mode': 'replay' }),
   });
   $('events').innerHTML = sim.events.filter(e => e.state !== 'idle' || e.turn || e.confirmed).map(e =>
     `<li data-i="${e.i}"><span class="t">${e.t.toFixed(1)}s</span>` +
@@ -194,7 +205,7 @@ function seek(i) {
   if ($('follow').checked && playing) map.panTo([c.lat[idx], c.lon[idx]], { animate: false });
   $('now').textContent = `${c.t[idx].toFixed(1)} s · ${c.mph[idx]} mph · ${c.state[idx]}`;
   $('at').innerHTML = kv({
-    'time': c.t[idx].toFixed(2) + ' s', 'speed': c.mph[idx] + ' mph',
+    'time': c.t[idx].toFixed(2) + ' s', 'speed': c.mph[idx] + ' mph' + (c.rec_mph ? ` (you: ${c.rec_mph[idx]})` : ''),
     'stop state': c.state[idx], 'sign': c.sign[idx] ?? '—', 'distance': c.dist[idx] != null ? c.dist[idx] + ' m' : '—',
     'target': c.target_mph[idx] != null ? c.target_mph[idx] + ' mph' : '—',
     'model confirm': `${c.filt[idx]}${c.confirmed[idx] ? ' · latched' : ''}${c.too_late[idx] ? ' · too late' : ''}`,
@@ -227,10 +238,13 @@ function drawChart() {
     for (let i = 0; i < n; i += 2) { const v = arr[i]; if (v == null) { on = false; continue; } on ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v)); on = true; }
     g.stroke(); g.setLineDash([]);
   };
+  if (c.rec_mph) line(c.rec_mph, css('--muted'), 1, [2, 2]);
   line(c.mph, css('--ink'), 1.5);
   line(c.target_mph, css('--brake'), 1.5, [4, 3]);
   g.strokeStyle = css('--accent'); g.lineWidth = 1.5; g.beginPath(); g.moveTo(X(idx), 4); g.lineTo(X(idx), h - 16); g.stroke();
-  g.fillStyle = css('--muted'); g.fillText('speed (mph) — actual; dashed: what Stop Sign Assist would command', pad, h - 4);
+  g.fillStyle = css('--muted');
+  g.fillText(sim.mode === 'closed' ? 'speed (mph): simulated car; red dashed: assist command; grey dotted: what you drove there'
+                                   : 'speed (mph): as driven; red dashed: what Stop Sign Assist would command', pad, h - 4);
 }
 
 function tick(ts) {

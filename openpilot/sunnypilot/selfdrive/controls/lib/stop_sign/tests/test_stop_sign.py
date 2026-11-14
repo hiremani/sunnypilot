@@ -790,6 +790,25 @@ def test_prefetch_road_tiles_match_the_road_tile_grid():
   assert len(roads) == len(tiles)                        # one road tile per 0.25 deg feature tile
 
 
+
+def test_unconfirmed_coast_never_stops_the_car():
+  # found with drive_sim's closed loop: an unconfirmed coast decayed to 0 and held the car short of the sign
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import COAST_FLOOR_V
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, STOP_MARGIN_M + 30.0))])
+  v = 6.0
+  for _ in range(400):   # 20 s of following the coast target, model never confirming
+    ctrl.update(sm_at(gps(LAT0, LON0, speed=v), model()), True, False, v, 0.0, NOW)
+    if ctrl.output_v_target < 200:
+      v = max(0.0, v + max(min(ctrl.output_v_target - v, 0.0), -1.2) * 0.05)
+  assert not ctrl.confirmed
+  assert v >= COAST_FLOOR_V - 0.05
+
+
+def test_coast_below_the_floor_holds_speed():
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import coast_target
+  assert coast_target(1.5) == 1.5
+  assert coast_target(10.0) == 10.0 - 0.4
+
 def _as_method(fn):
   import inspect
   import pathlib

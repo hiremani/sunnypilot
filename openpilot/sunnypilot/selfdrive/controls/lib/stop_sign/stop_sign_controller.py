@@ -71,6 +71,9 @@ COAST_START_M = 45.72    # m (150 ft): lift off the gas at least this far out
 A_COMFORT = 1.0          # m/s^2 planned braking; the planner's cruise floor is -1.2, so this leaves headroom
 COAST_TIME_S = 2.0       # at speed, coast this long before the braking point
 COAST_DV = 0.4           # m/s under the current speed while coasting: ~ -0.4 m/s^2, an EV's gentle lift-off
+COAST_FLOOR_V = 2.5      # m/s (~5.6 mph): coasting eases off down to here and no further. Only a confirmed stop brings
+                         # the car to a halt; an unconfirmed coast used to decay to 0 and hold the car short of the sign
+                         # with no way out but the gas (found with drive_sim's closed loop, 2026-11-14)
 LAG_S = 1.0              # lead the braking profile by the planner's ~1 s speed-loop time constant
 STOP_MARGIN_M = 6.0      # stop this far before the sign's map point
 STOP_V_TARGET = 0.0      # m/s: a complete stop. No rolling-stop option on purpose (NHTSA recall 22V-037, see above)
@@ -104,6 +107,12 @@ def coast_distance(v_ego: float) -> float:
 
 def braking_distance(v_ego: float) -> float:
   return v_ego ** 2 / (2 * A_COMFORT) + v_ego * LAG_S
+
+
+def coast_target(v_ego: float) -> float:
+  """Easing off the gas: a little under the current speed, but never below COAST_FLOOR_V (or below v_ego, when already
+  slower than that: no creeping to a stop on a coast)."""
+  return max(v_ego - COAST_DV, min(v_ego, COAST_FLOOR_V))
 
 
 def braking_v_target(dist_to_stop: float, v_ego: float) -> float:
@@ -291,7 +300,7 @@ class StopSignAssist:
       self.state = StopSignState.idle
       self.output_v_target = V_CRUISE_UNSET
     else:
-      coast_v = max(v_ego - COAST_DV, 0.0)
+      coast_v = coast_target(v_ego)
       brake_v = braking_v_target(self.distance, v_ego) if may_brake else coast_v
       self.state = StopSignState.braking if brake_v < coast_v else StopSignState.coasting
       self.output_v_target = min(coast_v, brake_v)

@@ -76,7 +76,10 @@ def make_handler(root: str):
           sim = reload_code()
           data = sim.extract(root, q["route"], q.get("segs") or None)
           t1 = time.monotonic()
-          out = sim.simulate(data)
+          if q.get("mode") == "closed":
+            out = sim.simulate_closed_loop(data, proceed_wait_s=float(q.get("wait", 2.0)))
+          else:
+            out = sim.simulate(data)
           out["timing"] = {"extract_s": round(t1 - t0, 2), "simulate_s": round(time.monotonic() - t1, 2)}
           self._json(200, out)
         else:

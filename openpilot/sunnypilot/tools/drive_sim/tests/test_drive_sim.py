@@ -50,3 +50,26 @@ class TestDriveSim(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestClosedLoop(unittest.TestCase):
+  def _frames(self, n=400, v=8.0):
+    out = []
+    for i in range(n):
+      lat = 37.5 + i * v * 0.05 / 111_195.0   # driving north at v
+      out.append({"t": i * 0.05, "gps": (lat, -121.95, 0.0, v, True, 3.0, 1_800_000_000_000 + i * 50),
+                  "cs": (v, 0.0, 0.0, False, False, False, 0.0, False, False, False, False), "lead": (False, 0.0),
+                  "lat_active": True, "stop": False, "curv": 0.0, "vel": [v] * 33, "pos": [v * k for k in range(33)], "desire": 0})
+    return out
+
+  def test_without_signs_it_drives_like_the_recording(self):
+    out = sim.simulate_closed_loop({"route": "r", "segs": None, "service": "gpsLocation", "frames": self._frames()})
+    self.assertTrue(out["completed"])
+    self.assertAlmostEqual(out["simulated_s"], out["recorded_s"], delta=2.0)
+    self.assertEqual(out["stops"], [])
+
+  def test_path_drops_jitter_and_measures_distance(self):
+    frames = self._frames(n=100)
+    path = sim.build_path(frames)
+    self.assertAlmostEqual(path[-1][0], 99 * 8.0 * 0.05, delta=2.0)
+    self.assertTrue(all(abs(p[3]) < 1.0 or abs(p[3] - 360) < 1.0 for p in path[3:-3]))   # heading north
