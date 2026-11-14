@@ -102,7 +102,7 @@ class StopSignIndicator:
       return
     self.display.update(sm['longitudinalPlanSP'].stopSign, sm['carState'].vEgo, dt)
 
-  def render(self, rect: rl.Rectangle) -> None:
+  def render(self, rect: rl.Rectangle, right_inset: float = 0.0) -> None:
     from openpilot.selfdrive.ui.ui_state import ui_state
     from openpilot.system.ui.lib.application import FontWeight, gui_app
     from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -117,7 +117,7 @@ class StopSignIndicator:
       alpha = 0.2
 
     r = self.SIZE / 2
-    cx = rect.x + rect.width - self.MARGIN_X - r
+    cx = rect.x + rect.width - self.MARGIN_X - right_inset - r
     cy = rect.y + self.MARGIN_Y + r
     center = rl.Vector2(cx, cy)
     red = rl.Color(200, 16, 46, int(255 * alpha))
