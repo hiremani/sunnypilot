@@ -16,6 +16,8 @@ from enum import IntEnum
 
 import pyray as rl
 
+from openpilot.common.swaglog import cloudlog
+
 PROCEED_M = 20.0        # after a stop, keep blinking until the car has rolled this far (through the junction)
 PROCEED_MAX_S = 15.0    # ...or this long, whichever is first
 BLINK_HZ = 1.4
@@ -45,7 +47,7 @@ class StopSignDisplay:
     self._proceed_s = 0.0
 
   def update(self, stop_sign, v_ego: float, dt: float) -> Phase:
-    state = int(stop_sign.state)
+    state = int(getattr(stop_sign.state, "raw", stop_sign.state))   # a capnp enum, or an int in tests
     sign_id = int(stop_sign.signId)
     self.shadow = bool(stop_sign.shadow)
     self.distance = max(0.0, float(stop_sign.distance))
@@ -100,9 +102,21 @@ class StopSignIndicator:
     if sm.recv_frame['longitudinalPlanSP'] < ui_state.started_frame:
       self.display.phase = Phase.NONE
       return
-    self.display.update(sm['longitudinalPlanSP'].stopSign, sm['carState'].vEgo, dt)
+    try:
+      self.display.update(sm['longitudinalPlanSP'].stopSign, sm['carState'].vEgo, dt)
+    except Exception:
+      # a display bug must never take the UI (and with it engagement) down
+      self.display.phase = Phase.NONE
+      cloudlog.exception("stop sign indicator: update failed")
 
   def render(self, rect: rl.Rectangle, right_inset: float = 0.0) -> None:
+    try:
+      self._draw(rect, right_inset)
+    except Exception:
+      self.display.phase = Phase.NONE
+      cloudlog.exception("stop sign indicator: render failed")
+
+  def _draw(self, rect: rl.Rectangle, right_inset: float) -> None:
     from openpilot.selfdrive.ui.ui_state import ui_state
     from openpilot.system.ui.lib.application import FontWeight, gui_app
     from openpilot.system.ui.lib.text_measure import measure_text_cached

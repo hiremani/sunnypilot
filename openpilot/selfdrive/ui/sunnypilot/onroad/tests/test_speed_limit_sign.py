@@ -37,6 +37,15 @@ class TestSpeedLimitSign(unittest.TestCase):
   def test_overspeed_uses_the_limit_with_offset(self):
     self.assertFalse(sign_state(res(final=30 * CV.MPH_TO_MS), 28 * CV.MPH_TO_MS, 2, False)[2])
 
+  def test_real_capnp_message(self):
+    import openpilot.cereal.messaging as messaging
+    m = messaging.new_message('longitudinalPlanSP')
+    r = m.longitudinalPlanSP.speedLimit.resolver
+    r.speedLimitLast = MPH25
+    r.speedLimitValid = True
+    r.speedLimitLastValid = True
+    self.assertEqual(sign_state(m.longitudinalPlanSP.speedLimit.resolver, 5.0, 2, False), (True, "25", False, False))
+
   def test_stale_reading_greyed(self):
     show, _, _, stale = sign_state(res(valid=False, last_valid=True), 5.0, 1, False)
     self.assertTrue(show and stale)

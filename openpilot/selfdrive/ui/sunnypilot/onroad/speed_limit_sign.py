@@ -11,6 +11,7 @@ when Speed Limit mode is Warning or Assist, and grey while the current reading i
 import pyray as rl
 
 from openpilot.common.constants import CV
+from openpilot.common.swaglog import cloudlog
 
 MODE_OFF, MODE_WARNING = 0, 2
 
@@ -48,13 +49,24 @@ class SpeedLimitSign:
     if sm.recv_frame['longitudinalPlanSP'] < ui_state.started_frame:
       self.show = False
       return
-    mode = int(ui_state.speed_limit_mode or 0)
-    self.show, self.number, self.overspeed, self.stale = sign_state(sm['longitudinalPlanSP'].speedLimit.resolver,
-                                                                    sm['carState'].vEgo, mode, ui_state.is_metric)
+    try:
+      mode = int(ui_state.speed_limit_mode or 0)
+      self.show, self.number, self.overspeed, self.stale = sign_state(sm['longitudinalPlanSP'].speedLimit.resolver,
+                                                                      sm['carState'].vEgo, mode, ui_state.is_metric)
+    except Exception:
+      self.show = False   # a display bug must never take the UI (and with it engagement) down
+      cloudlog.exception("speed limit sign: update failed")
 
   def render(self, rect: rl.Rectangle) -> None:
     if not self.show:
       return
+    try:
+      self._draw(rect)
+    except Exception:
+      self.show = False
+      cloudlog.exception("speed limit sign: render failed")
+
+  def _draw(self, rect: rl.Rectangle) -> None:
     from openpilot.selfdrive.ui.ui_state import ui_state
     from openpilot.system.ui.lib.application import FontWeight, gui_app
     from openpilot.system.ui.lib.text_measure import measure_text_cached

@@ -74,6 +74,20 @@ class TestStopSignDisplay(unittest.TestCase):
     self.assertEqual(d.label(False), "98 ft")
     self.assertEqual(d.label(True), "30 m")
 
+  def test_real_capnp_message(self):
+    # the live message's state is a capnp enum, not an int (this crashed the UI on the car)
+    import openpilot.cereal.messaging as messaging
+    m = messaging.new_message('longitudinalPlanSP')
+    ss = m.longitudinalPlanSP.stopSign
+    ss.state = 'braking'
+    ss.distance = 30.0
+    ss.signId = -1
+    d = StopSignDisplay()
+    self.assertEqual(d.update(m.longitudinalPlanSP.stopSign, 6.0, DT), Phase.ACTING)
+    ss.state = 'idle'
+    ss.distance = 100.0
+    self.assertEqual(StopSignDisplay().update(m.longitudinalPlanSP.stopSign, 6.0, DT), Phase.TRACKED)
+
   def test_shadow_flag_passes_through(self):
     d = StopSignDisplay()
     d.update(msg(COASTING, 30.0, shadow=True), 6.0, DT)
