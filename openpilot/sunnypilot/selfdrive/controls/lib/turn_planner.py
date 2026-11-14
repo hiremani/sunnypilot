@@ -36,8 +36,8 @@ import numpy as np
 EARTH_R = 6371000.0
 
 # ---- arming ----
-V_ARM_MAX = 5.4                 # m/s (12 mph): the planner only starts a turn at or below this speed
-V_ABORT = 7.0                   # m/s: release above this speed at any point
+V_ARM_MAX = 7.2                 # m/s (16 mph): the planner only starts a turn at or below this speed
+V_ABORT = 9.0                   # m/s (20 mph): release above this speed at any point
 JUNCTION_LOOKAHEAD_M = 35.0     # junctions this far ahead along the current road are considered
 TURN_MIN_DEG = 45.0             # a branch is a turn on the blinker side when it leaves this much...
 TURN_MAX_DEG = 135.0            # ...and at most this much (beyond is a U-turn or a road doubling back)

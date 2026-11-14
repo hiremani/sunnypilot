@@ -149,7 +149,7 @@ class TestTurnPlanner(unittest.TestCase):
     self.assertEqual(set(car.states), {tp.IDLE})
 
   def test_too_fast_no_turn(self):
-    car = Car(planner(t_junction(right=True)), v=6.5)
+    car = Car(planner(t_junction(right=True)), v=tp.V_ARM_MAX + 1.0)
     car.drive(20.0, right=True)
     self.assertTrue(all(o is None for o in car.outputs))
     self.assertNotIn(tp.TURNING, car.states)
