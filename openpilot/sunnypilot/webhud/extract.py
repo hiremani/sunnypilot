@@ -205,6 +205,7 @@ def longitudinal_plan_sp(lp) -> dict:
   resolver = _g(sl, "resolver") if sl is not None else None
   assist = _g(sl, "assist") if sl is not None else None
   dec = _g(lp, "dec")
+  ss = _g(lp, "stopSign")
   return {
     "speedLimit": None if resolver is None else {
       "value": _f(_g(resolver, "speedLimit")),       # m/s
@@ -217,6 +218,11 @@ def longitudinal_plan_sp(lp) -> dict:
       "state": _enum(_g(assist, "state")), "active": bool(_g(assist, "active", False)),
     },
     "dec": None if dec is None else {"state": _enum(_g(dec, "state")), "active": bool(_g(dec, "active", False))},
+    "stopSign": None if ss is None else {
+      "state": _enum(_g(ss, "state")), "active": bool(_g(ss, "active", False)), "shadow": bool(_g(ss, "shadow", False)),
+      "distance": _f(_g(ss, "distance"), 1),      # m to the stop point
+      "confirmed": bool(_g(ss, "confirmed", False)),
+    },
     "source": _enum(_g(lp, "longitudinalPlanSource")),
   }
 

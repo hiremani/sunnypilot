@@ -118,7 +118,7 @@ class StopSignAssist:
               now_s - gps.unixTimestampMillis * 1e-3 <= GPS_MAX_AGE_S)
     if fix_ok and gps.speed >= MIN_GPS_SPEED:
       signs = self.map.signs_near(gps.latitude, gps.longitude)
-      ahead = find_stop_ahead(gps.latitude, gps.longitude, gps.bearingDeg, signs, self.done_ids)
+      ahead = find_stop_ahead(gps.latitude, gps.longitude, gps.bearingDeg, signs, self.done_ids, prefer_id=self.node_id)
       if ahead is None:
         # passed it, or turned away: whatever sign we had is done
         if self.node_id is not None:

@@ -194,14 +194,14 @@ class MapFeatures:
     req = urllib.request.Request(OVERPASS_URL, data=urllib.parse.urlencode({"data": query}).encode(),
                                  headers={"User-Agent": USER_AGENT, "Accept": "application/json",
                                           "Content-Type": "application/x-www-form-urlencoded"})
-    # a busy Overpass answers 504 (or 429) for a while; a couple of short retries usually get through
+    # a busy Overpass answers 504 (or 429, or a 502/503 from its proxy) for a while; a few short retries usually get through
     for attempt in range(OVERPASS_TRIES):
       try:
         with urllib.request.urlopen(req, timeout=OVERPASS_TIMEOUT_S) as r:
           data = json.loads(r.read().decode("utf-8"))
         break
       except urllib.error.HTTPError as e:
-        if e.code not in (429, 504) or attempt == OVERPASS_TRIES - 1:
+        if e.code not in (429, 502, 503, 504) or attempt == OVERPASS_TRIES - 1:
           raise
         time.sleep(OVERPASS_RETRY_S)
     # split into the page's cells (a node on the tile's far edge stays in this tile)

@@ -22,6 +22,7 @@ EARTH_R = 6371000.0
 LOOKAHEAD_M = 300.0        # only signs this far ahead along the heading
 MAX_LATERAL_M = 12.0       # ...and this close to the line the car is driving on
 MAX_BEARING_ERR_DEG = 25.0  # ...and roughly in front (a sign off to the side is on a crossing road)
+SAME_JUNCTION_M = 25.0     # signs this close along the road are one junction (OSM often maps one per approach)
 RETRY_S = 60.0             # wait this long before trying a cell that failed to load again
 
 
@@ -51,11 +52,15 @@ def stop_signs_from_cell(cell: dict) -> list[StopSign]:
   return out
 
 
-def find_stop_ahead(lat: float, lon: float, bearing_deg: float, signs, skip_ids=frozenset()) -> StopAhead | None:
-  """The nearest stop sign in front of the car on its line of travel, or None."""
+def find_stop_ahead(lat: float, lon: float, bearing_deg: float, signs, skip_ids=frozenset(),
+                    prefer_id: int | None = None) -> StopAhead | None:
+  """The nearest stop sign in front of the car on its line of travel, or None. prefer_id, the sign already being
+  approached, is kept while it is still ahead and part of the same junction as the nearest one, so two nodes mapped
+  for one junction don't trade places every few frames."""
   cos_lat = math.cos(math.radians(lat))
   hx, hy = math.sin(math.radians(bearing_deg)), math.cos(math.radians(bearing_deg))
   best = None
+  preferred = None
   for s in signs:
     if s.node_id in skip_ids:
       continue
@@ -70,8 +75,13 @@ def find_stop_ahead(lat: float, lon: float, bearing_deg: float, signs, skip_ids=
     # close in, a few metres sideways is a big angle; only check the bearing once it's meaningful
     if along > 2 * MAX_LATERAL_M and math.degrees(math.atan2(lateral, along)) > MAX_BEARING_ERR_DEG:
       continue
+    ahead = StopAhead(s.node_id, along, lateral)
+    if s.node_id == prefer_id:
+      preferred = ahead
     if best is None or along < best.distance:
-      best = StopAhead(s.node_id, along, lateral)
+      best = ahead
+  if preferred is not None and best is not None and preferred.distance <= best.distance + SAME_JUNCTION_M:
+    return preferred
   return best
 
 

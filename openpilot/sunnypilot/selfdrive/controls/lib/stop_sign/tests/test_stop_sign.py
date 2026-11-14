@@ -231,3 +231,36 @@ def test_state_changes_are_logged(monkeypatch=None):
   assert len(events) == 1  # one transition (idle -> braking/coasting), not one per tick
   name, kw = events[0]
   assert name == "stop_sign" and kw["sign"] == 1 and kw["state"] in ("coasting", "braking") and kw["shadow"] is False
+
+
+def test_two_nodes_at_one_junction_dont_flip_flop():
+  a = StopSign(1, *north_of(LAT0, LON0, 100))
+  b = StopSign(2, *north_of(LAT0, LON0, 104))   # second node mapped for the same junction
+  assert find_stop_ahead(LAT0, LON0, 0.0, [a, b]).node_id == 1
+  assert find_stop_ahead(LAT0, LON0, 0.0, [a, b], prefer_id=2).node_id == 2   # keeps the one it had
+  far = StopSign(3, *north_of(LAT0, LON0, 180))  # a different junction further on is not "the same"
+  assert find_stop_ahead(LAT0, LON0, 0.0, [a, far], prefer_id=3).node_id == 1
+
+
+def test_controller_keeps_its_sign_through_gps_jitter():
+  a = StopSign(1, *north_of(LAT0, LON0, 120))
+  b = StopSign(2, *north_of(LAT0, LON0, 121))
+  ctrl = make([a, b])
+  ids = set()
+  for i in range(40):
+    jitter = 1.5 if i % 2 else -1.5   # GPS wandering sideways a little
+    lat, lon = east_of(LAT0, LON0, jitter)
+    ctrl.update(sm_at(gps(lat, lon, speed=8.0), model()), True, False, 8.0, 0.0, NOW)
+    ids.add(ctrl.node_id)
+  assert len(ids) == 1
+
+
+def test_prefetch_tiles_cover_the_radius():
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.prefetch import tiles_around
+  from openpilot.sunnypilot.webhud.maptiles import FEAT_TILE_DEG
+  tiles = tiles_around(37.5, -121.95, 15.0)
+  # every corner of the 15 km box lands in a returned tile
+  for dlat, dlon in ((0.13, 0.165), (-0.13, -0.165), (0.13, -0.165), (-0.13, 0.165)):   # just inside 15 km
+    t = (math.floor((37.5 + dlat) / FEAT_TILE_DEG), math.floor((-121.95 + dlon) / FEAT_TILE_DEG))
+    assert t in tiles
+  assert len(tiles) <= 9   # 0.25 deg tiles: a 30 km box spans at most 3 x 3

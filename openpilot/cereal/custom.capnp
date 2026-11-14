@@ -204,6 +204,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
   aTarget @5 :Float32;
   events @6 :List(OnroadEventSP.Event);
   e2eAlerts @7 :E2eAlerts;
+  stopSign @8 :StopSign;
 
   struct DynamicExperimentalControl {
     state @0 :DynamicExperimentalControlState;
@@ -301,6 +302,25 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     sccMap @2;
     speedLimitAssist @3;
     stopSign @4;
+  }
+
+  struct StopSign {
+    # Stop Sign Assist; when only the shadow copy runs (shadow = true) this is what it would be doing
+    state @0 :StopSignState;
+    active @1 :Bool;
+    shadow @2 :Bool;
+    distance @3 :Float32;   # m to the stop point
+    vTarget @4 :Float32;    # m/s, 255 when not limiting
+    confirmed @5 :Bool;     # the driving model also plans a stop
+    signId @6 :Int64;       # OSM node, 0 when none
+
+    enum StopSignState {
+      disabled @0;
+      idle @1;
+      coasting @2;
+      braking @3;
+      stopped @4;
+    }
   }
 
   struct E2eAlerts {

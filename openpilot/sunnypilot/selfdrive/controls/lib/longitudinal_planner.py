@@ -160,6 +160,18 @@ class LongitudinalPlannerSP:
     assist.vTarget = float(self.sla.output_v_target)
     assist.aTarget = float(self.sla.output_a_target)
 
+    # Stop Sign Assist: the live one when it runs, else the shadow
+    ss = self.stop_sign if self.stop_sign is not None and self.stop_sign.enabled else self.stop_sign_shadow
+    if ss is not None:
+      stopSign = longitudinalPlanSP.stopSign
+      stopSign.state = int(ss.state)
+      stopSign.active = ss.is_active
+      stopSign.shadow = ss.shadow
+      stopSign.distance = float(ss.distance)
+      stopSign.vTarget = float(ss.output_v_target)
+      stopSign.confirmed = ss.confirmed
+      stopSign.signId = int(ss.node_id or 0)
+
     # E2E Alerts
     e2eAlerts = longitudinalPlanSP.e2eAlerts
     e2eAlerts.greenLightAlert = self.e2e_alerts_helper.green_light_alert
