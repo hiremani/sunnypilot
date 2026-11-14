@@ -737,13 +737,27 @@ def path_curvature(path) -> list[float]:
   return out
 
 
-def simulate_style(data: dict, style: dict | None = None) -> dict:
+def style_from_profile(name: str | None) -> tuple[dict, str]:
+  """The style dict from a named driver profile (driver_profile.py), and the name used; STYLE if there is none."""
+  from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
+  names = [p["name"] for p in dp.list_profiles()]
+  name = name if name in names else (dp.DEFAULT_NAME if dp.DEFAULT_NAME in names else (names[0] if names else None))
+  if name is None:
+    return dict(STYLE), "built-in"
+  p = dp.load(name)
+  return STYLE | {"town_offset_mph": p.town_offset_mph, "fast_offset_mph": p.fast_offset_mph, "fast_zone_mph": p.fast_zone_mph,
+                  "lat_accel": p.curve_lat_accel, "decel": p.stop_decel, "gap_s": p.follow_gap_s,
+                  "accel_max": min(p.launch_accel, STYLE["accel_max"])}, name
+
+
+def simulate_style(data: dict, style: dict | None = None, profile: str | None = None) -> dict:
   """The recorded route driven by openpilot longitudinal tuned to the driver's style: the posted limit (+ offset), the
   driver's lateral accel in curves, the driver's braking to each place the driver stopped (held as long), the
   driver's gap to the lead the recording saw at that spot, and the car's accel limit. Compared with the recorded speed
   at the same place."""
   from openpilot.common.realtime import DT_MDL
-  st = STYLE | (style or {})
+  base, profile_used = style_from_profile(profile)
+  st = base | (style or {})
   frames = data["frames"]
   lo, hi = moving_span(frames)
   path = build_path(frames, lo, hi)
@@ -848,7 +862,7 @@ def simulate_style(data: dict, style: dict | None = None) -> dict:
   return {"route": data["route"], "segs": data["segs"], "frames": len(cols["t"]), "mode": "style", "cols": cols,
           "events": [], "signs": [], "completed": s >= end_s - 1.0, "path_m": round(end_s, 1),
           "recorded_s": round(frames[hi]["t"] - frames[lo]["t"], 1), "simulated_s": round(t, 1),
-          "style": st, "why_s": {k: round(v_, 1) for k, v_ in sorted(why_t.items(), key=lambda x: -x[1])},
+          "style": st, "profile": profile_used, "why_s": {k: round(v_, 1) for k, v_ in sorted(why_t.items(), key=lambda x: -x[1])},
           "faster_5_pct": round(100 * sum(d > 5 for d in moving) / max(len(moving), 1)),
           "slower_5_pct": round(100 * sum(d < -5 for d in moving) / max(len(moving), 1)),
           "mean_abs_mph": round(sum(abs(d) for d in moving) / max(len(moving), 1), 1)}

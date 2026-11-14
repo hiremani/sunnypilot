@@ -238,7 +238,7 @@ function draw() {
       'time: simulated / recorded': `${sim.simulated_s} / ${sim.recorded_s} s`,
       'assist stops': sim.stops.length ? sim.stops.map(x => `${x.t.toFixed(0)}s @${x.dist} m`).join(', ') : 'none',
     } : { 'mode': { turns: 'replay + turn planner', narrow: 'replay + narrow-street assist', style: 'openpilot speed, your style' }[sim.mode] || 'replay' }),
-    ...(sim.mode === 'style' ? { 'trip time: sim / you': `${sim.simulated_s} / ${sim.recorded_s} s`,
+    ...(sim.mode === 'style' ? { 'driver profile': sim.profile, 'trip time: sim / you': `${sim.simulated_s} / ${sim.recorded_s} s`,
       'avg speed difference': sim.mean_abs_mph + ' mph', 'sim >5 mph faster / slower': `${sim.faster_5_pct}% / ${sim.slower_5_pct}% of the time`,
       'what set the speed': Object.entries(sim.why_s).map(([k, v]) => `${k} ${v.toFixed(0)}s`).join(', ') } : {}),
     ...(sim.mode === 'narrow' ? { 'narrow stretches': `${sim.narrow_spans.length} · ${sim.narrow_spans.reduce((a, s) => a + s.dur, 0).toFixed(0)} s`,

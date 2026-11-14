@@ -34,6 +34,7 @@ RELOAD = (   # dependencies first
   "openpilot.sunnypilot.selfdrive.controls.lib.lane_turn_desire",
   "openpilot.sunnypilot.selfdrive.controls.lib.turn_planner",
   "openpilot.sunnypilot.selfdrive.controls.lib.narrow_street",
+  "openpilot.sunnypilot.selfdrive.controls.lib.driver_profile",
   "openpilot.sunnypilot.tools.drive_sim.sim",
 )
 
@@ -84,7 +85,7 @@ def make_handler(root: str):
           elif q.get("mode") == "turns":
             out = sim.simulate_turns(data)
           elif q.get("mode") == "style":
-            out = sim.simulate_style(data)
+            out = sim.simulate_style(data, profile=q.get("profile") or None)
           elif q.get("mode") == "narrow":
             out = sim.simulate_narrow(data, root)
           else:

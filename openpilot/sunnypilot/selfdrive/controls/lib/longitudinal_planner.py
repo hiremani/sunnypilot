@@ -20,7 +20,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_crui
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import StopSignAssist
-from openpilot.sunnypilot.selfdrive.controls.lib import narrow_street
+from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile, narrow_street
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 
@@ -53,6 +53,10 @@ class LongitudinalPlannerSP:
     self.narrow_street = False
     self.narrow_enabled = False
     self._narrow_param_frame = 0
+    # The active driver profile (driver_profile.py; defaults unless DriverProfile is set), re-read every PROFILE_EVERY
+    # frames so a switch in the web HUD applies within seconds.
+    self.profile = driver_profile.DriverProfile()
+    self.narrow_speed = narrow_street.NARROW_SPEED
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
 
@@ -102,6 +106,12 @@ class LongitudinalPlannerSP:
         self.narrow_enabled = Params().get_bool(narrow_street.PARAM)
       except Exception:
         self.narrow_enabled = False
+    if self._narrow_param_frame % 100 == 0:
+      self.profile = driver_profile.active()
+      self.narrow_speed = self.profile.narrow_speed_mph * CV.MPH_TO_MS
+      for ss in (self.stop_sign, self.stop_sign_shadow):
+        if ss is not None:
+          ss.set_profile(self.profile.stop_decel, self.profile.coast_s)
     self._narrow_param_frame += 1
     try:
       self.narrow_street = self.narrow.update(sm['modelV2'], v_ego)
@@ -118,8 +128,8 @@ class LongitudinalPlannerSP:
     if self.stop_sign is not None:
       targets[LongitudinalPlanSource.stopSign] = (self.stop_sign.output_v_target, self.stop_sign.output_a_target)
     if self.narrow_street and self.narrow_enabled and self.openpilot_long:
-      a_narrow = narrow_street.NARROW_ACCEL if v_ego > narrow_street.NARROW_SPEED else a_ego
-      targets[LongitudinalPlanSource.narrowStreet] = (narrow_street.NARROW_SPEED, a_narrow)
+      a_narrow = narrow_street.NARROW_ACCEL if v_ego > self.narrow_speed else a_ego
+      targets[LongitudinalPlanSource.narrowStreet] = (self.narrow_speed, a_narrow)
 
     self.source = min(targets, key=lambda k: targets[k][0])
     self.output_v_target, self.output_a_target = targets[self.source]

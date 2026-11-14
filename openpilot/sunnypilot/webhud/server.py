@@ -60,7 +60,7 @@ Oceanfront View app (https://github.com/moistpope/oceanfront-view): on the car's
 PC run `python3 serve.py --bridge <this host>` from its checkout and open http://localhost:18088, or set
 WEBHUD_PAGE_DIR to that checkout and this process serves the page too.
 
-Endpoints: /api/status, /api/routes, /api/replay, /api/upload, /api/params, /api/overrides, /api/ssh, /map/...,
+Endpoints: /api/status, /api/routes, /api/replay, /api/upload, /api/params, /api/profiles, /api/overrides, /api/ssh, /map/...,
 /dbc/fisker_ocean_adas_world.dbc, /dbc/fisker_ocean_mrr.dbc, the WebSocket at /ws and the camera view's at /video.
 """
 DEFAULT_PORT = int(os.getenv("WEBHUD_PORT", "8088"))
@@ -790,6 +790,43 @@ def api_params_put(h: HudHandler, q) -> None:
   api_params_get(h, q)
 
 
+# ---- driver profiles (driver_profile.py): list them, pick the active one, turn them on/off ------------------------
+# Named profiles live in <media>/driver_profiles/<name>.json (written by sunnypilot/tools/driver_profile_gen.py).
+# The assists re-read the active one within seconds. Switching is refused while the car is moving.
+
+def api_profiles_get(h: HudHandler, q) -> None:
+  from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
+  params = h.server.params
+  try:
+    enabled = bool(params.get_bool(dp.PARAM))
+  except Exception:
+    enabled = None   # the param isn't built on this device yet
+  h._json({"enabled": enabled, "active": dp.active_name(params), "profiles": dp.list_profiles(),
+           "defaults": dp.to_dict(dp.DriverProfile())["values"], "bounds": dp.BOUNDS,
+           "editable": not h.server.engine.monitor.moving})
+
+
+def api_profiles_put(h: HudHandler, q) -> None:
+  from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
+  if h.server.engine.monitor.moving:
+    return h._error(409, "driver profiles can't be changed while the car is moving")
+  body = h._json_body()
+  if not isinstance(body, dict):
+    return h._error(400, "expected a JSON object")
+  if "active" in body:
+    name = body["active"]
+    if not dp.valid_name(name) or name not in {p["name"] for p in dp.list_profiles()}:
+      return h._error(400, f"no such profile: {name!r}")
+  try:
+    if "active" in body:
+      h.server.params.put(dp.NAME_PARAM, body["active"])
+    if "enabled" in body:
+      h.server.params.put_bool(dp.PARAM, bool(body["enabled"]))
+  except Exception as e:
+    return h._error(500, f"could not save: {e}")
+  api_profiles_get(h, q)
+
+
 # ---- SSH keys: the Oceanfront View app's key, for managing the comma over SSH -----------------------------
 # The app makes its own key pair (in the head unit's keystore) and asks for its public half to be let in. It goes
 # into GithubSshKeys beside whatever is there (the comma's sshd reads that param for `comma`), and SSH is turned on.
@@ -980,6 +1017,8 @@ ROUTES = {
   ("GET", "/api/overrides"): api_overrides_get,
   ("PUT", "/api/overrides"): api_overrides_put,
   ("DELETE", "/api/overrides"): api_overrides_delete,
+  ("GET", "/api/profiles"): api_profiles_get,
+  ("PUT", "/api/profiles"): api_profiles_put,
   ("GET", "/api/ssh"): api_ssh_get,
   ("POST", "/api/ssh/authorize"): api_ssh_authorize,
   ("DELETE", "/api/ssh/authorize"): api_ssh_revoke,

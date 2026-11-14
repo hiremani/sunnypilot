@@ -275,8 +275,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LagdToggleDelay", {PERSISTENT | BACKUP, FLOAT, "0.2"}},
     {"LagdValueCache", {PERSISTENT, FLOAT, "0.2"}},
     {"LaneTurnDesire", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"MapTurnAssist", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"NarrowStreetAssist", {PERSISTENT | BACKUP, BOOL, "0"}},  // keep off the center line; slow and warn on narrow streets  // steer signaled low-speed junction turns from map data (needs LaneTurnDesire)
+    {"MapTurnAssist", {PERSISTENT | BACKUP, BOOL, "0"}},  // steer signaled low-speed junction turns from map data (needs LaneTurnDesire)
+    {"NarrowStreetAssist", {PERSISTENT | BACKUP, BOOL, "0"}},  // keep off the center line; slow and warn on narrow streets
+    {"DriverProfile", {PERSISTENT | BACKUP, BOOL, "0"}},  // assists drive by the active driver profile (driver_profile.py)
+    {"DriverProfileName", {PERSISTENT | BACKUP, STRING, "me"}},  // the active profile: <media>/driver_profiles/<name>.json
     {"LaneTurnValue", {PERSISTENT | BACKUP, FLOAT, "19.0"}},
     {"PlanplusControl", {PERSISTENT | BACKUP, FLOAT, "1.0"}},
 

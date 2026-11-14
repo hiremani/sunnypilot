@@ -169,6 +169,27 @@ class TestServer(OpenpilotTestCase):
     assert self.request("PUT", "/api/params", {"LongitudinalPersonality": 7})[0] == 400
     assert self.request("PUT", "/api/params", {"DisableUpdates": True})[0] == 400
 
+  def test_driver_profiles(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
+    with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"DRIVER_PROFILES_DIR": d}):
+      for name, decel in (("me", 0.95), ("relaxed", 0.8)):
+        with open(os.path.join(d, name + ".json"), "w") as f:
+          json.dump(dp.to_dict(dp.DriverProfile(stop_decel=decel), {"miles": 28.5}), f)
+      with open(os.path.join(d, "broken.json"), "w") as f:
+        f.write("{not json")
+      status, body, _ = self.request("GET", "/api/profiles")
+      out = json.loads(body)
+      assert status == 200 and [p["name"] for p in out["profiles"]] == ["me", "relaxed"]   # unreadable one skipped
+      assert out["profiles"][1]["values"]["stop_decel"] == 0.8 and out["active"] == "me"
+      status, body, _ = self.request("PUT", "/api/profiles", {"active": "relaxed", "enabled": True})
+      assert status == 200 and json.loads(body)["active"] == "relaxed" and json.loads(body)["enabled"] is True
+      assert dp.active(self.params).stop_decel == 0.8
+      for bad in ({"active": "nobody"}, {"active": "../etc/passwd"}, {"active": 3}):
+        assert self.request("PUT", "/api/profiles", bad)[0] == 400
+      self.server.engine.monitor.moving = True
+      assert self.request("PUT", "/api/profiles", {"active": "me"})[0] == 409
+      assert json.loads(self.request("GET", "/api/profiles")[1])["editable"] is False
+
   def test_acc_toggle_params(self):
     for key in ("FiskerACCTerrain", "FiskerACCAutoSpeed"):
       for enabled in (True, False):

@@ -104,12 +104,12 @@ class StopSignState(IntEnum):
   stopped = 4
 
 
-def coast_distance(v_ego: float) -> float:
-  return max(COAST_START_M, braking_distance(v_ego) + v_ego * COAST_TIME_S)
+def coast_distance(v_ego: float, a: float = A_COMFORT, coast_s: float = COAST_TIME_S) -> float:
+  return max(COAST_START_M, braking_distance(v_ego, a) + v_ego * coast_s)
 
 
-def braking_distance(v_ego: float) -> float:
-  return v_ego ** 2 / (2 * A_COMFORT) + v_ego * LAG_S
+def braking_distance(v_ego: float, a: float = A_COMFORT) -> float:
+  return v_ego ** 2 / (2 * a) + v_ego * LAG_S
 
 
 def coast_target(v_ego: float) -> float:
@@ -118,15 +118,15 @@ def coast_target(v_ego: float) -> float:
   return max(v_ego - COAST_DV, min(v_ego, COAST_FLOOR_V))
 
 
-def braking_v_target(dist_to_stop: float, v_ego: float) -> float:
+def braking_v_target(dist_to_stop: float, v_ego: float, a: float = A_COMFORT) -> float:
   """The braking profile's speed target: it ends at STOP_V_TARGET (zero) at the stop point, never at a rolling speed."""
   d = max(dist_to_stop - v_ego * LAG_S, 0.0)
-  return max(math.sqrt(2 * A_COMFORT * d), STOP_V_TARGET)
+  return max(math.sqrt(2 * a * d), STOP_V_TARGET)
 
 
-def confirm_distance(v_ego: float) -> float:
+def confirm_distance(v_ego: float, a: float = A_COMFORT, coast_s: float = COAST_TIME_S) -> float:
   """The confirmer listens from here in: early enough for the filter to settle before the coast begins."""
-  return coast_distance(v_ego) + v_ego * CONFIRM_FILTER_S
+  return coast_distance(v_ego, a, coast_s) + v_ego * CONFIRM_FILTER_S
 
 
 @dataclass(frozen=True)
@@ -186,6 +186,10 @@ class StopSignAssist:
     self.confirmed = False         # the model has planned to slow for this sign (latched until the sign changes)
     self.too_late = False          # ...but only once a comfortable stop was no longer possible: never brake for it
     self.max_approach_v = MAX_APPROACH_V
+    # braking rate and coast time: the constants, or the active driver profile's (set_profile; always within the
+    # profile's bounds, 0.7-1.5 m/s^2 and 0-4 s)
+    self.a_comfort = A_COMFORT
+    self.coast_s = COAST_TIME_S
     self.gave_up = 0               # signs left to the driver because a comfortable stop was no longer possible
     self.confirm_filter = FirstOrderFilter(0.0, CONFIRM_FILTER_S, DT_MDL)
     self.cue = StopCue()           # the last frame the confirmer read, for the log
@@ -194,6 +198,10 @@ class StopSignAssist:
 
     self.output_v_target = V_CRUISE_UNSET
     self.output_a_target = 0.0
+
+  def set_profile(self, stop_decel: float, coast_s: float) -> None:
+    self.a_comfort = float(stop_decel)
+    self.coast_s = float(coast_s)
 
   @property
   def is_active(self) -> bool:
@@ -256,7 +264,7 @@ class StopSignAssist:
     if (self.state, self.node_id) != prev and self.state != StopSignState.disabled:
       cloudlog.event("stop_sign", shadow=self.shadow, state=self.state.name, prev=prev[0].name, sign=self.node_id,
                      dist=round(self.distance, 1), v=round(v_ego, 2), v_target=round(min(self.output_v_target, 99.0), 2),
-                     confirmed=self.confirmed, coast_at=round(coast_distance(v_ego), 1), **self._confirm_log())
+                     confirmed=self.confirmed, coast_at=round(coast_distance(v_ego, self.a_comfort, self.coast_s), 1), **self._confirm_log())
 
   def _confirm_log(self) -> dict:
     """The confirmer's raw and filtered values, for tuning its thresholds from shadow drives."""
@@ -266,7 +274,7 @@ class StopSignAssist:
 
   def _confirm(self, sm, v_ego: float) -> None:
     """Feed this frame to the confirmer and latch self.confirmed for the current sign once the filter agrees."""
-    if not (self.is_active or self.distance <= confirm_distance(v_ego)):
+    if not (self.is_active or self.distance <= confirm_distance(v_ego, self.a_comfort, self.coast_s)):
       self.confirm_filter.x = 0.0   # too far out for a slowdown to be about this sign
       self.cue, self.cue_lead = StopCue(), False
       return
@@ -279,7 +287,7 @@ class StopSignAssist:
       # Too late for a comfortable stop: never brake for it. On route 000000e5 (2026-11-14) a cross-street sign
       # confirmed at 2.6 m and 24 mph; braking to a stop from there would be an emergency stop at a junction the driver
       # was driving through. The driver handles this sign.
-      self.too_late = self.distance < braking_distance(v_ego)
+      self.too_late = self.distance < braking_distance(v_ego, self.a_comfort)
       cloudlog.event("stop_sign_confirmed", shadow=self.shadow, sign=self.node_id, dist=round(self.distance, 1),
                      v=round(v_ego, 2), state=self.state.name, too_late=self.too_late, **self._confirm_log())
 
@@ -318,11 +326,11 @@ class StopSignAssist:
       # held here until the driver taps the accelerator to proceed (long_override above); never released by itself
       self.state = StopSignState.stopped
       self.output_v_target = STOP_V_TARGET
-    elif not self.is_active and (self.distance > coast_distance(v_ego) or v_ego > self.max_approach_v):
+    elif not self.is_active and (self.distance > coast_distance(v_ego, self.a_comfort, self.coast_s) or v_ego > self.max_approach_v):
       self.state = StopSignState.idle
       self.output_v_target = V_CRUISE_UNSET
     else:
-      if not self.is_active and self.distance < braking_distance(v_ego):
+      if not self.is_active and self.distance < braking_distance(v_ego, self.a_comfort):
         # Taking a sign on (it just came into range, or the driver just slowed under max_approach_v) with no room left
         # for a comfortable stop: leave it to the driver, however early the model confirmed. Found with drive_sim's
         # closed loop: a fast approach taken on late overshot the stop point by 7.6 m.
@@ -330,6 +338,6 @@ class StopSignAssist:
         self._give_up(v_ego, "taken on too close")
         return
       coast_v = coast_target(v_ego)
-      brake_v = braking_v_target(self.distance, v_ego) if may_brake else coast_v
+      brake_v = braking_v_target(self.distance, v_ego, self.a_comfort) if may_brake else coast_v
       self.state = StopSignState.braking if brake_v < coast_v else StopSignState.coasting
       self.output_v_target = min(coast_v, brake_v)
