@@ -134,24 +134,25 @@ class TestServer(OpenpilotTestCase):
     assert all(accsigs[n]["locked"] for n in ("ICC_0x52ACheckSum", "ICC_0x52AAliveCounter", "ICCACCTiGapCfm", "ICC_0x52A_Rsv49"))
     table = data["tables"][1]
     assert table["address"] == 0x35B and not table["customized"]
-    sig = next(s for s in table["signals"] if s["name"] == "ICC_BSDSetting")
-    assert sig["default"] == self.saved["ICC_BSDSetting"] and sig["values"]["2"] and not sig["locked"]
+    sig = next(s for s in table["signals"] if s["name"] == "ICC_APA_Setting")
+    assert sig["default"] == self.saved["ICC_APA_Setting"] and sig["values"]["2"] and not sig["locked"]
+    assert next(s for s in table["signals"] if s["name"] == "ICC_BSDSetting")["locked"]   # blind spot: the head unit's own setting
     assert next(s for s in table["signals"] if s["name"] == "ICC_ViewReq")["locked"]   # camera-view requests always pass through
 
-    status, body, _ = self.request("PUT", "/api/overrides", {"ICC_0x35B": {"ICC_BSDSetting": 9}})
+    status, body, _ = self.request("PUT", "/api/overrides", {"ICC_0x35B": {"ICC_APA_Setting": 9}})
     assert status == 400 and b"outside" in body
     status, body, _ = self.request("PUT", "/api/overrides", {"ADAS_0x31C": {"ADAS_TiGapSet_ACC": 1}})
     assert status == 400 and b"not an overridable message" in body
     status, body, _ = self.request("PUT", "/api/overrides", {"ICC_0x52A": {"ICCACCSpdLimOffs": 7.3}})
     assert status == 400 and b"step 0.5" in body
-    status, body, _ = self.request("PUT", "/api/overrides", {"ICC_0x35B": {"ICC_BSDSetting": 2}})
-    assert status == 200 and self.params.get(PARAM) == {"ICC_0x35B": {"ICC_BSDSetting": 2}}
+    status, body, _ = self.request("PUT", "/api/overrides", {"ICC_0x35B": {"ICC_APA_Setting": 2}})
+    assert status == 200 and self.params.get(PARAM) == {"ICC_0x35B": {"ICC_APA_Setting": 2}}
     assert json.loads(body)["tables"][1]["customized"] and not json.loads(body)["tables"][0]["customized"]
     # the HUD's Assist settings: the whole 0x52A table, merged with the stored 0x35B one
     acc_table = {"ICCACCSwt": 1, "ICCACCFuncTyp": 2, "ICCACCSpdStepSize": 1, "ICCLaneTrajectorySetting": 1,
                  "ICCACCTerrainSetting": 1, "ICCACCSpdLimOffsTyp": 2, "ICCACCSpdLimOffs": 7.5}
     status, body, _ = self.request("PUT", "/api/overrides", {"ICC_0x52A": acc_table})
-    assert status == 200 and self.params.get(PARAM) == {"ICC_0x35B": {"ICC_BSDSetting": 2}, "ICC_0x52A": acc_table}
+    assert status == 200 and self.params.get(PARAM) == {"ICC_0x35B": {"ICC_APA_Setting": 2}, "ICC_0x52A": acc_table}
     assert json.loads(body)["tables"][0]["customized"]
 
     status, _, _ = self.request("PUT", "/api/overrides", {"ICC_0x35B": {}}, headers={"Origin": "http://evil.example"})
