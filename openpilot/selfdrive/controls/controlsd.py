@@ -24,6 +24,7 @@ from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
 from openpilot.sunnypilot.selfdrive.controls.lib.turn_planner import TurnPlanner
+from openpilot.sunnypilot.selfdrive.controls.lib.narrow_street import PARAM as NARROW_PARAM, CenterLineKeeper
 from openpilot.common.gps import get_gps_location_service
 
 State = log.SelfdriveState.OpenpilotState
@@ -64,6 +65,10 @@ class Controls(ControlsExt):
     self.map_turn_assist = False
     self.map_turn_curvature: float | None = None
     self._turn_param_frame = 0
+    # Center-line keeper (narrow_street.py): with NarrowStreetAssist, keep the car's left side off a seen left line by
+    # a small curvature correction, only ever to the right. Re-read with the map turn params.
+    self.center_line_keeper = CenterLineKeeper(DT_CTRL)
+    self.narrow_street_assist = False
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -90,6 +95,10 @@ class Controls(ControlsExt):
         self.map_turn_assist = self.params.get_bool("MapTurnAssist") and self.params.get_bool("LaneTurnDesire")
       except Exception:
         self.map_turn_assist = False
+      try:   # separately: an unknown key here must not switch the map turn assist off
+        self.narrow_street_assist = self.params.get_bool(NARROW_PARAM)
+      except Exception:
+        self.narrow_street_assist = False
     self._turn_param_frame += 1
     self.map_turn_curvature = None
     if not self.map_turn_assist:
@@ -179,6 +188,12 @@ class Controls(ControlsExt):
       turn_curvature = self.update_map_turn(CS, CC)
       if turn_curvature is not None and CC.latActive:
         new_desired_curvature = turn_curvature
+      elif self.narrow_street_assist and CC.latActive:
+        try:
+          new_desired_curvature += self.center_line_keeper.update(model_v2, CS.vEgo, CS.leftBlinker,
+                                                                   CS.steeringPressed, CC.latActive)
+        except Exception:
+          cloudlog.exception("center line keeper failed")
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
     lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 

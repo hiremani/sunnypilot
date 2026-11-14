@@ -10,6 +10,8 @@ import time
 from openpilot.cereal import messaging, custom
 from opendbc.car import structs
 from openpilot.common.constants import CV
+from openpilot.common.params import Params
+from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
@@ -18,6 +20,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_crui
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import StopSignAssist
+from openpilot.sunnypilot.selfdrive.controls.lib import narrow_street
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 
@@ -43,6 +46,13 @@ class LongitudinalPlannerSP:
     except Exception:
       cloudlog.exception("stop sign assist unavailable")
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
+    # Narrow streets (narrow_street.py): always detected and published; the speed cap only with NarrowStreetAssist
+    # and openpilot longitudinal. Re-read the param about once a second.
+    self.openpilot_long = CP.openpilotLongitudinalControl
+    self.narrow = narrow_street.NarrowStreetDetector(DT_MDL)
+    self.narrow_street = False
+    self.narrow_enabled = False
+    self._narrow_param_frame = 0
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
 
@@ -87,6 +97,18 @@ class LongitudinalPlannerSP:
       except Exception:
         cloudlog.exception("stop sign shadow update failed")
 
+    if self._narrow_param_frame % 20 == 0:
+      try:
+        self.narrow_enabled = Params().get_bool(narrow_street.PARAM)
+      except Exception:
+        self.narrow_enabled = False
+    self._narrow_param_frame += 1
+    try:
+      self.narrow_street = self.narrow.update(sm['modelV2'], v_ego)
+    except Exception:
+      self.narrow_street = False
+      cloudlog.exception("narrow street detector failed")
+
     targets = {
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),
       LongitudinalPlanSource.sccVision: (self.scc.vision.output_v_target, self.scc.vision.output_a_target),
@@ -95,6 +117,9 @@ class LongitudinalPlannerSP:
     }
     if self.stop_sign is not None:
       targets[LongitudinalPlanSource.stopSign] = (self.stop_sign.output_v_target, self.stop_sign.output_a_target)
+    if self.narrow_street and self.narrow_enabled and self.openpilot_long:
+      a_narrow = narrow_street.NARROW_ACCEL if v_ego > narrow_street.NARROW_SPEED else a_ego
+      targets[LongitudinalPlanSource.narrowStreet] = (narrow_street.NARROW_SPEED, a_narrow)
 
     self.source = min(targets, key=lambda k: targets[k][0])
     self.output_v_target, self.output_a_target = targets[self.source]
@@ -115,6 +140,7 @@ class LongitudinalPlannerSP:
     longitudinalPlanSP.vTarget = float(self.output_v_target)
     longitudinalPlanSP.aTarget = float(self.output_a_target)
     longitudinalPlanSP.events = self.events_sp.to_msg()
+    longitudinalPlanSP.narrowStreet = bool(self.narrow_street)
 
     # Dynamic Experimental Control
     dec = longitudinalPlanSP.dec

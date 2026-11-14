@@ -231,6 +231,14 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.WARNING: speed_limit_posted_alert,
   },
 
+  EventNameSP.narrowStreet: {
+    ET.WARNING: Alert(
+      "Narrow Street",
+      "Watch for oncoming and parked cars",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 4.),
+  },
+
   EventNameSP.blindSpotBlinker: {
     ET.WARNING: Alert(
       "Car in Blind Spot",

@@ -117,6 +117,8 @@ class SelfdriveD(CruiseHelper):
     # read params
     self.is_metric = self.params.get_bool("IsMetric")
     self.speed_limit_chime = (self.params.get("SpeedLimitMode", return_default=True) or 0) > 0
+    self.narrow_street_assist = self.params.get_bool("NarrowStreetAssist")
+    self.narrow_street_prev = False
     self.speed_limit_posted = SpeedLimitPosted(DT_CTRL)
     self.blinker_blind_spot = BlinkerBlindSpot(DT_CTRL)
     self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
@@ -383,6 +385,12 @@ class SelfdriveD(CruiseHelper):
     resolver = self.sm['longitudinalPlanSP'].speedLimit.resolver
     if self.speed_limit_posted.update(resolver.speedLimit, resolver.speedLimitValid, CS.vEgo) and self.speed_limit_chime:
       self.events_sp.add(custom.OnroadEventSP.EventName.speedLimitPosted)
+
+    # Narrow street: once as it starts, while engaged (the car can't see oncoming or parked cars)
+    narrow = bool(self.sm['longitudinalPlanSP'].narrowStreet)
+    if narrow and not self.narrow_street_prev and self.narrow_street_assist and self.enabled:
+      self.events_sp.add(custom.OnroadEventSP.EventName.narrowStreet)
+    self.narrow_street_prev = narrow
 
     # Handle lane turn
     lane_turn_direction = self.sm['modelDataV2SP'].laneTurnDirection
@@ -678,6 +686,7 @@ class SelfdriveD(CruiseHelper):
     while not evt.is_set():
       self.is_metric = self.params.get_bool("IsMetric")
       self.speed_limit_chime = (self.params.get("SpeedLimitMode", return_default=True) or 0) > 0
+      self.narrow_street_assist = self.params.get_bool("NarrowStreetAssist")
       self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
       self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
       self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl

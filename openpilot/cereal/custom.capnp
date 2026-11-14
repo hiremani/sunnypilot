@@ -205,6 +205,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
   events @6 :List(OnroadEventSP.Event);
   e2eAlerts @7 :E2eAlerts;
   stopSign @8 :StopSign;
+  narrowStreet @9 :Bool;   # no lane lines, curbs close together (narrow_street.py); the speed cap applies with NarrowStreetAssist
 
   struct DynamicExperimentalControl {
     state @0 :DynamicExperimentalControlState;
@@ -302,6 +303,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     sccMap @2;
     speedLimitAssist @3;
     stopSign @4;
+    narrowStreet @5;
   }
 
   struct StopSign {
@@ -377,6 +379,7 @@ struct OnroadEventSP @0xda96579883444c35 {
     bigModelReady @25;
     speedLimitPosted @26;
     blindSpotBlinker @27;
+    narrowStreet @28;
   }
 }
 
