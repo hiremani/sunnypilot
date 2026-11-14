@@ -604,3 +604,99 @@ def simulate_turns(data: dict, tuning=None) -> dict:
   out.update(ev)
   out["mode"] = "turns"
   return out
+
+
+# ---- narrow streets ----
+
+NARROW_PUSH_TQ = 1.0   # Nm: the driver pushing the wheel (not just resting a hand on it)
+
+
+def extract_narrow(root: str, route: str, segs: str | None = None) -> dict:
+  """Per modelV2 frame, aligned 1:1 with extract()'s frames (same logs, same frame filter), the narrow-street
+  detector's state and what the center-line keeper would shift, run over the recording as if NarrowStreetAssist were
+  on (the keeper ignores the driver's hands here, to show what it would want), plus the driver's own pushes."""
+  from openpilot.common.realtime import DT_MDL
+  from openpilot.sunnypilot.selfdrive.controls.lib import narrow_street as ns
+  dirs = segment_dirs(root, route, segs)
+  stamp = max(os.path.getmtime(_log(d)) for d in dirs)
+  src = os.path.getmtime(ns.__file__)
+  os.makedirs(CACHE_DIR, exist_ok=True)
+  cache = os.path.join(CACHE_DIR, f"{route}_{segs or 'all'}_narrow.pkl")
+  if os.path.exists(cache):
+    with open(cache, "rb") as f:
+      out = pickle.load(f)
+    if out.get("stamp") == (stamp, src):
+      return out
+
+  from openpilot.tools.lib.logreader import LogReader
+  keeper, det = ns.CenterLineKeeper(DT_MDL), ns.NarrowStreetDetector(DT_MDL)
+  cols = {k: [] for k in ("narrow", "shift", "push", "left_line", "left_prob", "width")}
+  service, have_gps, cs, lat_active = None, False, None, False
+  for seg in dirs:
+    for m in LogReader(_log(seg)):
+      w = m.which()
+      if w in ("gpsLocationExternal", "gpsLocation"):
+        g = getattr(m, w)
+        if service is None and g.hasFix:
+          service = w
+        have_gps = have_gps or w == service
+      elif w == "carState":
+        cs = m.carState
+      elif w == "carControl":
+        lat_active = m.carControl.latActive
+      elif w == "modelV2" and have_gps and cs is not None:
+        md = m.modelV2
+        keeper.update(md, cs.vEgo, cs.leftBlinker, False, lat_active)
+        mv = ns.ModelView(md)
+        push = 0
+        if lat_active and abs(cs.steeringTorque) > NARROW_PUSH_TQ and abs(cs.steeringAngleDeg) < 30 and cs.vEgo > 3:
+          push = -1 if cs.steeringTorque < 0 else 1    # torque + = left; -1 = pushing RIGHT
+        cols["narrow"].append(int(det.update(md, cs.vEgo)))
+        cols["shift"].append(round(keeper.shift, 2))
+        cols["push"].append(push)
+        cols["left_line"].append(round(mv.left_line, 2) if math.isfinite(mv.left_line) else None)
+        cols["left_prob"].append(round(mv.left_prob, 2))
+        width = mv.right_edge - mv.left_edge
+        cols["width"].append(round(width, 1) if math.isfinite(width) else None)
+  out = {"stamp": (stamp, src), "cols": cols}
+  with open(cache, "wb") as f:
+    pickle.dump(out, f)
+  return out
+
+
+def _runs(flags: list, min_n: int, gap_n: int = 0) -> list[tuple[int, int]]:
+  """(start, end) index runs where flags are truthy, at least min_n long, merging gaps up to gap_n."""
+  runs: list[list[int]] = []
+  for i, f in enumerate(flags):
+    if not f:
+      continue
+    if runs and i - runs[-1][1] <= gap_n + 1:
+      runs[-1][1] = i
+    else:
+      runs.append([i, i])
+  return [(a, b) for a, b in runs if b - a + 1 >= min_n]
+
+
+def simulate_narrow(data: dict, root: str) -> dict:
+  """Replay plus the narrow-street assist, for the page's "Narrow streets" mode."""
+  out = simulate(data)
+  nar = extract_narrow(root, data["route"], data["segs"])["cols"]
+  n = len(out["cols"]["t"])
+  if len(nar["narrow"]) != n:
+    raise RuntimeError(f"narrow pass has {len(nar['narrow'])} frames, replay {n}: logs changed? clear {CACHE_DIR}")
+  out["cols"].update(nar)
+  c = out["cols"]
+  spans = [{"i": a, "t": c["t"][a], "dur": round(c["t"][b] - c["t"][a], 1),
+            "mph": round(sum(c["mph"][a:b + 1]) / (b - a + 1)),
+            "width": round(sum(w for w in c["width"][a:b + 1] if w) / max(1, sum(1 for w in c["width"][a:b + 1] if w)), 1)}
+           for a, b in _runs(c["narrow"], 20)]
+  pushes = []
+  for side, val in (("right", -1), ("left", 1)):
+    for a, b in _runs([p == val for p in c["push"]], 10, gap_n=10):
+      seg = c["shift"][a:b + 1]
+      pushes.append({"i": a, "t": c["t"][a], "dur": round(c["t"][b] - c["t"][a], 1), "side": side,
+                     "keeper": round(max(seg), 2), "narrow": any(c["narrow"][a:b + 1]), "mph": c["mph"][a]})
+  pushes.sort(key=lambda p: p["i"])
+  out.update({"mode": "narrow", "narrow_spans": spans, "pushes": pushes,
+              "keeper_active_s": round(sum(1 for s in c["shift"] if s > 0.05) / 20, 1)})
+  return out

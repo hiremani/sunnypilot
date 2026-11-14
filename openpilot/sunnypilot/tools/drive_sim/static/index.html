@@ -84,7 +84,7 @@
   <select id="route"></select>
   <input id="segs" placeholder="segments, e.g. 5-9" size="14">
   <select id="mode" title="replay: the recording drives, the code reports; closed loop: the simulated car obeys Stop Sign Assist; turn planner: replay plus the map turn planner's ghost path at each signaled turn">
-    <option value="replay">Replay</option><option value="closed">Closed loop</option><option value="turns">Turn planner</option>
+    <option value="replay">Replay</option><option value="closed">Closed loop</option><option value="turns">Turn planner</option><option value="narrow">Narrow streets</option>
   </select>
   <label title="closed loop: seconds the driver waits at a stop before tapping the accelerator">wait <input id="wait" type="number" value="2" min="0" step="0.5" style="width:56px">s</label>
   <button id="run" class="primary">Run</button>
@@ -111,6 +111,12 @@
       <span><i class="sw" style="background:var(--turn)"></i>turn desire</span>
       <span><i class="sw" style="background:var(--ghost)"></i>turn planner ghost</span>
     </div>
+    <div class="legend" id="narrowLegend" style="margin-top:6px" hidden>
+      <span><i class="sw" style="background:#f59e0b"></i>narrow street</span>
+      <span><i class="sw" style="background:#22d3ee"></i>keeper shifts right</span>
+      <span><i class="sw" style="background:#ef4444"></i>you pushed right</span>
+      <span><i class="sw" style="background:#a855f7"></i>you pushed left</span>
+    </div>
     <div class="legend" style="margin-top:6px">
       <span><i class="sw" style="background:var(--applies)"></i>sign applies</span>
       <span><i class="sw" style="background:var(--notours)"></i>not ours</span>
@@ -125,6 +131,11 @@
       <h2>Turn planner (signaled turns)</h2>
       <table id="turns"></table>
       <div style="font-size:11px;color:var(--muted);margin-top:4px">trig m: distance to the junction node where it starts turning · lat m: max distance of the ghost from your path · hdg°: ghost heading minus your exit heading (+ = clockwise)</div>
+    </div>
+    <div id="narrowBox" hidden>
+      <h2>Narrow-street assist</h2>
+      <table id="narrowTbl"></table>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">narrow: flagged by the detector (warning + 18 mph cap) · push: you pushed the wheel &gt;1 Nm while steering was engaged · keeper: the most the center-line keeper would have shifted right during it</div>
     </div>
     <h2>Events</h2>
     <ul id="events"></ul>
@@ -210,6 +221,7 @@ function draw() {
       .bindPopup(`<b>turn planner ghost</b>${g.n ? ' · turn ' + g.n : ''} · ${g.side}`).addTo(layers);
     L.circleMarker(g.junction, { radius: 5, color: css('--ghost'), weight: 2, fillOpacity: 0 }).bindPopup('junction node').addTo(layers);
   }
+  drawNarrowOverlay(c, n);
   car = L.circleMarker([c.lat[0], c.lon[0]], { radius: 8, color: '#fff', weight: 3, fillColor: css('--accent'), fillOpacity: 1 }).addTo(layers);
   map.fitBounds(L.latLngBounds(c.lat.map((la, i) => [la, c.lon[i]])), { padding: [20, 20] });
   $('scrub').max = n - 1;
@@ -225,10 +237,14 @@ function draw() {
       'mode': 'closed loop', 'route length': (sim.path_m / 1609.34).toFixed(2) + ' mi',
       'time: simulated / recorded': `${sim.simulated_s} / ${sim.recorded_s} s`,
       'assist stops': sim.stops.length ? sim.stops.map(x => `${x.t.toFixed(0)}s @${x.dist} m`).join(', ') : 'none',
-    } : { 'mode': sim.mode === 'turns' ? 'replay + turn planner' : 'replay' }),
+    } : { 'mode': { turns: 'replay + turn planner', narrow: 'replay + narrow-street assist' }[sim.mode] || 'replay' }),
+    ...(sim.mode === 'narrow' ? { 'narrow stretches': `${sim.narrow_spans.length} · ${sim.narrow_spans.reduce((a, s) => a + s.dur, 0).toFixed(0)} s`,
+      'keeper shifting': sim.keeper_active_s + ' s',
+      'your pushes (R / L)': `${sim.pushes.filter(p => p.side === 'right').length} / ${sim.pushes.filter(p => p.side === 'left').length}` } : {}),
     ...(sim.turns ? { 'planner turns': `${sim.turns.filter(t => t.triggered).length} of ${sim.turns.length} triggered` } : {}),
   });
   drawTurns();
+  drawNarrowTable();
   $('events').innerHTML = sim.events.filter(e => e.state !== 'idle' || e.turn || e.confirmed).map(e =>
     `<li data-i="${e.i}"><span class="t">${e.t.toFixed(1)}s</span>` +
     `<span class="pill" style="background:${css(e.turn && e.state === 'idle' ? '--turn' : STATE_COLOR[e.state] || '--idle')}">${e.turn && e.state === 'idle' ? 'turn ' + e.turn : e.state}</span>` +
@@ -250,6 +266,42 @@ function drawTurns() {
     }).join('');
 }
 
+function drawNarrowOverlay(c, n) {
+  $('narrowLegend').hidden = sim.mode !== 'narrow';
+  if (sim.mode !== 'narrow') return;
+  for (const [a, b] of runsOf(i => c.narrow[i], n)) {   // narrow stretches: a wide amber band under the path
+    const pts = []; for (let j = a; j <= b; j += 2) pts.push([c.lat[j], c.lon[j]]);
+    if (pts.length > 1) L.polyline(pts, { color: '#f59e0b', weight: 12, opacity: .45 }).bindPopup('narrow street (warning + 18 mph cap)').addTo(layers);
+  }
+  for (let i = 0; i < n; i += 10) {   // keeper: a cyan dot offset to the right, sized by the shift
+    if (c.shift[i] > 0.05) L.circleMarker([c.lat[i], c.lon[i]], { radius: 2 + 8 * c.shift[i], color: '#22d3ee', weight: 1, fillOpacity: .6 })
+      .bindPopup(`center-line keeper: +${c.shift[i]} m right<br>left line ${c.left_line[i] ?? '—'} m (p ${c.left_prob[i]})`).addTo(layers);
+  }
+  for (const p of sim.pushes) {
+    L.circleMarker([c.lat[p.i], c.lon[p.i]], { radius: 7, color: p.side === 'right' ? '#ef4444' : '#a855f7', weight: 3, fillOpacity: .15 })
+      .bindPopup(`you pushed ${p.side} for ${p.dur} s at ${p.mph} mph<br>keeper would shift right up to ${p.keeper} m${p.narrow ? '<br>on a flagged narrow street' : ''}`).addTo(layers);
+  }
+}
+
+function runsOf(pred, n) {
+  const out = []; let a = null;
+  for (let i = 0; i <= n; i++) {
+    if (i < n && pred(i)) { if (a === null) a = i; } else if (a !== null) { out.push([a, i - 1]); a = null; }
+  }
+  return out;
+}
+
+function drawNarrowTable() {
+  const box = $('narrowBox');
+  box.hidden = sim.mode !== 'narrow';
+  if (box.hidden) return;
+  const rows = [...sim.narrow_spans.map(s => ({ ...s, kind: 'narrow' })), ...sim.pushes.map(p => ({ ...p, kind: 'push' }))].sort((a, b) => a.i - b.i);
+  $('narrowTbl').innerHTML = '<tr><th>t s</th><th>what</th><th>dur s</th><th>mph</th><th>detail</th></tr>' + rows.map(r => r.kind === 'narrow'
+    ? `<tr data-i="${r.i}"><td>${r.t.toFixed(0)}</td><td style="color:#f59e0b">narrow street</td><td>${r.dur}</td><td>${r.mph}</td><td>curbs ${r.width} m apart</td></tr>`
+    : `<tr data-i="${r.i}"><td>${r.t.toFixed(0)}</td><td style="color:${r.side === 'right' ? '#ef4444' : '#a855f7'}">you pushed ${r.side}</td><td>${r.dur}</td><td>${r.mph}</td>` +
+      `<td>${r.keeper > 0.05 ? (r.side === 'right' ? 'keeper agrees: +' : 'keeper would go right: +') + r.keeper + ' m' : 'keeper idle'}${r.narrow ? ' · narrow' : ''}</td></tr>`).join('');
+}
+
 function kv(obj) { return Object.entries(obj).map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join(''); }
 
 function seek(i) {
@@ -269,6 +321,9 @@ function seek(i) {
     'wheel': c.wheel[idx] + '°' + (c.pressed[idx] ? ' · driver' : ''), 'steering active': c.lat_active[idx] ? 'yes' : 'no',
     'model curvature': c.curv[idx],
     ...(c.tp_state ? { 'turn planner': c.tp_state[idx] } : {}),
+    ...(c.narrow ? { 'narrow street': c.narrow[idx] ? 'yes' : 'no', 'curb width': c.width[idx] != null ? c.width[idx] + ' m' : '—',
+      'left line': c.left_line[idx] != null ? `${c.left_line[idx]} m (p ${c.left_prob[idx]})` : '—', 'keeper shift': c.shift[idx] + ' m',
+      'your push': c.push[idx] ? (c.push[idx] < 0 ? 'right' : 'left') : '—' } : {}),
   });
   showStopSign(c);
   drawChart();
@@ -355,6 +410,7 @@ function tick(ts) {
 $('run').onclick = run;
 $('scrub').oninput = e => seek(+e.target.value);
 $('play').onclick = () => { playing = !playing; lastTick = performance.now(); $('play').textContent = playing ? 'Pause' : 'Play'; };
+$('narrowTbl').onclick = e => { const tr = e.target.closest('tr[data-i]'); if (tr) { seek(+tr.dataset.i); map.setView(car.getLatLng(), 18); } };
 $('turns').onclick = e => { const tr = e.target.closest('tr[data-i]'); if (tr) { seek(+tr.dataset.i); map.setView(car.getLatLng(), 18); } };
 $('events').onclick = e => { const li = e.target.closest('li'); if (li) { seek(+li.dataset.i); map.panTo(car.getLatLng()); } };
 $('chart').onclick = e => { if (sim) { const r = e.target.getBoundingClientRect(); seek((e.clientX - r.left - 28) / (r.width - 36) * (sim.cols.t.length - 1)); } };

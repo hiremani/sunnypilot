@@ -33,6 +33,7 @@ RELOAD = (   # dependencies first
   "openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller",
   "openpilot.sunnypilot.selfdrive.controls.lib.lane_turn_desire",
   "openpilot.sunnypilot.selfdrive.controls.lib.turn_planner",
+  "openpilot.sunnypilot.selfdrive.controls.lib.narrow_street",
   "openpilot.sunnypilot.tools.drive_sim.sim",
 )
 
@@ -82,6 +83,8 @@ def make_handler(root: str):
             out = sim.simulate_closed_loop(data, proceed_wait_s=float(q.get("wait", 2.0)))
           elif q.get("mode") == "turns":
             out = sim.simulate_turns(data)
+          elif q.get("mode") == "narrow":
+            out = sim.simulate_narrow(data, root)
           else:
             out = sim.simulate(data)
           out["timing"] = {"extract_s": round(t1 - t0, 2), "simulate_s": round(time.monotonic() - t1, 2)}
