@@ -13,6 +13,13 @@ sits on in mapd's road tiles, road_geometry.py) is skipped; one that can't be to
 includes a stop=all node with an explicit forward/backward: it is one approach's node of an all-way stop. A cell's
 signs are usable as soon as the cell is read; the road-tile lookup that follows, on the same background thread,
 only adds the approaches it could resolve.
+
+Signs OpenStreetMap is missing can be added in <mapd root>/local_stop_signs.json (kept beside the cached map data, out of
+git, since it holds the driver's own streets):
+  {"signs": [{"id": -1, "lat": 37.5, "lon": -121.9, "all_way": true, "note": "Main & 1st"},
+             {"id": -2, "lat": 37.6, "lon": -121.8, "approaches": [90.0], "note": "eastbound only"}]}
+id must be negative (OSM ids are positive). all_way holds every approach; approaches lists the bearings (deg) of the
+traffic it holds. Each is merged into its feature cell when the cell loads.
 """
 import json
 import math
@@ -34,6 +41,7 @@ MAX_LATERAL_M = 12.0       # ...and this close to the line the car is driving on
 MAX_BEARING_ERR_DEG = 25.0  # ...and roughly in front (a sign off to the side is on a crossing road)
 SAME_JUNCTION_M = 25.0     # signs this close along the road are one junction (OSM often maps one per approach)
 RETRY_S = 60.0             # wait this long before trying a cell that failed to load again
+LOCAL_SIGNS_FILE = "local_stop_signs.json"
 
 
 @dataclass(frozen=True)
@@ -72,6 +80,29 @@ def stop_signs_from_cell(cell: dict) -> list[StopSign]:
       # only an explicit forward/backward (road tiles, resolve_approaches) narrows an all-way stop, never a compass value
       out.append(StopSign(int(node_id), float(lat), float(lon), direction, all_way,
                           None if all_way else approaches_from_tags(direction)))
+  return out
+
+
+def local_stop_signs(path: str) -> list[StopSign]:
+  """The hand-added signs in `path` (see the module docstring); [] when there is no file. A bad entry is skipped."""
+  if not os.path.isfile(path):
+    return []
+  with open(path) as f:
+    data = json.load(f)
+  out = []
+  for e in data.get("signs", []):
+    try:
+      node_id = int(e["id"])
+      if node_id >= 0:
+        raise ValueError("local stop sign ids must be negative")
+      approaches = e.get("approaches")
+      approaches = tuple(float(a) % 360.0 for a in approaches) if approaches else None
+      all_way = bool(e.get("all_way", False))
+      if not all_way and approaches is None:
+        raise ValueError("a local stop sign needs all_way or approaches")
+      out.append(StopSign(node_id, float(e["lat"]), float(e["lon"]), None, all_way, approaches))
+    except (KeyError, TypeError, ValueError) as err:
+      cloudlog.warning(f"stop sign: skipping local stop sign {e!r}: {err}")
   return out
 
 
@@ -133,6 +164,15 @@ class StopSignMap:
     self._pending: set[tuple[int, int]] = set()
     self._failed: dict[tuple[int, int], float] = {}
     self._lock = threading.Lock()
+    self.local_path = os.path.join(os.path.dirname(os.path.normpath(self.features.root)), LOCAL_SIGNS_FILE)
+
+  def _local_in_cell(self, key: tuple[int, int]) -> list[StopSign]:
+    try:
+      signs = local_stop_signs(self.local_path)
+    except Exception:
+      cloudlog.exception(f"stop sign: reading {self.local_path} failed")
+      return []
+    return [s for s in signs if (math.floor(s.lat / FEAT_DEG), math.floor(s.lon / FEAT_DEG)) == key]
 
   def _load(self, key: tuple[int, int]) -> None:
     signs: list[StopSign] | None = None
@@ -140,7 +180,7 @@ class StopSignMap:
       path = self.features.cell_path(*key)
       if path is not None and os.path.isfile(path):
         with open(path) as f:
-          signs = stop_signs_from_cell(json.load(f))
+          signs = stop_signs_from_cell(json.load(f)) + self._local_in_cell(key)
     except Exception:
       cloudlog.exception(f"stop sign: loading feature cell {key} failed")
     with self._lock:

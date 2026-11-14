@@ -20,7 +20,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_direction i
   Applies, angle_diff, approaches_from_ways, parse_direction, sign_applies, travel_from_facing,
 )
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_map import (
-  EARTH_R, StopSign, StopSignMap, find_stop_ahead, resolve_approaches, stop_signs_from_cell,
+  EARTH_R, StopSign, StopSignMap, find_stop_ahead, local_stop_signs, resolve_approaches, stop_signs_from_cell,
 )
 
 LAT0, LON0 = 37.0, -122.0
@@ -852,6 +852,45 @@ def test_crawling_past_a_sign_releases_it():
   for _ in range(400):   # 20 s at 1.3 m/s, GPS speed too low for its bearing
     ctrl.update(sm_at(gps(LAT0, LON0, speed=1.3), model()), True, False, 1.3, 0.0, NOW)
   assert ctrl.node_id is None and 1 in ctrl.done_ids and ctrl.output_v_target > 200
+
+def test_local_stop_signs_parse_and_skip_bad_entries(tmp_path):
+  import json
+  p = tmp_path / "local_stop_signs.json"
+  assert local_stop_signs(str(p)) == []
+  p.write_text(json.dumps({"signs": [
+    {"id": -1, "lat": LAT0, "lon": LON0, "all_way": True},
+    {"id": -2, "lat": LAT0, "lon": LON0, "approaches": [450.0]},
+    {"id": 5, "lat": LAT0, "lon": LON0, "all_way": True},      # positive id: could clash with OSM
+    {"id": -3, "lat": LAT0, "lon": LON0},                       # holds nothing
+    {"id": -4, "lon": LON0, "all_way": True},                   # no lat
+  ]}))
+  signs = local_stop_signs(str(p))
+  assert [s.node_id for s in signs] == [-1, -2]
+  assert signs[0].all_way and signs[0].approaches is None and not signs[0].needs_geometry
+  assert signs[1].approaches == (90.0,)
+  assert sign_applies(signs[0], 123.0) == Applies.YES
+
+
+def test_local_stop_sign_merges_into_its_cell(tmp_path):
+  import json
+  from openpilot.sunnypilot.webhud.maptiles import FEAT_DEG
+  features = tmp_path / "features"
+  features.mkdir()
+  key = (math.floor(LAT0 / FEAT_DEG), math.floor(LON0 / FEAT_DEG))
+  cell = features / "cell.json"
+  cell.write_text(json.dumps({"nodes": [[7, LAT0, LON0, {"highway": "stop", "direction": "both"}]]}))
+  far = LAT0 + 3 * FEAT_DEG
+  (tmp_path / "local_stop_signs.json").write_text(json.dumps({"signs": [
+    {"id": -1, "lat": north_of(LAT0, LON0, 100)[0], "lon": LON0, "all_way": True},
+    {"id": -2, "lat": far, "lon": LON0, "all_way": True},       # another cell
+  ]}))
+  feats = SimpleNamespace(root=str(features), cell_path=lambda klat, klon: str(cell) if (klat, klon) == key else None)
+  smap = StopSignMap(features=feats, geometry=SimpleNamespace(ways_at=lambda lat, lon: None))
+  smap._load(key)
+  assert sorted(s.node_id for s in smap._cells[key]) == [-1, 7]
+  ahead = find_stop_ahead(*north_of(LAT0, LON0, 60), 0.0, smap._cells[key])
+  assert ahead is not None and ahead.node_id == -1
+
 
 def _as_method(fn):
   import inspect
