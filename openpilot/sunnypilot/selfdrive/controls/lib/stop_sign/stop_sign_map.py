@@ -7,15 +7,24 @@ See the LICENSE.md file in the root directory for more details.
 Stop signs near the car, from the OpenStreetMap point features the webhud already caches (webhud/maptiles.py
 MapFeatures: highway=stop nodes, FEAT_DEG cells under <mapd root>/features/). Cells load, and download when
 missing, on a background thread, so the 20 Hz planner never waits on disk or the network.
+
+A sign that clearly holds another direction of travel (stop_sign_direction.py: its direction tag, or the road it
+sits on in mapd's road tiles, road_geometry.py) is skipped; one that can't be told apart is kept as before. A cell's
+signs are usable as soon as the cell is read; the road-tile lookup that follows, on the same background thread,
+only adds the approaches it could resolve.
 """
 import json
 import math
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.road_geometry import RoadGeometry
+from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_direction import (
+  Applies, approaches_from_tags, approaches_from_ways, sign_applies,
+)
 from openpilot.sunnypilot.webhud.maptiles import FEAT_DEG, MapFeatures
 
 EARTH_R = 6371000.0
@@ -31,6 +40,13 @@ class StopSign:
   node_id: int
   lat: float
   lon: float
+  direction: str | None = None                   # the OSM direction tag, as mapped
+  all_way: bool = False                          # stop=all
+  approaches: tuple[float, ...] | None = None    # bearings of the traffic it holds; None: not known
+
+  @property
+  def needs_geometry(self) -> bool:
+    return not self.all_way and self.approaches is None
 
 
 @dataclass(frozen=True)
@@ -48,7 +64,22 @@ def stop_signs_from_cell(cell: dict) -> list[StopSign]:
     except (TypeError, ValueError):
       continue
     if isinstance(tags, dict) and tags.get("highway") == "stop":
-      out.append(StopSign(int(node_id), float(lat), float(lon)))
+      direction = tags.get("direction")
+      direction = direction if isinstance(direction, str) else None
+      out.append(StopSign(int(node_id), float(lat), float(lon), direction, tags.get("stop") == "all",
+                          approaches_from_tags(direction)))
+  return out
+
+
+def resolve_approaches(signs: list[StopSign], geometry: RoadGeometry) -> list[StopSign]:
+  """The signs with what the road tiles add: approaches for forward/backward and untagged signs. Blocking."""
+  out = []
+  for s in signs:
+    if s.needs_geometry:
+      approaches = approaches_from_ways(s.direction, geometry.ways_at(s.lat, s.lon))
+      if approaches is not None:
+        s = replace(s, approaches=approaches)
+    out.append(s)
   return out
 
 
@@ -64,6 +95,8 @@ def find_stop_ahead(lat: float, lon: float, bearing_deg: float, signs, skip_ids=
   for s in signs:
     if s.node_id in skip_ids:
       continue
+    if sign_applies(s, bearing_deg) == Applies.NO:
+      continue   # for another direction of travel (a crossing road's two-way stop)
     dx = math.radians(s.lon - lon) * cos_lat * EARTH_R  # east, m
     dy = math.radians(s.lat - lat) * EARTH_R            # north, m
     along = dx * hx + dy * hy
@@ -88,8 +121,9 @@ def find_stop_ahead(lat: float, lon: float, bearing_deg: float, signs, skip_ids=
 class StopSignMap:
   """The stop signs in the 3 x 3 feature cells around the car, loaded in the background."""
 
-  def __init__(self, features: MapFeatures | None = None):
+  def __init__(self, features: MapFeatures | None = None, geometry: RoadGeometry | None = None):
     self.features = features or MapFeatures()
+    self.geometry = geometry or RoadGeometry()
     self._cells: dict[tuple[int, int], list[StopSign]] = {}
     self._pending: set[tuple[int, int]] = set()
     self._failed: dict[tuple[int, int], float] = {}
@@ -111,6 +145,16 @@ class StopSignMap:
         self._failed.pop(key, None)
       else:
         self._failed[key] = time.monotonic()
+    if signs is None or not any(s.needs_geometry for s in signs):
+      return
+    try:
+      resolved = resolve_approaches(signs, self.geometry)
+    except Exception:
+      cloudlog.exception(f"stop sign: road geometry for cell {key} failed")
+      return
+    with self._lock:
+      if key in self._cells:
+        self._cells[key] = resolved
 
   def signs_near(self, lat: float, lon: float) -> list[StopSign]:
     klat, klon = math.floor(lat / FEAT_DEG), math.floor(lon / FEAT_DEG)
