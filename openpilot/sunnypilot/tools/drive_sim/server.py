@@ -83,6 +83,8 @@ def make_handler(root: str):
             out = sim.simulate_closed_loop(data, proceed_wait_s=float(q.get("wait", 2.0)))
           elif q.get("mode") == "turns":
             out = sim.simulate_turns(data)
+          elif q.get("mode") == "style":
+            out = sim.simulate_style(data)
           elif q.get("mode") == "narrow":
             out = sim.simulate_narrow(data, root)
           else:

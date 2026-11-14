@@ -84,7 +84,7 @@
   <select id="route"></select>
   <input id="segs" placeholder="segments, e.g. 5-9" size="14">
   <select id="mode" title="replay: the recording drives, the code reports; closed loop: the simulated car obeys Stop Sign Assist; turn planner: replay plus the map turn planner's ghost path at each signaled turn">
-    <option value="replay">Replay</option><option value="closed">Closed loop</option><option value="turns">Turn planner</option><option value="narrow">Narrow streets</option>
+    <option value="replay">Replay</option><option value="closed">Closed loop</option><option value="turns">Turn planner</option><option value="narrow">Narrow streets</option><option value="style">Your style (openpilot speed)</option>
   </select>
   <label title="closed loop: seconds the driver waits at a stop before tapping the accelerator">wait <input id="wait" type="number" value="2" min="0" step="0.5" style="width:56px">s</label>
   <button id="run" class="primary">Run</button>
@@ -237,7 +237,10 @@ function draw() {
       'mode': 'closed loop', 'route length': (sim.path_m / 1609.34).toFixed(2) + ' mi',
       'time: simulated / recorded': `${sim.simulated_s} / ${sim.recorded_s} s`,
       'assist stops': sim.stops.length ? sim.stops.map(x => `${x.t.toFixed(0)}s @${x.dist} m`).join(', ') : 'none',
-    } : { 'mode': { turns: 'replay + turn planner', narrow: 'replay + narrow-street assist' }[sim.mode] || 'replay' }),
+    } : { 'mode': { turns: 'replay + turn planner', narrow: 'replay + narrow-street assist', style: 'openpilot speed, your style' }[sim.mode] || 'replay' }),
+    ...(sim.mode === 'style' ? { 'trip time: sim / you': `${sim.simulated_s} / ${sim.recorded_s} s`,
+      'avg speed difference': sim.mean_abs_mph + ' mph', 'sim >5 mph faster / slower': `${sim.faster_5_pct}% / ${sim.slower_5_pct}% of the time`,
+      'what set the speed': Object.entries(sim.why_s).map(([k, v]) => `${k} ${v.toFixed(0)}s`).join(', ') } : {}),
     ...(sim.mode === 'narrow' ? { 'narrow stretches': `${sim.narrow_spans.length} · ${sim.narrow_spans.reduce((a, s) => a + s.dur, 0).toFixed(0)} s`,
       'keeper shifting': sim.keeper_active_s + ' s',
       'your pushes (R / L)': `${sim.pushes.filter(p => p.side === 'right').length} / ${sim.pushes.filter(p => p.side === 'left').length}` } : {}),
@@ -321,6 +324,7 @@ function seek(i) {
     'wheel': c.wheel[idx] + '°' + (c.pressed[idx] ? ' · driver' : ''), 'steering active': c.lat_active[idx] ? 'yes' : 'no',
     'model curvature': c.curv[idx],
     ...(c.tp_state ? { 'turn planner': c.tp_state[idx] } : {}),
+    ...(c.why ? { 'speed set by': c.why[idx], 'style target': c.target_mph[idx] + ' mph' } : {}),
     ...(c.narrow ? { 'narrow street': c.narrow[idx] ? 'yes' : 'no', 'curb width': c.width[idx] != null ? c.width[idx] + ' m' : '—',
       'left line': c.left_line[idx] != null ? `${c.left_line[idx]} m (p ${c.left_prob[idx]})` : '—', 'keeper shift': c.shift[idx] + ' m',
       'your push': c.push[idx] ? (c.push[idx] < 0 ? 'right' : 'left') : '—' } : {}),
@@ -394,7 +398,8 @@ function drawChart() {
   line(c.target_mph, css('--brake'), 1.5, [4, 3]);
   g.strokeStyle = css('--accent'); g.lineWidth = 1.5; g.beginPath(); g.moveTo(X(idx), 4); g.lineTo(X(idx), h - 16); g.stroke();
   g.fillStyle = css('--muted');
-  g.fillText(sim.mode === 'closed' ? 'speed (mph): simulated car; red dashed: assist command; grey dotted: what you drove there'
+  g.fillText(sim.mode === 'style' ? 'speed (mph): openpilot with your style; red dashed: its target; grey dotted: what you drove there'
+           : sim.mode === 'closed' ? 'speed (mph): simulated car; red dashed: assist command; grey dotted: what you drove there'
                                    : 'speed (mph): as driven; red dashed: what Stop Sign Assist would command', pad, h - 4);
 }
 

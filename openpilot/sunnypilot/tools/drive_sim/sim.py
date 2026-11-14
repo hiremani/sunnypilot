@@ -62,7 +62,7 @@ def extract(root: str, route: str, segs: str | None = None) -> dict:
   if os.path.exists(cache):
     with open(cache, "rb") as f:
       data = pickle.load(f)
-    if data.get("stamp") == stamp and data.get("version") == 2:
+    if data.get("stamp") == stamp and data.get("version") == 3:
       return data
 
   from openpilot.tools.lib.logreader import LogReader
@@ -85,19 +85,23 @@ def extract(root: str, route: str, segs: str | None = None) -> dict:
                      cs.gasPressed, cs.brakePressed, cs.leftBlindspot, cs.rightBlindspot)
       elif w == "radarState":
         lead = m.radarState.leadOne
-        cur["lead"] = (bool(lead.present), float(lead.dRel))
+        cur["lead"] = (bool(lead.present), float(lead.dRel), float(lead.vLead))
+      elif w == "longitudinalPlanSP":
+        r = m.longitudinalPlanSP.speedLimit.resolver
+        cur["limit"] = float(r.speedLimit) if r.speedLimitValid else 0.0
       elif w == "carControl":
         cur["lat"] = m.carControl.latActive
       elif w == "modelV2" and "gps" in cur and "cs" in cur:
         md = m.modelV2
         ds = list(md.meta.desireState)
         frames.append({
-          "t": (m.logMonoTime - t0) / 1e9, "gps": cur["gps"], "cs": cur["cs"], "lead": cur.get("lead", (False, 0.0)),
+          "t": (m.logMonoTime - t0) / 1e9, "gps": cur["gps"], "cs": cur["cs"], "lead": cur.get("lead", (False, 0.0, 0.0)),
+          "limit": cur.get("limit", 0.0),
           "lat_active": cur.get("lat", False), "stop": md.action.shouldStop, "curv": md.action.desiredCurvature,
           "vel": [round(v, 3) for v in md.velocity.x], "pos": [round(p, 2) for p in md.position.x],
           "desire": max(range(len(ds)), key=lambda i: ds[i]) if ds else 0,
         })
-  data = {"version": 2, "stamp": stamp, "route": route, "segs": segs, "service": service or "gpsLocation", "frames": frames}
+  data = {"version": 3, "stamp": stamp, "route": route, "segs": segs, "service": service or "gpsLocation", "frames": frames}
   with open(cache, "wb") as f:
     pickle.dump(data, f)
   return data
@@ -700,3 +704,151 @@ def simulate_narrow(data: dict, root: str) -> dict:
   out.update({"mode": "narrow", "narrow_spans": spans, "pushes": pushes,
               "keeper_active_s": round(sum(1 for s in c["shift"] if s > 0.05) / 20, 1)})
   return out
+
+
+# ---- your style ----
+
+# The driver's own habits (fisker_drive_style over 000000ea..f2, 2026-11-14): openpilot longitudinal tuned to them.
+STYLE = {
+  "town_offset_mph": 0.0,      # 25-45 mph zones: the driver ran under the limit (median -5..-8)
+  "fast_offset_mph": 5.0,      # 55+ mph zones: median +2, p85 +9
+  "fast_zone_mph": 55.0,
+  "lat_accel": 2.2,            # m/s^2 in curves (driver p50 1.5, p95 3.2)
+  "decel": 1.1,                # m/s^2 planned braking for stops and curves (driver average 1.12)
+  "gap_s": 1.65,               # following gap behind a lead (driver median)
+  "standstill_gap_m": 4.0,
+  "accel_max": 1.0,            # m/s^2: the car's openpilot limit (ACCEL_MAX); the driver launches at ~1.6
+  "decel_max": 3.5,
+}
+CURVE_LOOK_M = 150.0
+
+
+def path_curvature(path) -> list[float]:
+  """|curvature| (1/m) at each path point from the bearing change over ~10 m either side."""
+  out = []
+  for k in range(len(path)):
+    a, b = k, k
+    while a > 0 and path[k][0] - path[a][0] < 10.0:
+      a -= 1
+    while b < len(path) - 1 and path[b][0] - path[k][0] < 10.0:
+      b += 1
+    ds = path[b][0] - path[a][0]
+    out.append(abs(math.radians(_angle_diff(path[b][3], path[a][3]))) / ds if ds > 5.0 else 0.0)
+  return out
+
+
+def simulate_style(data: dict, style: dict | None = None) -> dict:
+  """The recorded route driven by openpilot longitudinal tuned to the driver's style: the posted limit (+ offset), the
+  driver's lateral accel in curves, the driver's braking to each place the driver stopped (held as long), the
+  driver's gap to the lead the recording saw at that spot, and the car's accel limit. Compared with the recorded speed
+  at the same place."""
+  from openpilot.common.realtime import DT_MDL
+  st = STYLE | (style or {})
+  frames = data["frames"]
+  lo, hi = moving_span(frames)
+  path = build_path(frames, lo, hi)
+  if len(path) < 2:
+    raise ValueError("no GPS path in these segments")
+  curv = path_curvature(path)
+  runs = stop_runs(frames, lo, hi)
+  s_of_frame = [0.0] * len(frames)
+  k = 0
+  for i in range(lo, hi + 1):
+    while k + 1 < len(path) and path[k + 1][4] <= i:
+      k += 1
+    s_of_frame[i] = path[k][0]
+  # The world runs on the recorded clock: the lead car is where the recording saw it at the same time (as a position
+  # along the route), and at each place the driver stopped the car waits until the driver pulled away (a light
+  # turning green), with at least a 1 s full stop.
+  import bisect
+  t0_rec = frames[path[0][4]]["t"]
+  times = [frames[i]["t"] for i in range(lo, hi + 1)]
+  stop_at = [(s_of_frame[a], frames[b]["t"]) for a, b in runs if b - a >= 10]   # (where, recorded departure time)
+  end_s = path[-1][0]
+
+  cols = {key: [] for key in ("t", "lat", "lon", "mph", "rec_mph", "state", "sign", "dist", "target_mph", "confirmed",
+                              "too_late", "filt", "turn", "logged_desire", "wheel", "pressed", "blinker", "lat_active", "curv",
+                              "why")}
+  s, v, a_prev, t = 0.0, frames[path[0][4]]["cs"][0], 0.0, 0.0
+  j, pk, si, hold = path[0][4], 0, 0, 0
+  why_t: dict[str, float] = {}
+  step, max_steps = 0, int((hi - lo + 1) * 4)
+  while s < end_s - 1.0 and step < max_steps:
+    step += 1
+    while j + 1 <= hi and s_of_frame[j + 1] <= s:
+      j += 1
+    fr = frames[j]
+    while pk + 1 < len(path) and path[pk + 1][0] <= s:
+      pk += 1
+    a_pt, b_pt = path[pk], path[min(pk + 1, len(path) - 1)]
+    f = 0.0 if b_pt[0] == a_pt[0] else (s - a_pt[0]) / (b_pt[0] - a_pt[0])
+    lat, lon = a_pt[1] + f * (b_pt[1] - a_pt[1]), a_pt[2] + f * (b_pt[2] - a_pt[2])
+
+    # set speed: the posted limit plus the driver's offset; with no limit, what the driver drove here
+    limit = fr.get("limit", 0.0)
+    if limit > 0.0:
+      off = st["fast_offset_mph"] if limit * MPH >= st["fast_zone_mph"] - 2 else st["town_offset_mph"]
+      target, why = limit + off / MPH, "limit"
+    else:
+      target, why = max(fr["cs"][0], 5.0), "your speed (no limit)"
+    # curves ahead, braking at the driver's rate
+    q = pk
+    while q < len(path) and path[q][0] - s < CURVE_LOOK_M:
+      if curv[q] > 1e-4:
+        vc = math.sqrt(st["lat_accel"] / curv[q])
+        vc = math.sqrt(vc * vc + 2 * st["decel"] * max(path[q][0] - s, 0.0))
+        if vc < target:
+          target, why = vc, "curve"
+      q += 1
+    # the next place the driver stopped
+    while si < len(stop_at) and stop_at[si][0] < s - 3.0 and hold == 0:
+      si += 1
+    if si < len(stop_at):
+      d = stop_at[si][0] - s
+      vs = math.sqrt(2 * st["decel"] * max(d, 0.0))
+      if vs < target:
+        target, why = vs, "stop"
+      if d < 1.5 and v < 0.5 and hold == 0:
+        hold = max(int(1.0 / DT_MDL), int((stop_at[si][1] - (t0_rec + t)) / DT_MDL))
+    if hold > 0:
+      hold -= 1
+      target, why = 0.0, "stopped"
+      if hold == 0:
+        si += 1
+    # the lead car, on the recorded clock
+    ri = lo + min(max(bisect.bisect_left(times, t0_rec + t), 0), len(times) - 1)
+    present, d_rel, v_lead = (frames[ri]["lead"] + (0.0,))[:3]
+    gap = s_of_frame[ri] + d_rel - s if present else 999.0
+    if present and 0.0 < gap < 120:
+      want = st["standstill_gap_m"] + st["gap_s"] * v
+      vl = max(0.0, v_lead + 0.3 * (gap - want))
+      if vl < target:
+        target, why = vl, "lead"
+
+    a_want = max(-st["decel_max"], min(st["accel_max"], (target - v) / 1.0))
+    a_cmd = a_prev + (a_want - a_prev) * min(1.0, DT_MDL / 0.3)    # the planner's smoothing
+    v = max(0.0, v + a_cmd * DT_MDL)
+    if target == 0.0 and v < 0.3:
+      v = 0.0
+    a_prev = a_cmd
+    s += v * DT_MDL
+    t += DT_MDL
+    why_t[why] = why_t.get(why, 0.0) + DT_MDL
+
+    row = {"t": round(t, 2), "lat": round(lat, 6), "lon": round(lon, 6), "mph": round(v * MPH, 1),
+           "rec_mph": round(fr["cs"][0] * MPH, 1), "state": "idle", "sign": None, "dist": None,
+           "target_mph": round(min(target, 45.0) * MPH, 1), "confirmed": False, "too_late": False, "filt": 0.0, "turn": "",
+           "logged_desire": fr["desire"], "wheel": round(fr["cs"][2], 1), "pressed": bool(fr["cs"][3]),
+           "blinker": "", "lat_active": bool(fr["lat_active"]), "curv": round(fr["curv"], 4), "why": why}
+    for key, val in row.items():
+      cols[key].append(val)
+
+  diff = [m - r for m, r in zip(cols["mph"], cols["rec_mph"], strict=True)]
+  moving = [d for d, m, r in zip(diff, cols["mph"], cols["rec_mph"], strict=True) if max(m, r) > 3]
+  return {"route": data["route"], "segs": data["segs"], "frames": len(cols["t"]), "mode": "style", "cols": cols,
+          "events": [], "signs": [], "completed": s >= end_s - 1.0, "path_m": round(end_s, 1),
+          "recorded_s": round(frames[hi]["t"] - frames[lo]["t"], 1), "simulated_s": round(t, 1),
+          "style": st, "why_s": {k: round(v_, 1) for k, v_ in sorted(why_t.items(), key=lambda x: -x[1])},
+          "faster_5_pct": round(100 * sum(d > 5 for d in moving) / max(len(moving), 1)),
+          "slower_5_pct": round(100 * sum(d < -5 for d in moving) / max(len(moving), 1)),
+          "mean_abs_mph": round(sum(abs(d) for d in moving) / max(len(moving), 1), 1)}
