@@ -46,3 +46,9 @@ class TestProfileLong(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestTurnExit(unittest.TestCase):
+  def test_turn_exit_cap(self):
+    self.assertEqual(pl.turn_exit_cap(1.0, 0.7), 0.7)
+    self.assertEqual(pl.turn_exit_cap(0.0, 0.7), float("inf"))

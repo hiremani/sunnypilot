@@ -198,6 +198,21 @@ def rolling_slowdowns(S: list[Sample]) -> list[dict]:
   return out
 
 
+TURN_EXIT_S = 3.0       # s after a turn over which the pull-away out of it is measured
+
+
+def exit_accel(S: list[Sample], j: int) -> float | None:
+  """m/s^2 the driver pulled away with over TURN_EXIT_S after the turn ending at S[j]: only when they were on the
+  accelerator, never braked, had no lead within 30 m, and the car's ACC was off (else it is the car's choice)."""
+  end = S[j].t + TURN_EXIT_S
+  win = [s for s in S[j:j + 400] if s.t <= end]
+  if not win or win[-1].t < end - 0.3:
+    return None
+  if any(s.brake or s.cruise or 0 < s.lead_d < 30 for s in win) or not any(s.gas for s in win):
+    return None
+  return (win[-1].v - win[0].v) / (win[-1].t - win[0].t)
+
+
 def turns(S: list[Sample]) -> list[dict]:
   out = []
   i = 0
@@ -223,6 +238,7 @@ def turns(S: list[Sample]) -> list[dict]:
       lead_m = sum(x.v * (y.t - x.t) for x, y in zip(S, S[1:], strict=False) if onset and onset.t <= x.t < S[i].t) if onset else None
       kind = "junction" if max(s.v for s in seg) < TURN_MAX_V and deg <= 135 else ("u/loop" if deg > 135 else "curve/ramp")
       out.append({"t": round(S[i].t), "where": where(S[i]), "side": side, "deg": deg, "kind": kind,
+                  "exit_accel": exit_accel(S, j),
                   "entry_mph": S[i].v * MPH, "min_mph": min(s.v for s in seg) * MPH,
                   "peak_lat_accel": max(abs(s.v * s.yaw) for s in seg),
                   "blinker_lead_s": lead_s, "blinker_lead_m": lead_m,

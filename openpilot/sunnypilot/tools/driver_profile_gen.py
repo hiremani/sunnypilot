@@ -185,6 +185,9 @@ def measure(routes: list[str], root: str, narrow: bool = True) -> tuple[dp.Drive
   tmin = [t["min_mph"] for t in turns]
   put("junction_turn_mph", statistics.median(tmin) if tmin else None, len(tmin), MIN_SAMPLES["turns"],
       "median slowest speed through junction turns the driver steered")
+  exits = [t["exit_accel"] for t in turns if t.get("exit_accel") is not None and t["exit_accel"] > 0.0]
+  put("turn_exit_accel", statistics.median(exits) if exits else None, len(exits), MIN_SAMPLES["turns"],
+      "median pull-away over the 3 s after a junction turn the driver steered, on the accelerator, ACC off, no lead")
   put("follow_gap_s", statistics.median(gaps) if gaps else None, len(gaps), MIN_SAMPLES["gap"],
       "median time gap behind a steady lead, ACC off")
   put("lead_coast_s", statistics.median(lead_coasts) if lead_coasts else None, len(lead_coasts), MIN_SAMPLES["coast"],

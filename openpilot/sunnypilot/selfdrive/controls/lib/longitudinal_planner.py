@@ -58,6 +58,7 @@ class LongitudinalPlannerSP:
     self.profile = driver_profile.DriverProfile()
     self.profile_on = False
     self.profile_speed_on = False
+    self.turn_exit_left = 0.0     # s left of the pull-away window after a junction turn
     self.narrow_speed = narrow_street.NARROW_SPEED
     self.lead_coasting = False
     self.source = LongitudinalPlanSource.cruise
@@ -139,7 +140,9 @@ class LongitudinalPlannerSP:
 
     # driver profile: the junction-turn speed during a signaled sharp slow turn, and the cruising speed cap
     if self.profile_on and self.openpilot_long:
-      if profile_long.junction_turn(CS.leftBlinker, CS.rightBlinker, v_ego, sm['controlsState'].curvature):
+      in_turn = profile_long.junction_turn(CS.leftBlinker, CS.rightBlinker, v_ego, sm['controlsState'].curvature)
+      self.turn_exit_left = profile_long.TURN_EXIT_S if in_turn else max(0.0, self.turn_exit_left - DT_MDL)
+      if in_turn:
         v_turn = self.profile.junction_turn_mph * CV.MPH_TO_MS
         targets[LongitudinalPlanSource.junctionTurn] = (v_turn, profile_long.JUNCTION_ACCEL if v_ego > v_turn else a_ego)
       limit = self.resolver.speed_limit
@@ -159,12 +162,15 @@ class LongitudinalPlannerSP:
     return profile_long.follow_t(self.profile.follow_gap_s, v_ego)
 
   def lead_coast_cap(self, sm: messaging.SubMaster, v_ego: float) -> float:
-    """The most acceleration the driver profile allows toward the lead (ACCEL_MAX when it doesn't limit)."""
+    """The most acceleration the driver profile allows: none toward a slower lead inside the coasting gap, and the
+    driver's own pull-away just after a junction turn (inf when it doesn't limit)."""
     self.lead_coasting = False
-    if self.profile_on and self.openpilot_long:
-      lead = sm['radarState'].leadOne
-      self.lead_coasting = profile_long.lead_coast(self.profile.lead_coast_s, v_ego, lead.present, lead.dRel, lead.vRel)
-    return profile_long.LEAD_COAST_ACCEL if self.lead_coasting else float('inf')
+    if not (self.profile_on and self.openpilot_long):
+      return float('inf')
+    lead = sm['radarState'].leadOne
+    self.lead_coasting = profile_long.lead_coast(self.profile.lead_coast_s, v_ego, lead.present, lead.dRel, lead.vRel)
+    cap = profile_long.LEAD_COAST_ACCEL if self.lead_coasting else float('inf')
+    return min(cap, profile_long.turn_exit_cap(self.turn_exit_left, self.profile.turn_exit_accel))
 
   def update(self, sm: messaging.SubMaster) -> None:
     self.events_sp.clear()

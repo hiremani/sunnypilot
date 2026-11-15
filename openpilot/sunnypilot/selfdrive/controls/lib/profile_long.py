@@ -16,6 +16,7 @@ How the longitudinal planner drives by the driver profile (driver_profile.py), a
                             closing at 5 mph, and +0.58 toward one 8 m ahead at 7 mph; both times the driver braked.
   junction_turn(...)        a signaled, sharp, slow turn is under way: cap the speed at the driver's junction speed.
   profile_speed(...)        the cruising speed cap: the posted limit + the driver's own offset for that limit.
+  turn_exit_cap(...)        for TURN_EXIT_S after a junction turn, pull away no harder than the driver does out of one.
 """
 from openpilot.common.constants import CV
 
@@ -33,6 +34,8 @@ JUNCTION_ACCEL = -0.8       # m/s^2 to get down to the junction speed
 
 PROFILE_SPEED_ACCEL = -0.5  # m/s^2 to get down to a lower cap (a new, lower limit)
 
+TURN_EXIT_S = 3.0           # s after a junction turn (fisker_drive_style.TURN_EXIT_S, what the profile measures over)
+
 
 def follow_t(gap_s: float, v_ego: float) -> float:
   return max(T_FOLLOW_MIN, gap_s - STOP_DISTANCE / max(v_ego, V_FOLLOW_MIN))
@@ -48,6 +51,11 @@ def lead_coast(lead_coast_s: float, v_ego: float, lead_present: bool, d_rel: flo
 
 def junction_turn(left_blinker: bool, right_blinker: bool, v_ego: float, curvature: float) -> bool:
   return (left_blinker or right_blinker) and v_ego < JUNCTION_V_MAX and abs(curvature) > JUNCTION_CURVATURE
+
+
+def turn_exit_cap(exit_left_s: float, turn_exit_accel: float) -> float:
+  """The most acceleration allowed (m/s^2) with exit_left_s of the turn exit window left; inf when not limiting."""
+  return turn_exit_accel if exit_left_s > 0.0 else float("inf")
 
 
 def profile_speed(limit_ms: float, offset_mph: float) -> float | None:
