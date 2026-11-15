@@ -633,11 +633,23 @@ class TurnPlanner:
     if not lat_active:
       self._end("lateral inactive")
       return None
+    if side != self.side:
+      # The blinker cancels itself once the wheel comes back from the turn: the turn is over, whoever made it.
+      # Route 000000f6 (2026-11-14, left onto Doane St): it cancelled 3.3 s before the planner thought the turn was
+      # done, and the planner went on commanding a left turn onto the straight road.
+      self._end("blinker off")
+      return None
     if v > V_ABORT:
       self._end("too fast")
       return None
     # progress in the turn's direction only (yawRate positive = left, so a right turn has yawRate < 0)
     self.progress += max(0.0, -sign * math.degrees(yaw_rate)) * dt
+    # The turn counts from the road the car arrived on, not from when the planner took over: a driver who starts
+    # the turn by hand turns the car some way before the planner does. Route 000000f6 (2026-11-14): the driver had
+    # turned 19 deg when the planner started, so it counted 19 deg short all through the turn and was still
+    # commanding a hard left (wheel 127 deg, 16 mph) on the straight road after the turn.
+    if self.heading is not None and self.junction is not None:
+      self.progress = max(self.progress, sign * _wrap(self.heading - self.junction.arrival_bearing))
     self.t_turn += dt
     remaining = abs(self.planned) - self.progress
     k_meas = -yaw_rate / max(v, 0.5)   # the car's own curvature now (positive = right)

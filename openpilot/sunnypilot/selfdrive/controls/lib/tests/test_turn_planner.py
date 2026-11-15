@@ -267,3 +267,34 @@ class TestDriverMadeTurn(unittest.TestCase):
     car.drive(1.0, left=True)
     car.drive(1.0)                   # blinker off: the driver's turn is over
     self.assertEqual(car.p.state, tp.IDLE)
+
+
+class TestTurnEnds(unittest.TestCase):
+  def test_blinker_off_mid_turn_ends_it(self):
+    """Route 000000f6 (2026-11-14, left onto Doane St): the blinker cancelled while the planner was still turning, and
+    it went on commanding a hard left onto the straight road."""
+    car = Car(planner(t_junction(right=False, left=True)))
+    while car.p.state != tp.TURNING:
+      car.step(left=True)
+    car.drive(0.5, left=True)
+    out = car.step()
+    self.assertIsNone(out)
+    self.assertEqual(car.p.log.reason, "blinker off")
+    car.drive(5.0)
+    self.assertTrue(all(o is None for o in car.outputs[-100:]))
+
+  def test_turn_counts_from_the_arrival_road(self):
+    """The driver turned the car 30 deg by hand before the planner took over: the planner turns the rest, not the
+    whole 90 deg again (route 000000f6: 19 deg short all through the turn)."""
+    car = Car(planner(t_junction(right=False, left=True)))
+    while car.y < -16.0:
+      car.step(left=True)
+    self.assertEqual(car.p.state, tp.ARMED)
+    while car.p.state == tp.ARMED:    # the driver starts the turn by hand, ahead of the planner
+      car.k = -1.0 / 9.0
+      car.step(left=True)
+    self.assertEqual(car.p.state, tp.TURNING)
+    self.assertLess(car.h, -10.0)
+    car.drive(30.0, left=True)
+    self.assertEqual(car.p.log.reason, "done")
+    self.assertAlmostEqual(car.h, -90.0, delta=10.0)
