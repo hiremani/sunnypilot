@@ -274,14 +274,40 @@ class TestTurnEnds(unittest.TestCase):
     """Route 000000f6 (2026-11-14, left onto Doane St): the blinker cancelled while the planner was still turning, and
     it went on commanding a hard left onto the straight road."""
     car = Car(planner(t_junction(right=False, left=True)))
-    while car.p.state != tp.TURNING:
+    while car.p.state != tp.TURNING or car.p.progress < 0.6 * abs(car.p.planned):
       car.step(left=True)
-    car.drive(0.5, left=True)
-    out = car.step()
-    self.assertIsNone(out)
+    car.drive(0.4)                                  # a flash gap: still turning
+    self.assertEqual(car.p.state, tp.TURNING)
+    car.step(left=True)
+    for _ in range(int((tp.BLINKER_OFF_S + 0.1) / DT)):   # stays off, the driver holding the car straight (Doane St)
+      car.k = 0.0
+      car.queue = [0.0] * len(car.queue)
+      car.step()
     self.assertEqual(car.p.log.reason, "blinker off")
     car.drive(5.0)
     self.assertTrue(all(o is None for o in car.outputs[-100:]))
+
+  def test_flashing_blinker_or_early_cancel_keeps_turning(self):
+    car = Car(planner(t_junction(right=False, left=True)))
+    while car.p.state != tp.TURNING:
+      car.step(left=True)
+    for _ in range(6):                              # a blinker logged flashing (older carState): 0.35 s on, 0.35 off
+      car.drive(0.35, left=True)
+      car.drive(0.35)
+    self.assertIn(car.p.state, (tp.TURNING, tp.DONE))
+    self.assertNotEqual(car.p.log.reason, "blinker off")
+    car = Car(planner(t_junction(right=False, left=True)))
+    while car.p.state != tp.TURNING:
+      car.step(left=True)
+    car.drive(2.0)                                  # off right at the start of the turn: keep going
+    self.assertNotEqual(car.p.log.reason, "blinker off")
+
+  def test_other_blinker_releases_at_once(self):
+    car = Car(planner(t_junction(right=False, left=True)))
+    while car.p.state != tp.TURNING:
+      car.step(left=True)
+    car.step(right=True)
+    self.assertEqual(car.p.log.reason, "other blinker")
 
   def test_turn_counts_from_the_arrival_road(self):
     """The driver turned the car 30 deg by hand before the planner took over: the planner turns the rest, not the

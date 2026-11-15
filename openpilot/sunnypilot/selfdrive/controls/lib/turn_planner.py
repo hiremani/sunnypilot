@@ -67,6 +67,8 @@ STALL_S = 2.0                   # turning, but the heading hasn't progressed STA
 STALL_DEG = 3.0
 STALL_MIN_V = 0.5               # m/s: below this the car is waiting (pedestrian, cross traffic), not stalling
 OVERRIDE_S = 0.3                # driver torque against the turn for this long: release
+BLINKER_OFF_S = 1.0             # turning, the blinker off this long (longer than a flash gap) once the turn is...
+BLINKER_OFF_DONE = 0.5          # ...this fraction done: the blinker cancelled itself, the turn is over
 TURN_TIMEOUT_S = 20.0           # a turn that takes longer than this is released whatever else happens
 DRIVER_TURNED_DEG = TURN_MIN_DEG  # the car has turned this much toward the blinker side since that blinker came on,
                                   # not steered by the planner: the driver made the turn; no planner turn on that
@@ -483,6 +485,7 @@ class TurnPlanner:
     self.override_t = 0.0
     self.no_match_t = 0.0
     self.waited_stopped = False   # armed and stopped (at the stop line) at some point
+    self.blinker_off_t = 0.0      # s the blinker has been off while turning
 
   def _end(self, reason: str) -> None:
     if self.state in (ARMED, TURNING):
@@ -649,11 +652,14 @@ class TurnPlanner:
     if not lat_active:
       self._end("lateral inactive")
       return None
-    if side != self.side:
-      # The blinker cancels itself once the wheel comes back from the turn: the turn is over, whoever made it.
-      # Route 000000f6 (2026-11-14, left onto Doane St): it cancelled 3.3 s before the planner thought the turn was
-      # done, and the planner went on commanding a left turn onto the straight road.
-      self._end("blinker off")
+    # The blinker cancels itself once the wheel comes back from the turn: the turn is over, whoever made it. Route
+    # 000000f6 (2026-11-14, left onto Doane St): it cancelled with the turn 56% done, 3.3 s before the planner thought
+    # the turn was done, and the planner went on commanding a left turn onto the straight road. Only a blinker that
+    # stays off (older logs show it flashing off for 0.3-0.4 s) once the turn is well under way: early in the turn a
+    # blinker going off is not the turn being over. The other blinker is a change of mind: release at once.
+    self.blinker_off_t = self.blinker_off_t + dt if side != self.side else 0.0
+    if side and side != self.side:
+      self._end("other blinker")
       return None
     if v > V_ABORT:
       self._end("too fast")
@@ -668,6 +674,9 @@ class TurnPlanner:
       self.progress = max(self.progress, sign * _wrap(self.heading - self.junction.arrival_bearing))
     self.t_turn += dt
     remaining = abs(self.planned) - self.progress
+    if self.blinker_off_t >= BLINKER_OFF_S and self.progress >= BLINKER_OFF_DONE * abs(self.planned):
+      self._end("blinker off")
+      return None
     k_meas = -yaw_rate / max(v, 0.5)   # the car's own curvature now (positive = right)
     if remaining <= self.tuning.release_deg + unwind_heading_deg(v, max(0.0, sign * k_meas)):
       self._end("done")
