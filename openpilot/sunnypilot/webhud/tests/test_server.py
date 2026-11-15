@@ -184,6 +184,8 @@ class TestServer(OpenpilotTestCase):
       status, body, _ = self.request("PUT", "/api/profiles", {"active": "relaxed", "enabled": True})
       assert status == 200 and json.loads(body)["active"] == "relaxed" and json.loads(body)["enabled"] is True
       assert dp.active(self.params).stop_decel == 0.8
+      status, body, _ = self.request("PUT", "/api/profiles", {"speed": True})
+      assert status == 200 and json.loads(body)["speed"] is True and dp.is_on(self.params, param=dp.SPEED_PARAM)
       for bad in ({"active": "nobody"}, {"active": "../etc/passwd"}, {"active": 3}):
         assert self.request("PUT", "/api/profiles", bad)[0] == 400
       self.server.engine.monitor.moving = True

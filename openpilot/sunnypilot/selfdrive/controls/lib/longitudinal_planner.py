@@ -20,7 +20,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_crui
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import StopSignAssist
-from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile, narrow_street
+from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile, narrow_street, profile_long
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 
@@ -56,7 +56,10 @@ class LongitudinalPlannerSP:
     # The active driver profile (driver_profile.py; defaults unless DriverProfile is set), re-read every PROFILE_EVERY
     # frames so a switch in the web HUD applies within seconds.
     self.profile = driver_profile.DriverProfile()
+    self.profile_on = False
+    self.profile_speed_on = False
     self.narrow_speed = narrow_street.NARROW_SPEED
+    self.lead_coasting = False
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
 
@@ -108,10 +111,13 @@ class LongitudinalPlannerSP:
         self.narrow_enabled = False
     if self._narrow_param_frame % 100 == 0:
       self.profile = driver_profile.active()
+      self.profile_on = driver_profile.is_on()
+      self.profile_speed_on = self.profile_on and driver_profile.is_on(param=driver_profile.SPEED_PARAM)
       self.narrow_speed = self.profile.narrow_speed_mph * CV.MPH_TO_MS
       for ss in (self.stop_sign, self.stop_sign_shadow):
         if ss is not None:
           ss.set_profile(self.profile.stop_decel, self.profile.coast_s)
+      self.scc.vision.set_lat_accel_max(self.profile.curve_lat_accel)
     self._narrow_param_frame += 1
     try:
       self.narrow_street = self.narrow.update(sm['modelV2'], v_ego)
@@ -131,9 +137,34 @@ class LongitudinalPlannerSP:
       a_narrow = narrow_street.NARROW_ACCEL if v_ego > self.narrow_speed else a_ego
       targets[LongitudinalPlanSource.narrowStreet] = (self.narrow_speed, a_narrow)
 
+    # driver profile: the junction-turn speed during a signaled sharp slow turn, and the cruising speed cap
+    if self.profile_on and self.openpilot_long:
+      if profile_long.junction_turn(CS.leftBlinker, CS.rightBlinker, v_ego, sm['controlsState'].curvature):
+        v_turn = self.profile.junction_turn_mph * CV.MPH_TO_MS
+        targets[LongitudinalPlanSource.junctionTurn] = (v_turn, profile_long.JUNCTION_ACCEL if v_ego > v_turn else a_ego)
+      limit = self.resolver.speed_limit
+      if self.profile_speed_on and self.resolver.speed_limit_valid:
+        v_cap = profile_long.profile_speed(limit, self.profile.speed_offset_mph(limit * CV.MS_TO_MPH))
+        if v_cap is not None:
+          targets[LongitudinalPlanSource.driverSpeed] = (v_cap, profile_long.PROFILE_SPEED_ACCEL if v_ego > v_cap + 0.5 else a_ego)
+
     self.source = min(targets, key=lambda k: targets[k][0])
     self.output_v_target, self.output_a_target = targets[self.source]
     return self.output_v_target, self.output_a_target
+
+  def t_follow(self, v_ego: float) -> float | None:
+    """The MPC's following gap from the driver profile, or None for the personality's."""
+    if not (self.profile_on and self.openpilot_long):
+      return None
+    return profile_long.follow_t(self.profile.follow_gap_s, v_ego)
+
+  def lead_coast_cap(self, sm: messaging.SubMaster, v_ego: float) -> float:
+    """The most acceleration the driver profile allows toward the lead (ACCEL_MAX when it doesn't limit)."""
+    self.lead_coasting = False
+    if self.profile_on and self.openpilot_long:
+      lead = sm['radarState'].leadOne
+      self.lead_coasting = profile_long.lead_coast(self.profile.lead_coast_s, v_ego, lead.present, lead.dRel, lead.vRel)
+    return profile_long.LEAD_COAST_ACCEL if self.lead_coasting else float('inf')
 
   def update(self, sm: messaging.SubMaster) -> None:
     self.events_sp.clear()
@@ -151,6 +182,7 @@ class LongitudinalPlannerSP:
     longitudinalPlanSP.aTarget = float(self.output_a_target)
     longitudinalPlanSP.events = self.events_sp.to_msg()
     longitudinalPlanSP.narrowStreet = bool(self.narrow_street)
+    longitudinalPlanSP.leadCoast = bool(self.lead_coasting)
 
     # Dynamic Experimental Control
     dec = longitudinalPlanSP.dec

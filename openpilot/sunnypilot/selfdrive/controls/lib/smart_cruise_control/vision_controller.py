@@ -53,6 +53,7 @@ class SmartCruiseControlVision:
   output_a_target: float = 0.
 
   def __init__(self):
+    self.a_lat_max = _A_LAT_REG_MAX
     self.params = Params()
     self.frame = -1
     self.long_enabled = False
@@ -65,6 +66,10 @@ class SmartCruiseControlVision:
     self.state = VisionState.disabled
     self.current_lat_acc = 0.
     self.max_pred_lat_acc = 0.
+
+  def set_lat_accel_max(self, a_lat: float) -> None:
+    """The curve speed's lateral acceleration (m/s^2): the driver profile's curve_lat_accel (clamped there)."""
+    self.a_lat_max = float(a_lat)
 
   def get_a_target_from_control(self) -> float:
     return self.a_target
@@ -97,7 +102,7 @@ class SmartCruiseControlVision:
       max_curve = self.max_pred_lat_acc / (v_ego**2)
 
       # Get the target velocity for the maximum curve
-      self.v_target = (_A_LAT_REG_MAX / max_curve) ** 0.5
+      self.v_target = (self.a_lat_max / max_curve) ** 0.5
 
   def _update_state_machine(self) -> tuple[bool, bool]:
     # ENABLED, ENTERING, TURNING, LEAVING, OVERRIDING

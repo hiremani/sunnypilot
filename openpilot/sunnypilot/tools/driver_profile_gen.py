@@ -17,8 +17,13 @@ Only what the driver chose counts: speed habits only with the car's own ACC off 
 on open road (no lead within 3 s, not braking for a stop, not in a curve); curve habits only while the driver steered
 (not openpilot); stops only those the driver braked for with ACC off. Each value is written clamped to the profile's
 bounds; the raw measurement and its sample count go in "meta" next to it. Too few samples: the value keeps its default.
+
+Also measured: the offset for each posted limit with enough open road (limit_offsets_mph), the time gap at which the
+driver lifts off the accelerator closing on a slower lead (lead_coast_s), and the speed on narrow streets as the
+narrow-street detector sees them (narrow_speed_mph; needs rlogs, which carry the model's road edges).
 """
 import argparse
+import math
 import datetime
 import glob
 import json
@@ -27,11 +32,14 @@ import statistics
 import sys
 from collections import defaultdict
 
+from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
+from openpilot.sunnypilot.selfdrive.controls.lib import narrow_street as ns
 from openpilot.sunnypilot.tools import fisker_drive_style as fds
 
 MPH = fds.MPH
-MIN_SAMPLES = {"speed": 300, "stops": 5, "curve": 100, "turns": 5, "gap": 200}   # 10 Hz samples, or events
+MIN_SAMPLES = {"speed": 300, "stops": 5, "curve": 100, "turns": 5, "gap": 200, "limit": 1200, "coast": 8,
+               "narrow": 200}   # 10 Hz samples (narrow: 20 Hz), or events
 OPEN_ROAD_GAP_S = 3.0
 LAT_CURVE_YAW = 0.05      # rad/s: in a curve
 MIN_ROUTE_MOVING_MIN = 3.0
@@ -51,6 +59,46 @@ def speed_offsets(S: list, fast_zone_mph: float) -> dict[int, list[float]]:
       continue
     by[round(s.limit * MPH / 5) * 5].append((s.v - s.limit) * MPH)
   return by
+
+
+LEAD_COAST_CLOSING = 0.5   # m/s slower than us
+LEAD_COAST_MAX_GAP_S = 6.0  # releases with the lead further than this are about something else
+
+
+def lead_coast_gaps(S: list) -> list[float]:
+  """Time gaps (s) to a slower lead at which the driver, ACC off, took the foot off the accelerator."""
+  out = []
+  for p, s in zip(S, S[1:], strict=False):
+    if not (p.gas and not s.gas) or s.cruise or s.v < 3.0:
+      continue
+    if 0 < s.lead_d < 120 and s.lead_v < s.v - LEAD_COAST_CLOSING and s.lead_d / s.v < LEAD_COAST_MAX_GAP_S:
+      out.append(s.lead_d / s.v)
+  return out
+
+
+def narrow_speeds(root: str, route: str) -> list[float]:
+  """Speeds (m/s, 20 Hz) while the narrow-street detector flags the street and the driver chose the speed (ACC off).
+  Needs rlogs (modelV2); routes without them give nothing."""
+  from openpilot.tools.lib.logreader import LogReader
+  out: list[float] = []
+  segs = sorted(glob.glob(os.path.join(root, f"{route}--*")), key=lambda p: int(p.rsplit("--", 1)[1]))
+  det = ns.NarrowStreetDetector(DT_MDL)
+  v, cruise = 0.0, True
+  for seg in segs:
+    f = os.path.join(seg, "rlog.zst")
+    if not os.path.exists(f):
+      continue
+    try:
+      for m in LogReader(f):
+        w = m.which()
+        if w == "carState":
+          v, cruise = m.carState.vEgo, m.carState.cruiseState.enabled
+        elif w == "modelV2":
+          if det.update(m.modelV2, v) and not cruise and v > ns.NARROW_V_MIN:
+            out.append(v)
+    except Exception:
+      continue
+  return out
 
 
 def coast_times(S: list) -> list[float]:
@@ -73,10 +121,10 @@ def coast_times(S: list) -> list[float]:
   return out
 
 
-def measure(routes: list[str], root: str) -> tuple[dp.DriverProfile, dict]:
+def measure(routes: list[str], root: str, narrow: bool = True) -> tuple[dp.DriverProfile, dict]:
   base = dp.DriverProfile()
   offsets: dict[int, list[float]] = defaultdict(list)
-  stops, coasts, lat_acc, turns, gaps = [], [], [], [], []
+  stops, coasts, lat_acc, turns, gaps, lead_coasts, narrow_v = [], [], [], [], [], [], []
   used, miles = [], 0.0
   for r in routes:
     S = fds.load(root, r)
@@ -97,6 +145,9 @@ def measure(routes: list[str], root: str) -> tuple[dp.DriverProfile, dict]:
     lat_acc += [abs(s.v * s.yaw) for s in S if not s.lat and s.v > 9 and abs(s.yaw) > LAT_CURVE_YAW]
     turns += [t for t in fds.turns(S) if t["kind"] == "junction" and t["driver_steered_pct"] > 50]
     gaps += [s.lead_d / s.v for s in S if s.v > 8 and 0 < s.lead_d < 100 and not s.cruise and abs(s.lead_v - s.v) < 3]
+    lead_coasts += lead_coast_gaps(S)
+    if narrow:
+      narrow_v += narrow_speeds(root, r)
 
   values, meta = {}, {}
 
@@ -136,10 +187,18 @@ def measure(routes: list[str], root: str) -> tuple[dp.DriverProfile, dict]:
       "median slowest speed through junction turns the driver steered")
   put("follow_gap_s", statistics.median(gaps) if gaps else None, len(gaps), MIN_SAMPLES["gap"],
       "median time gap behind a steady lead, ACC off")
-  meta["narrow_speed_mph"] = {"measured": None, "samples": 0, "used": base.narrow_speed_mph,
-                              "note": "not measured yet (needs modelV2 road edges): default"}
+  put("lead_coast_s", statistics.median(lead_coasts) if lead_coasts else None, len(lead_coasts), MIN_SAMPLES["coast"],
+      "median time gap at which the driver lifted off closing on a slower lead, ACC off")
+  put("narrow_speed_mph", statistics.median(narrow_v) * MPH if narrow_v else None, len(narrow_v), MIN_SAMPLES["narrow"],
+      "median speed on streets the narrow-street detector flagged, ACC off" + ("" if narrow else " (skipped)"))
+  limit_offsets = {str(lim): round(statistics.median(d), 1) for lim, d in sorted(offsets.items())
+                   if len(d) >= MIN_SAMPLES["limit"] and math.isfinite(statistics.median(d))}
+  values["limit_offsets_mph"] = dp.clamp_limit_offsets(limit_offsets, base.fast_zone_mph)
+  meta["limit_offsets_mph"] = {"measured": limit_offsets, "used": values["limit_offsets_mph"],
+                               "note": f"median (speed - limit) per posted limit with >= {MIN_SAMPLES['limit'] / 10:.0f} s of open road"}
 
   profile = dp.DriverProfile(**({f: getattr(base, f) for f in dp.BOUNDS} | values))
+  profile.limit_offsets_mph = values["limit_offsets_mph"]
   info = {"generated": datetime.datetime.now().isoformat(timespec="seconds"), "routes": used, "miles": round(miles, 1),
           "values": meta, "stops": len(stops), "turns": len(turns)}
   return profile, info
@@ -153,6 +212,8 @@ def report(profile: dp.DriverProfile, info: dict) -> None:
     m = info["values"].get(name, {})
     meas = "-" if m.get("measured") is None else f"{m['measured']:.2f}"
     print(f"{name:20s} {meas:>9s} {getattr(profile, name):7.2f} {getattr(base, name):8.2f} {m.get('samples', 0):8d}  {m.get('note', '')}")
+  if profile.limit_offsets_mph:
+    print("per-limit offsets used:", ", ".join(f"{k} mph {v:+.1f}" for k, v in profile.limit_offsets_mph.items()))
   if info["values"].get("speed_by_limit"):
     print("speed vs limit on open road:", ", ".join(f"{k} mph zone {v['median_mph']:+.1f} ({v['samples'] / 10:.0f} s)"
                                                     for k, v in info["values"]["speed_by_limit"].items()))
@@ -166,12 +227,13 @@ def main(argv: list[str] | None = None) -> int:
   ap.add_argument("--name", default=dp.DEFAULT_NAME, help="profile name (letters, digits, space, - _)")
   ap.add_argument("--out", default=None, help="write here instead of the named profile's file")
   ap.add_argument("--dry-run", action="store_true", help="measure and print, write nothing")
+  ap.add_argument("--no-narrow", action="store_true", help="skip the narrow-street speed (reads every rlog)")
   args = ap.parse_args(argv)
   routes = routes_in(args.root) if args.all else args.routes
   if not routes:
     print("no routes (name them, or --all)", file=sys.stderr)
     return 1
-  profile, info = measure(routes, args.root)
+  profile, info = measure(routes, args.root, narrow=not args.no_narrow)
   report(profile, info)
   if not args.dry_run:
     if not args.out and not dp.valid_name(args.name):

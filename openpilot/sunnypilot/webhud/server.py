@@ -79,6 +79,9 @@ mimetypes.add_type("text/plain", ".dbc")   # text, so the DBCs gzip on their way
 PARAM_ALLOWLIST: dict[str, tuple[type, Callable[[int], bool] | None]] = {
   "LongitudinalPersonality": (int, lambda v: v in (0, 1, 2)),
   "ExperimentalMode": (bool, None),
+  # sunnypilot: switch to the model's end-to-end speed (lights, stops) only when it predicts a stop; curve speed
+  "DynamicExperimentalControl": (bool, None),
+  "SmartCruiseControlVision": (bool, None),
   "IsMetric": (bool, None),
   "FiskerACCAutoSpeed": (bool, None),   # these two are the 0x52A spoof's baseline; ICC_0x52A overrides win
   "FiskerACCTerrain": (bool, None),
@@ -797,11 +800,13 @@ def api_params_put(h: HudHandler, q) -> None:
 def api_profiles_get(h: HudHandler, q) -> None:
   from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
   params = h.server.params
-  try:
-    enabled = bool(params.get_bool(dp.PARAM))
-  except Exception:
-    enabled = None   # the param isn't built on this device yet
-  h._json({"enabled": enabled, "active": dp.active_name(params), "profiles": dp.list_profiles(),
+  def flag(name):
+    try:
+      return bool(params.get_bool(name))
+    except Exception:
+      return None   # the param isn't built on this device yet
+  h._json({"enabled": flag(dp.PARAM), "speed": flag(dp.SPEED_PARAM), "active": dp.active_name(params),
+           "profiles": dp.list_profiles(),
            "defaults": dp.to_dict(dp.DriverProfile())["values"], "bounds": dp.BOUNDS,
            "editable": not h.server.engine.monitor.moving})
 
@@ -822,6 +827,8 @@ def api_profiles_put(h: HudHandler, q) -> None:
       h.server.params.put(dp.NAME_PARAM, body["active"])
     if "enabled" in body:
       h.server.params.put_bool(dp.PARAM, bool(body["enabled"]))
+    if "speed" in body:   # the cruising speed cap at the posted limit + the driver's offset (DriverProfileSpeed)
+      h.server.params.put_bool(dp.SPEED_PARAM, bool(body["speed"]))
   except Exception as e:
     return h._error(500, f"could not save: {e}")
   api_profiles_get(h, q)

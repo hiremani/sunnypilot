@@ -16,17 +16,21 @@ Profiles are named: <media>/driver_profiles/<name>.json (names: letters, digits,
 DriverProfileName param says which one is active; the generator writes them and the web HUD bridge lists and switches
 them (/api/profiles).
 
-Used, with the DriverProfile param, by: Stop Sign Assist (braking rate and coast time), the narrow-street speed cap,
-and drive_sim's "Your style" mode (always, to show what the profile would do).
+Used, with the DriverProfile param, by the longitudinal planner: Stop Sign Assist (braking rate and coast time), the
+narrow-street speed cap, the following gap (follow_gap_s), no accelerating toward a slower lead (lead_coast_s), the
+junction-turn speed cap and Smart Cruise Control's curve speed (curve_lat_accel); with DriverProfileSpeed as well, the
+cruising speed cap at the posted limit + the driver's offset for it (speed_offset_mph). drive_sim's "Your style" mode
+reads it always, to show what the profile would do.
 """
 import json
 import math
 import os
 import re
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 
 PARAM = "DriverProfile"
 NAME_PARAM = "DriverProfileName"
+SPEED_PARAM = "DriverProfileSpeed"
 DEFAULT_NAME = "me"
 VERSION = 1
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,31}$")
@@ -94,6 +98,17 @@ class DriverProfile:
   follow_gap_s: float = 1.45     # openpilot's "standard"
   # narrow streets
   narrow_speed_mph: float = 18.0
+  # slower lead ahead: no accelerating toward it inside this time gap (s); 0 = off
+  lead_coast_s: float = 0.0
+  # per posted limit (mph, multiple of 5, as a string key): the driver's own offset (mph); where a limit has no entry,
+  # town_offset_mph / fast_offset_mph. Clamped like those.
+  limit_offsets_mph: dict = field(default_factory=dict)
+
+  def speed_offset_mph(self, limit_mph: float) -> float:
+    key = str(int(round(limit_mph / 5.0) * 5))
+    if key in self.limit_offsets_mph:
+      return self.limit_offsets_mph[key]
+    return self.town_offset_mph if limit_mph < self.fast_zone_mph else self.fast_offset_mph
 
 
 # (min, max) a profile may set; outside, the value is clamped
@@ -108,6 +123,7 @@ BOUNDS = {
   "junction_turn_mph": (5.0, 16.0),    # the turn planner arms at 16 mph at most
   "follow_gap_s": (1.25, 2.5),
   "narrow_speed_mph": (10.0, 25.0),
+  "lead_coast_s": (0.0, 5.0),
 }
 
 
@@ -123,11 +139,36 @@ def clamp(name: str, value) -> float:
   return min(max(v, lo), hi)
 
 
+def clamp_limit_offsets(offsets, fast_zone_mph: float) -> dict:
+  """{"25": -5.3, ...} with bad keys / values dropped, each offset clamped to the town or fast-road bounds."""
+  out = {}
+  if not isinstance(offsets, dict):
+    return out
+  for k, v in offsets.items():
+    try:
+      lim = int(k)
+    except (TypeError, ValueError):
+      continue
+    if lim <= 0 or lim % 5 or lim > 90:
+      continue
+    name = "town_offset_mph" if lim < fast_zone_mph else "fast_offset_mph"
+    try:
+      fv = float(v)
+    except (TypeError, ValueError):
+      continue
+    if math.isfinite(fv):
+      out[str(lim)] = clamp(name, fv)
+  return out
+
+
 def from_dict(d: dict) -> DriverProfile:
   values = d.get("values", {}) if isinstance(d, dict) else {}
   if not isinstance(values, dict):
     values = {}
-  return DriverProfile(**{f.name: clamp(f.name, values[f.name]) for f in fields(DriverProfile) if f.name in values})
+  p = DriverProfile(**{f.name: clamp(f.name, values[f.name]) for f in fields(DriverProfile)
+                       if f.name in values and f.name in BOUNDS})
+  p.limit_offsets_mph = clamp_limit_offsets(values.get("limit_offsets_mph"), p.fast_zone_mph)
+  return p
 
 
 def load(name: str = DEFAULT_NAME) -> DriverProfile:
@@ -159,6 +200,17 @@ def active(params=None) -> DriverProfile:
     return load(active_name(params)) if params.get_bool(PARAM) else DriverProfile()
   except Exception:
     return DriverProfile()
+
+
+def is_on(params=None, param: str = PARAM) -> bool:
+  """Whether the DriverProfile (or another) param is set. Never raises: False."""
+  try:
+    if params is None:
+      from openpilot.common.params import Params
+      params = Params()
+    return bool(params.get_bool(param))
+  except Exception:
+    return False
 
 
 def to_dict(p: DriverProfile, meta: dict | None = None) -> dict:

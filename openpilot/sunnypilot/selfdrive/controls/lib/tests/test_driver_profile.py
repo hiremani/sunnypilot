@@ -61,6 +61,30 @@ class TestDriverProfile(unittest.TestCase):
     assert dp.active(FakeParams(DriverProfile=True, DriverProfileName="relaxed")).stop_decel == 0.8
     assert dp.active(FakeParams(DriverProfile=True, DriverProfileName="../x")).stop_decel == 0.95          # -> "me"
 
+  def test_limit_offsets(self):
+    self.write("me", {"town_offset_mph": -4.7, "fast_offset_mph": 4.5,
+                      "limit_offsets_mph": {"25": -5.3, "40": 6.1, "65": 9.0, "33": 1.0, "x": 2.0, "45": "nan"}})
+    p = dp.load("me")
+    # 40 zone: town bounds cap it at 0 (never over the limit in town); 65: fast bounds cap at +5; bad keys dropped
+    assert p.limit_offsets_mph == {"25": -5.3, "40": 0.0, "65": 5.0}
+    assert p.speed_offset_mph(25.0) == -5.3 and p.speed_offset_mph(26.2) == -5.3
+    assert p.speed_offset_mph(35.0) == -4.7 and p.speed_offset_mph(55.0) == 4.5   # no entry: town / fast
+    self.write("odd", {"limit_offsets_mph": [1, 2]})
+    assert dp.load("odd").limit_offsets_mph == {}
+
+  def test_lead_coast_bounds(self):
+    self.write("me", {"lead_coast_s": 9.0})
+    assert dp.load("me").lead_coast_s == 5.0
+    assert dp.DriverProfile().lead_coast_s == 0.0   # off without a profile
+
+  def test_is_on(self):
+    assert dp.is_on(FakeParams(DriverProfile=True)) and not dp.is_on(FakeParams(DriverProfile=False))
+    assert dp.is_on(FakeParams(DriverProfileSpeed=True), param=dp.SPEED_PARAM)
+    class Broken:
+      def get_bool(self, k):
+        raise KeyError(k)
+    assert not dp.is_on(Broken())
+
   def test_never_raises(self):
     class Broken:
       def get_bool(self, k):
