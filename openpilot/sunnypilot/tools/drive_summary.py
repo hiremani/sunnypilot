@@ -31,6 +31,10 @@ SETTLE_S = 180.0       # a route whose newest file is younger than this may stil
 WATCH_EVERY_S = 60.0
 LAG_EVENTS = ("selfdrivedLagging", "commIssue", "commIssueAvgFreq")
 MAX_ALERTS = 12
+# logged at error level on every start, not faults (route 000000f9: fingerprinting, init, the NNLC model check, a
+# locationd reset on the first fix)
+STARTUP_NOISE_EVENTS = {"fingerprinted", "selfdrived.initialized"}
+STARTUP_NOISE_TEXT = ("car doesn't match any Neural Network model", "kalman reset")
 
 
 def _segments(root: str, route: str) -> list[str]:
@@ -133,7 +137,9 @@ def summarize(root: str, route: str) -> dict:
       except ValueError:
         continue
       msg, t = j.get("msg"), m.logMonoTime * 1e-9 - t0
-      if j.get("levelnum", 0) >= 40:
+      noise = (isinstance(msg, dict) and msg.get("event") in STARTUP_NOISE_EVENTS) or \
+        any(x in str(msg) for x in STARTUP_NOISE_TEXT)
+      if j.get("levelnum", 0) >= 40 and not noise:
         errors[(j.get("ctx", {}).get("daemon", "?"), str(msg)[:80])] += 1
       if not isinstance(msg, dict):
         continue
