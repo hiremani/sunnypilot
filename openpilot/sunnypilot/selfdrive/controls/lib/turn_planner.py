@@ -67,6 +67,13 @@ STALL_DEG = 3.0
 STALL_MIN_V = 0.5               # m/s: below this the car is waiting (pedestrian, cross traffic), not stalling
 OVERRIDE_S = 0.3                # driver torque against the turn for this long: release
 TURN_TIMEOUT_S = 20.0           # a turn that takes longer than this is released whatever else happens
+DRIVER_TURNED_DEG = TURN_MIN_DEG  # the car has turned this much toward the blinker side since that blinker came on,
+                                  # not steered by the planner: the driver made the turn; no planner turn on that
+                                  # blinker. The blinker stays on for a moment after a hand-made turn, and the lagging
+                                  # GPS fix still puts the car short of the junction node, so the road the car came
+                                  # from looked like a branch on the blinker side a few metres ahead: the planner
+                                  # armed and steered hard back toward it (left onto Doane St from Gatewood St,
+                                  # 2026-11-14).
 
 # ---- car (Fisker Ocean): how fast the commanded curvature can actually build up ----
 ACTUATOR_DELAY_S = 0.15         # CarParams.steerActuatorDelay
@@ -448,6 +455,8 @@ class TurnPlanner:
     self.heading: float | None = None    # deg, the car's heading (GPS course, carried on by the yaw rate)
     self._last_fix = None
     self._done_side: str | None = None   # a turn on this side ended: no new one until that blinker goes off
+    self._side_turned = 0.0              # deg turned toward the blinker side since that blinker came on
+    self._turn_side = ""                 # the blinker side _side_turned counts for
     self._prefer_way: int | None = None
     self.pos: tuple[float, float] | None = None   # car position in the current roads' frame at the last fix
 
@@ -516,6 +525,15 @@ class TurnPlanner:
       self._done_side = None
       if self.state == DONE:
         self.state, self.side = IDLE, ""
+    if side != self._turn_side:
+      self._turn_side, self._side_turned = side, 0.0
+    elif side:
+      self._side_turned += (math.degrees(yaw_rate) if side == "left" else -math.degrees(yaw_rate)) * dt
+    # Only while idle: once armed, a driver starting the planned turn ahead of the planner is the cooperative case
+    # (carcontroller coop_signaled_turn), and a junction passed while armed already ends the turn.
+    if side and self.state == IDLE and self._side_turned >= DRIVER_TURNED_DEG:
+      self.state, self.side = ARMED, side   # _end marks the side done, so nothing arms until the blinker goes off
+      self._end("driver turned")
 
     # heading: GPS course when it means something, else carried on by the yaw rate (positive yaw = left = bearing down)
     new_fix = self._new_fix(gps)

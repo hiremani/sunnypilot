@@ -229,3 +229,41 @@ class TestTurnPlanner(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+def crossroads() -> tp.LocalRoads:
+  """A north-south road and an east-west road crossing at a junction node at the origin."""
+  return tp.LocalRoads(LAT0, LON0, [(1, "residential", False, [_ll(0, y) for y in (-200, -40, 0, 40, 200)]),
+                                    (2, "residential", False, [_ll(x, 0) for x in (-200, -40, 0, 40, 200)])])
+
+
+class TestDriverMadeTurn(unittest.TestCase):
+  def _manual_left(self, car: Car) -> None:
+    """The driver makes the left turn by hand (steering paused, so the planner is not steering) with the blinker on,
+    from the north-bound lane onto the west-bound road. The heading is carried on by the yaw rate at once, but the GPS
+    fix lags (~1 s, 4-6 m at turn speed), so the position it reports is still short of the junction node, east of it,
+    with the south road now on the left a few metres ahead (Doane St from Gatewood St, 2026-11-14)."""
+    while car.y < -9.0:
+      car.step(left=True, lat_active=False)
+    while car.h > -88.0:
+      car.k = -1.0 / 9.0
+      car.step(left=True, lat_active=False)
+    car.k, car.h = 0.0, -90.0
+    car.x, car.y = 3.0, 1.0          # where the lagging fix puts the car
+
+  def test_no_second_turn_after_the_driver_turned(self):
+    car = Car(planner(crossroads()))
+    self._manual_left(car)
+    self.assertGreater(car.x, 0.0)   # still short of the node: the south road looks like a left branch just ahead
+    n = len(car.outputs)
+    car.drive(4.0, left=True)        # steering resumes, the blinker has not cancelled yet
+    self.assertTrue(all(o is None for o in car.outputs[n:]))
+    self.assertNotIn(tp.TURNING, car.states[n:])
+    self.assertNotIn(tp.ARMED, car.states[n:])
+
+  def test_a_new_blinker_can_turn_again(self):
+    car = Car(planner(crossroads()))
+    self._manual_left(car)
+    car.drive(1.0, left=True)
+    car.drive(1.0)                   # blinker off: the driver's turn is over
+    self.assertEqual(car.p.state, tp.IDLE)
