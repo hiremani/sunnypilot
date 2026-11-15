@@ -208,6 +208,8 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
   narrowStreet @9 :Bool;   # no lane lines, curbs close together (narrow_street.py); the speed cap applies with NarrowStreetAssist
   leadCoast @10 :Bool;     # driver profile: not accelerating toward a slower lead inside lead_coast_s (profile_long.py)
   speedBump @11 :SpeedBump;
+  signalCoast @12 :Bool;        # map caution: not accelerating toward a mapped traffic light (map_caution.py)
+  crosswalkCaution @13 :Bool;   # map caution: capped for a marked crosswalk on a narrow street
 
   struct DynamicExperimentalControl {
     state @0 :DynamicExperimentalControlState;
@@ -309,6 +311,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     junctionTurn @6;   # driver profile: a signaled sharp slow turn, at the driver's junction speed
     driverSpeed @7;    # driver profile (DriverProfileSpeed): posted limit + the driver's offset for it
     speedBump @8;      # Speed Bump Assist: easing off to a mapped bump's crossing speed
+    crosswalk @9;      # map caution: a marked crosswalk ahead on a narrow street
   }
 
   struct SpeedBump {

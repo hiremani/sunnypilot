@@ -87,6 +87,9 @@ PARAM_ALLOWLIST: dict[str, tuple[type, Callable[[int], bool] | None]] = {
   "SpeedBumpAlert": (bool, None),
   "SpeedBumpAssistShadow": (bool, None),
   "DriveSummary": (bool, None),   # summarize each drive once the car is off (/api/drives)
+  # map caution (map_caution.py): no accelerating toward a mapped traffic light; slow for crosswalks on narrow streets
+  "TrafficSignalCoast": (bool, None),
+  "CrosswalkCaution": (bool, None),
   "IsMetric": (bool, None),
   "FiskerACCAutoSpeed": (bool, None),   # these two are the 0x52A spoof's baseline; ICC_0x52A overrides win
   "FiskerACCTerrain": (bool, None),

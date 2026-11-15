@@ -320,6 +320,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"SpeedBumpAssistShadow", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"SpeedBumpAlert", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"DriveSummary", {PERSISTENT | BACKUP, BOOL, "1"}},
+    {"TrafficSignalCoast", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"CrosswalkCaution", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"SmartCruiseControlVision", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // Torque lateral control custom params

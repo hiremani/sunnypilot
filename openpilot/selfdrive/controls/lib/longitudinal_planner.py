@@ -155,7 +155,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
     # driver profile: no accelerating toward a slower lead the driver would already coast for (never adds braking)
-    self.output_a_target = min(self.output_a_target, LongitudinalPlannerSP.lead_coast_cap(self, sm, v_ego))
+    self.output_a_target = min(self.output_a_target, LongitudinalPlannerSP.lead_coast_cap(self, sm, v_ego),
+                               LongitudinalPlannerSP.map_accel_cap(self))
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 

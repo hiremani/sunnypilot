@@ -21,6 +21,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist 
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import StopSignAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_bump import SpeedBumpAssist
+from openpilot.sunnypilot.selfdrive.controls.lib.map_caution import MapCaution
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile, narrow_street, profile_long
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
@@ -55,6 +56,12 @@ class LongitudinalPlannerSP:
       self.speed_bump_shadow = SpeedBumpAssist(bump_map=self.speed_bump.map if self.speed_bump else None, shadow=True)
     except Exception:
       cloudlog.exception("speed bump assist unavailable")
+    # map caution (traffic lights, crosswalks on narrow streets): openpilot longitudinal only
+    self.map_caution = None
+    try:
+      self.map_caution = MapCaution() if CP.openpilotLongitudinalControl else None
+    except Exception:
+      cloudlog.exception("map caution unavailable")
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
     # Narrow streets (narrow_street.py): always detected and published; the speed cap only with NarrowStreetAssist
     # and openpilot longitudinal. Re-read the param about once a second.
@@ -147,6 +154,14 @@ class LongitudinalPlannerSP:
       self.narrow_street = False
       cloudlog.exception("narrow street detector failed")
 
+    if self.map_caution is not None:
+      try:
+        self.map_caution.update(sm, long_enabled, long_override, v_ego, a_ego, self.narrow_street, now_s)
+      except Exception:
+        self.map_caution.signal_coast = self.map_caution.crosswalk_caution = False
+        self.map_caution.v_target = float('inf')
+        cloudlog.exception("map caution update failed")
+
     targets = {
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),
       LongitudinalPlanSource.sccVision: (self.scc.vision.output_v_target, self.scc.vision.output_a_target),
@@ -155,6 +170,8 @@ class LongitudinalPlannerSP:
     }
     if self.stop_sign is not None:
       targets[LongitudinalPlanSource.stopSign] = (self.stop_sign.output_v_target, self.stop_sign.output_a_target)
+    if self.map_caution is not None and self.map_caution.crosswalk_caution:
+      targets[LongitudinalPlanSource.crosswalk] = (self.map_caution.v_target, self.map_caution.a_target)
     if self.speed_bump is not None and self.speed_bump.is_active:
       targets[LongitudinalPlanSource.speedBump] = (self.speed_bump.output_v_target, self.speed_bump.output_a_target)
     if self.narrow_street and self.narrow_enabled and self.openpilot_long:
@@ -184,6 +201,10 @@ class LongitudinalPlannerSP:
       return None
     return profile_long.follow_t(self.profile.follow_gap_s, v_ego)
 
+  def map_accel_cap(self) -> float:
+    """No accelerating toward a mapped traffic light (map caution); inf when it doesn't limit."""
+    return self.map_caution.accel_cap() if self.map_caution is not None else float('inf')
+
   def lead_coast_cap(self, sm: messaging.SubMaster, v_ego: float) -> float:
     """The most acceleration the driver profile allows: none toward a slower lead inside the coasting gap, and the
     driver's own pull-away just after a junction turn (inf when it doesn't limit)."""
@@ -212,6 +233,9 @@ class LongitudinalPlannerSP:
     longitudinalPlanSP.events = self.events_sp.to_msg()
     longitudinalPlanSP.narrowStreet = bool(self.narrow_street)
     longitudinalPlanSP.leadCoast = bool(self.lead_coasting)
+    if self.map_caution is not None:
+      longitudinalPlanSP.signalCoast = bool(self.map_caution.signal_coast)
+      longitudinalPlanSP.crosswalkCaution = bool(self.map_caution.crosswalk_caution)
 
     # Dynamic Experimental Control
     dec = longitudinalPlanSP.dec
