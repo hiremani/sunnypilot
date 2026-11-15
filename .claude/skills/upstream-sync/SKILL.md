@@ -5,10 +5,12 @@ description: Keep the user's GitHub forks (hiremani/sunnypilot, hiremani/opendbc
 
 # Forks and upstream
 
+**Rule: never push to upstream.** The benkayuk repos are pull-only: no pushes, pull requests, issues or comments there, ever. Work goes only to the user's forks (`origin`), and only when the user asks. Both repos' upstream push URL is set to an invalid "no-push" value so a push fails; keep it that way.
+
 | Repo | origin (push here) | upstream (updates from) | branch |
 |---|---|---|---|
-| `~/Fisker/sunnypilot` | github.com/hiremani/sunnypilot | github.com/benkayuk/sunnypilot | `mallik-fisker` |
-| `opendbc_repo` | github.com/hiremani/opendbc | github.com/benkayuk/opendbc | `mallik-fisker` |
+| `~/Fisker/sunnypilot` | github.com/hiremani/sunnypilot | github.com/benkayuk/sunnypilot (fetch only) | `mallik-fisker` |
+| `opendbc_repo` | github.com/hiremani/opendbc | github.com/benkayuk/opendbc (fetch only) | `mallik-fisker` |
 | `panda` | benkayuk/panda (no local changes, no fork) | - | - |
 
 `.gitmodules` points opendbc at `hiremani/opendbc` so a fresh clone can resolve the pinned car commits. Both forks are public.
@@ -26,4 +28,4 @@ git add opendbc_repo && git commit -m "bump opendbc" && git push
 
 ## Pushing
 
-Commit or push only when the user asks. Pushes to the forks are public: scan first for keys or private files (`git diff upstream/master..HEAD | grep -iE '[0-9a-f]{32}|token|password'`; `local_stop_signs.json` and params are never in git).
+Push only to `origin`, and only when the user asks. Pushes to the forks are public: scan first for keys or private files (`git diff upstream/master..HEAD | grep -iE '[0-9a-f]{32}|token|password'`; `local_stop_signs.json` and params are never in git).
