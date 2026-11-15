@@ -360,3 +360,31 @@ class TestStartFromStop(unittest.TestCase):
     while car.p.state != tp.TURNING:
       car.step(left=True)
     self.assertGreater(car.y, -15.0)                 # rolling through: the normal start
+
+
+class TestTurnLog(unittest.TestCase):
+  def test_every_state_change_and_ticks_are_logged(self):
+    p = planner(t_junction(right=False, left=True))
+    events = []
+    p.log_event = lambda name, **f: events.append((name, f))
+    car = Car(p)
+    car.drive(30.0, left=True)
+    changes = [(f["prev"], f["state"]) for n, f in events if n == "map_turn"]
+    self.assertIn((tp.IDLE, tp.ARMED), changes)
+    self.assertIn((tp.ARMED, tp.TURNING), changes)
+    self.assertTrue(any(prev == tp.TURNING for prev, _ in changes))
+    done = [f for n, f in events if n == "map_turn" and f["prev"] == tp.TURNING][0]
+    self.assertEqual(done["reason"], "done")
+    ticks = [f for n, f in events if n == "map_turn_tick"]
+    self.assertTrue(any(f["state"] == tp.TURNING and f["curvature"] is not None for f in ticks))
+    self.assertTrue(all(f["blinker"] == "L" for f in ticks))
+
+  def test_a_failing_logger_never_breaks_the_turn(self):
+    p = planner(t_junction(right=False, left=True))
+
+    def boom(name, **f):
+      raise RuntimeError("log down")
+    p.log_event = boom
+    car = Car(p)
+    car.drive(30.0, left=True)
+    self.assertEqual(car.p.log.reason, "done")

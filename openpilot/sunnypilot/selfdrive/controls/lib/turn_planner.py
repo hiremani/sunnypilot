@@ -87,6 +87,8 @@ ANGLE_RATE_DOWN_DEG_S = (500.0, 200.0, 30.0)  # ... and unwinding (ANGLE_RATE_LI
 MAX_LATERAL_JERK = 5.0          # m/s^3 (drive_helpers.clip_curvature)
 MAX_CURVATURE = 0.2             # 1/m (drive_helpers)
 
+LOG_TICK_S = 0.5                # armed or turning: a "map_turn_tick" log event this often (state changes log at once)
+
 LOCAL_RADIUS_M = 250.0          # road ways within this of the load point are kept in local coordinates
 RELOAD_M = 120.0                # reload once the car is this far from the load point
 
@@ -467,6 +469,11 @@ class TurnPlanner:
     self._turn_side = ""                 # the blinker side _side_turned counts for
     self._prefer_way: int | None = None
     self.pos: tuple[float, float] | None = None   # car position in the current roads' frame at the last fix
+    # what the planner did goes to the log ("map_turn" on every state change, "map_turn_tick" while armed or turning),
+    # so an incident is a log lookup, not a replay. log_event(name, **fields); None: cloudlog.event
+    self.log_event = None
+    self._logged_state = IDLE
+    self._log_t = 0.0
 
   def _reset(self) -> None:
     self.state = IDLE
@@ -561,7 +568,33 @@ class TurnPlanner:
       if self.state == IDLE and side and lat_active and v_ego <= V_ARM_MAX and new_fix and self.heading is not None:
         self._try_arm(side, v_ego, gps)
     self._fill_log()
+    self._emit_log(dt, v_ego, left_blinker, right_blinker, lat_active, steering_pressed, steering_torque, out)
     return out
+
+  def _emit_log(self, dt, v_ego, left_blinker, right_blinker, lat_active, pressed, torque, out) -> None:
+    changed = self.state != self._logged_state
+    self._log_t += dt
+    if not changed and not (self.state in (ARMED, TURNING) and self._log_t >= LOG_TICK_S):
+      return
+    lg = self.log
+    fields = {"state": self.state, "side": self.side, "reason": lg.reason, "junction_dist": round(lg.junction_dist, 1),
+              "planned_deg": round(lg.planned_deg, 1), "progress_deg": round(lg.progress_deg, 1),
+              "radius": round(lg.radius, 1), "curvature": None if out is None else round(out, 4), "v": round(v_ego, 2),
+              "heading": None if self.heading is None else round(self.heading, 1), "way": lg.way_id,
+              "branch": lg.branch_way_id, "blinker": "L" if left_blinker else "R" if right_blinker else "",
+              "lat_active": bool(lat_active), "pressed": bool(pressed), "torque": round(torque, 2)}
+    if changed:
+      fields["prev"] = self._logged_state
+    try:
+      if self.log_event is not None:
+        self.log_event("map_turn" if changed else "map_turn_tick", **fields)
+      else:
+        from openpilot.common.swaglog import cloudlog
+        cloudlog.event("map_turn" if changed else "map_turn_tick", **fields)
+    except Exception:
+      pass   # logging must never take the turn planner down
+    self._logged_state = self.state
+    self._log_t = 0.0
 
   def _try_arm(self, side: str, v: float, gps) -> None:
     roads = self.roads_src.get(gps.latitude, gps.longitude)
