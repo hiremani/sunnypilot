@@ -194,6 +194,8 @@ procs += [
 
   # web HUD for an in-car browser (http://sunnypilot.local:8088)
   PythonProcess("webhud", "openpilot.sunnypilot.webhud.server", use_webhud),
+  # a summary of each finished drive for the web HUD (sunnypilot/tools/drive_summary.py); car off only, lowest priority
+  PythonProcess("drive_summary", "openpilot.sunnypilot.tools.drive_summary", only_offroad),
   # Fisker remote-control daemon — tiny HTTP server on 0.0.0.0:8899 for the
   # phone webapp. Opt-in: it runs only in a car and only while RemoteControlEnabled
   # is true, and that param is CLEAR_ON_MANAGER_START, so nothing listens after a

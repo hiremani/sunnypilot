@@ -192,6 +192,21 @@ class TestServer(OpenpilotTestCase):
       assert self.request("PUT", "/api/profiles", {"active": "me"})[0] == 409
       assert json.loads(self.request("GET", "/api/profiles")[1])["editable"] is False
 
+  def test_drive_summaries(self):
+    with tempfile.TemporaryDirectory() as d, mock.patch.object(webhud_server, "drive_summaries_dir", lambda: d):
+      assert json.loads(self.request("GET", "/api/drives")[1]) == {"drives": []}
+      for route in ("000000f6--a46af86fe7", "000000f8--e31bf5cc62"):
+        with open(os.path.join(d, route + ".json"), "w") as f:
+          json.dump({"route": route, "miles": 6.1, "moving_min": 10.0, "headline": ["6.1 mi"], "lag": []}, f)
+      with open(os.path.join(d, "000000f9--bad.json"), "w") as f:
+        f.write("{not json")
+      drives = json.loads(self.request("GET", "/api/drives")[1])["drives"]
+      assert [x["route"] for x in drives] == ["000000f8--e31bf5cc62", "000000f6--a46af86fe7"]   # newest first, bad skipped
+      assert "lag" not in drives[0]
+      status, body, _ = self.request("GET", "/api/drives?route=000000f6--a46af86fe7")
+      assert status == 200 and json.loads(body)["lag"] == []
+      assert self.request("GET", "/api/drives?route=../../etc/passwd")[0] == 404
+
   def test_acc_toggle_params(self):
     for key in ("FiskerACCTerrain", "FiskerACCAutoSpeed"):
       for enabled in (True, False):

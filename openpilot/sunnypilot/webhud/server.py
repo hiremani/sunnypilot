@@ -86,6 +86,7 @@ PARAM_ALLOWLIST: dict[str, tuple[type, Callable[[int], bool] | None]] = {
   "SpeedBumpAssist": (bool, None),
   "SpeedBumpAlert": (bool, None),
   "SpeedBumpAssistShadow": (bool, None),
+  "DriveSummary": (bool, None),   # summarize each drive once the car is off (/api/drives)
   "IsMetric": (bool, None),
   "FiskerACCAutoSpeed": (bool, None),   # these two are the 0x52A spoof's baseline; ICC_0x52A overrides win
   "FiskerACCTerrain": (bool, None),
@@ -801,6 +802,39 @@ def api_params_put(h: HudHandler, q) -> None:
 # Named profiles live in <media>/driver_profiles/<name>.json (written by sunnypilot/tools/driver_profile_gen.py).
 # The assists re-read the active one within seconds. Switching is refused while the car is moving.
 
+def drive_summaries_dir() -> str:
+  from openpilot.sunnypilot.tools.drive_summary import summary_dir
+  roots, _ = data_roots()
+  return summary_dir(roots[0])
+
+
+def api_drives_get(h: HudHandler, q) -> None:
+  """The drive summaries written after each drive (sunnypilot/tools/drive_summary.py): ?route=NAME for one in full,
+  else the newest (limit, default 20) with their headline lines."""
+  d = drive_summaries_dir()
+  route = q.get("route", [None])[0]
+  if route:
+    path = os.path.join(d, os.path.basename(route) + ".json")
+    if not os.path.isfile(path):
+      return h._error(404, f"no summary for {route}")
+    with open(path) as f:
+      return h._json(json.load(f))
+  try:
+    limit = max(1, min(200, int(q.get("limit", ["20"])[0])))
+  except ValueError:
+    limit = 20
+  out = []
+  files = sorted((f for f in os.listdir(d) if f.endswith(".json")), reverse=True) if os.path.isdir(d) else []
+  for f in files[:limit]:
+    try:
+      with open(os.path.join(d, f)) as fh:
+        s = json.load(fh)
+      out.append({k: s.get(k) for k in ("route", "summarized", "miles", "moving_min", "headline")})
+    except (OSError, ValueError):
+      continue
+  h._json({"drives": out})
+
+
 def api_profiles_get(h: HudHandler, q) -> None:
   from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
   params = h.server.params
@@ -1029,6 +1063,7 @@ ROUTES = {
   ("PUT", "/api/overrides"): api_overrides_put,
   ("DELETE", "/api/overrides"): api_overrides_delete,
   ("GET", "/api/profiles"): api_profiles_get,
+  ("GET", "/api/drives"): api_drives_get,
   ("PUT", "/api/profiles"): api_profiles_put,
   ("GET", "/api/ssh"): api_ssh_get,
   ("POST", "/api/ssh/authorize"): api_ssh_authorize,
