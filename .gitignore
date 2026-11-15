@@ -92,13 +92,15 @@ build/
 !.vscode/extensions.json
 !.vscode/*.code-snippets
 
-# agents
-.claude/
+# agents (the repo's Claude Code skills are shared; everything else under .claude/ stays local)
+.claude/*
+!.claude/skills/
 .context/
 PLAN.md
 TASK.md
 CLAUDE.md
 SKILL.md
+!.claude/skills/*/SKILL.md
 
 ### JetBrains ###
 !.idea/customTargets.xml
