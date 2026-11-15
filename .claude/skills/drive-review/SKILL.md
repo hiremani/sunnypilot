@@ -5,6 +5,12 @@ description: Review one or more drives - engagements, alerts, events, lag and CP
 
 # Drive review
 
+**Start with the automatic summary.** Since 2026-11-15 the comma writes one per drive once the car is off
+(`openpilot/sunnypilot/tools/drive_summary.py`, `DriveSummary` param): `/data/media/0/drive_summaries/<route>.json`,
+also `GET http://192.168.0.207:8088/api/drives` (headlines) and `/api/drives?route=NAME` (full). It covers steering
+and speed-control time, how each speed-control run ended, alerts, lag, turn-assist turns, stop sign and speed bump
+passes, and error lines. Use the scripts below for what it doesn't cover.
+
 Scripts (run on the device, detached; see `comma-device`):
 
 | Script | Args | What it tells you |
