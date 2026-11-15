@@ -23,6 +23,7 @@ from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
+from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile
 from openpilot.sunnypilot.selfdrive.controls.lib.turn_planner import TurnPlanner
 from openpilot.sunnypilot.selfdrive.controls.lib.narrow_street import PARAM as NARROW_PARAM, CenterLineKeeper
 from openpilot.common.gps import get_gps_location_service
@@ -99,6 +100,13 @@ class Controls(ControlsExt):
         self.narrow_street_assist = self.params.get_bool(NARROW_PARAM)
       except Exception:
         self.narrow_street_assist = False
+      if self._turn_param_frame % 1000 == 0:   # the driver profile's turn starts from a stop (about every 10 s)
+        try:   # a problem here keeps the planner's current tuning (default: off)
+          profile = driver_profile.active(self.params)
+          self.turn_planner.tuning.stop_start_left_m = profile.turn_stop_start_left_m
+          self.turn_planner.tuning.stop_start_right_m = profile.turn_stop_start_right_m
+        except Exception:
+          cloudlog.exception("driver profile turn starts failed")
     self._turn_param_frame += 1
     self.map_turn_curvature = None
     if not self.map_turn_assist:

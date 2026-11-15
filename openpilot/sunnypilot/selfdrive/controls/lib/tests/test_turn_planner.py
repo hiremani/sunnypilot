@@ -298,3 +298,39 @@ class TestTurnEnds(unittest.TestCase):
     car.drive(30.0, left=True)
     self.assertEqual(car.p.log.reason, "done")
     self.assertAlmostEqual(car.h, -90.0, delta=10.0)
+
+
+class TestStartFromStop(unittest.TestCase):
+  def _from_stop(self, stop_start_m: float):
+    p = planner(t_junction(right=False, left=True))
+    p.tuning = tp.TurnTuning(stop_start_left_m=stop_start_m)
+    car = Car(p, v=3.0, y0=-40.0)
+    while car.y < -22.0:
+      car.step(left=True)
+    car.v = 0.0
+    car.drive(2.0, left=True)          # stopped at the line, 22 m before the junction node
+    self.assertEqual(car.p.state, tp.ARMED)
+    car.v = 3.0
+    car.step(left=True)
+    started_at = car.y if car.p.state == tp.TURNING else None
+    car.drive(30.0, left=True)
+    return car, started_at
+
+  def test_moving_off_starts_the_turn_where_the_driver_does(self):
+    car, started_at = self._from_stop(25.0)
+    self.assertIsNotNone(started_at)                 # at once, from the stop line
+    self.assertAlmostEqual(car.h, -90.0, delta=10.0)  # and still ends on the branch
+    self.assertLess(abs(car.y), 6.0)                  # ... about where the branch runs
+
+  def test_off_by_default(self):
+    car, started_at = self._from_stop(0.0)
+    self.assertIsNone(started_at)                    # the planner's own start, ~10 m before the node
+    self.assertAlmostEqual(car.h, -90.0, delta=10.0)
+
+  def test_not_without_stopping(self):
+    p = planner(t_junction(right=False, left=True))
+    p.tuning = tp.TurnTuning(stop_start_left_m=25.0)
+    car = Car(p, v=3.0, y0=-40.0)
+    while car.p.state != tp.TURNING:
+      car.step(left=True)
+    self.assertGreater(car.y, -15.0)                 # rolling through: the normal start

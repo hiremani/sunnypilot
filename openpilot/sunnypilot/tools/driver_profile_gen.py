@@ -36,10 +36,12 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
 from openpilot.sunnypilot.selfdrive.controls.lib import narrow_street as ns
 from openpilot.sunnypilot.tools import fisker_drive_style as fds
+from openpilot.sunnypilot.tools import turn_habits
 
 MPH = fds.MPH
 MIN_SAMPLES = {"speed": 300, "stops": 5, "curve": 100, "turns": 5, "gap": 200, "limit": 1200, "coast": 8,
-               "narrow": 200}   # 10 Hz samples (narrow: 20 Hz), or events
+               "narrow": 200,
+               "stop_start": 3}   # 10 Hz samples (narrow: 20 Hz), or events
 OPEN_ROAD_GAP_S = 3.0
 LAT_CURVE_YAW = 0.05      # rad/s: in a curve
 MIN_ROUTE_MOVING_MIN = 3.0
@@ -121,10 +123,11 @@ def coast_times(S: list) -> list[float]:
   return out
 
 
-def measure(routes: list[str], root: str, narrow: bool = True) -> tuple[dp.DriverProfile, dict]:
+def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: bool = True) -> tuple[dp.DriverProfile, dict]:
   base = dp.DriverProfile()
   offsets: dict[int, list[float]] = defaultdict(list)
   stops, coasts, lat_acc, turns, gaps, lead_coasts, narrow_v = [], [], [], [], [], [], []
+  stop_starts: dict[str, list[float]] = {"left": [], "right": []}
   used, miles = [], 0.0
   for r in routes:
     S = fds.load(root, r)
@@ -148,6 +151,13 @@ def measure(routes: list[str], root: str, narrow: bool = True) -> tuple[dp.Drive
     lead_coasts += lead_coast_gaps(S)
     if narrow:
       narrow_v += narrow_speeds(root, r)
+    if turns_from_stop:
+      try:
+        for o in turn_habits.turn_onsets(root, r):
+          if o["from_stop"] and o["dist_m"] > 0.0:
+            stop_starts[o["side"]].append(o["dist_m"])
+      except Exception as e:   # no road tiles here, or a bad log: the value keeps its default
+        print(f"turn starts skipped for {r}: {e}", file=sys.stderr)
 
   values, meta = {}, {}
 
@@ -188,6 +198,11 @@ def measure(routes: list[str], root: str, narrow: bool = True) -> tuple[dp.Drive
   exits = [t["exit_accel"] for t in turns if t.get("exit_accel") is not None and t["exit_accel"] > 0.0]
   put("turn_exit_accel", statistics.median(exits) if exits else None, len(exits), MIN_SAMPLES["turns"],
       "median pull-away over the 3 s after a junction turn the driver steered, on the accelerator, ACC off, no lead")
+  for side in ("left", "right"):
+    ds = stop_starts[side]
+    put(f"turn_stop_start_{side}_m", statistics.median(ds) if ds else None, len(ds), MIN_SAMPLES["stop_start"],
+        f"median distance before the junction node where the driver's wheel passed 30 deg, signaled {side} turns"
+        + " moving off from a stop" + ("" if turns_from_stop else " (skipped)"))
   put("follow_gap_s", statistics.median(gaps) if gaps else None, len(gaps), MIN_SAMPLES["gap"],
       "median time gap behind a steady lead, ACC off")
   put("lead_coast_s", statistics.median(lead_coasts) if lead_coasts else None, len(lead_coasts), MIN_SAMPLES["coast"],
@@ -231,12 +246,13 @@ def main(argv: list[str] | None = None) -> int:
   ap.add_argument("--out", default=None, help="write here instead of the named profile's file")
   ap.add_argument("--dry-run", action="store_true", help="measure and print, write nothing")
   ap.add_argument("--no-narrow", action="store_true", help="skip the narrow-street speed (reads every rlog)")
+  ap.add_argument("--no-turns", action="store_true", help="skip the turn starts from a stop (reads every rlog, needs road tiles)")
   args = ap.parse_args(argv)
   routes = routes_in(args.root) if args.all else args.routes
   if not routes:
     print("no routes (name them, or --all)", file=sys.stderr)
     return 1
-  profile, info = measure(routes, args.root, narrow=not args.no_narrow)
+  profile, info = measure(routes, args.root, narrow=not args.no_narrow, turns_from_stop=not args.no_turns)
   report(profile, info)
   if not args.dry_run:
     if not args.out and not dp.valid_name(args.name):

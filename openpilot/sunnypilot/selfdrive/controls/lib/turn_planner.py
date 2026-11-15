@@ -58,6 +58,7 @@ PASSED_M = 3.0                  # armed, but the junction is this far behind: re
 # ---- the turn ----
 A_LAT_MAX = 2.5                 # m/s^2: the arc's radius is never tighter than v^2 / A_LAT_MAX
 R_MIN = 6.0                     # m: tightest arc ever planned (a late start may tighten the arc down to this)
+R_FROM_STOP_MAX = 30.0          # m: widest arc a turn started early from a stop (TurnTuning.stop_start_*_m) is fitted to
 LATE_SLACK_M = 2.0              # a start so late the arc would need to be this much tighter than R_MIN is abandoned;
                                 # within the slack the R_MIN arc is flown and ends a little past the planned exit
 V_START_MIN = 0.5               # m/s: armed and stopped (at the stop line), the turn waits for the car to move off
@@ -104,6 +105,11 @@ class TurnTuning:
                                 # the wheel unwinds (unwind_heading_deg at the measured curvature)
   lane_offset_m: float = 0.0    # the car drives this far right of the centreline: corners cut on rights, widen on lefts
                                 # (0 scored best: GPS and OSM centreline offsets are as large as the lane offset)
+  stop_start_left_m: float = 0.0   # armed and stopped (at the stop line) this close to the junction or closer: start
+  stop_start_right_m: float = 0.0  # the turn as the car moves off, the arc fitted to the distance left; 0 = off. From
+                                   # the driver profile (turn_stop_start_*_m): from a stop the driver starts a left turn
+                                   # ~25 m before the junction node in a ~20 m arc, the planner's own start is ~10 m
+                                   # (4 turns, routes f0 f3 f5 f6; f6 is the Doane St turn the driver led by 2 s)
 
 
 def _wrap(a: float) -> float:
@@ -476,6 +482,7 @@ class TurnPlanner:
     self.stall_ref = 0.0
     self.override_t = 0.0
     self.no_match_t = 0.0
+    self.waited_stopped = False   # armed and stopped (at the stop line) at some point
 
   def _end(self, reason: str) -> None:
     if self.state in (ARMED, TURNING):
@@ -608,13 +615,22 @@ class TurnPlanner:
       return None
     if v > V_ARM_MAX:
       return None   # wait: the turn only starts at a turn speed
+    if v < V_START_MIN:
+      self.waited_stopped = True
     r = self.radius_for(self.side, v)
     start = self.start_distance(r, self.planned, v)
-    if self.dist > start:
+    stop_start = self.tuning.stop_start_left_m if self.side == "left" else self.tuning.stop_start_right_m
+    early = self.waited_stopped and v >= V_START_MIN and start < self.dist <= stop_start
+    if self.dist > start and not early:
       return None
     if v < V_START_MIN:
       return None   # stopped at the line: wait for the car to move off
-    if self.dist < start - 0.5:
+    if early:
+      # moving off from the stop line, where the driver starts this turn: the arc that ends on the branch from here
+      half = math.radians(abs(self.planned)) / 2.0
+      fixed = start - r * math.tan(half)
+      r = min(R_FROM_STOP_MAX, max(r, (self.dist - fixed) / math.tan(half)))
+    elif self.dist < start - 0.5:
       # started late (slowed down or armed close in, or moving off from the stop line): tighten the arc to fit
       half = math.radians(abs(self.planned)) / 2.0
       fixed = self.start_distance(r, self.planned, v) - r * math.tan(half)
