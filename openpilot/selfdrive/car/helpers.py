@@ -1,4 +1,5 @@
 import capnp
+import dataclasses
 from typing import Any
 
 from openpilot.cereal import custom
@@ -46,6 +47,48 @@ def convert_to_capnp(struct: structs.CarParamsSP | structs.CarStateSP) -> capnp.
     raise ValueError(f"Unsupported struct type: {type(struct)}")
 
   return struct_capnp
+
+
+class LazyCarControlSP:
+  """convert_carControlSP's result, converted one field at a time as the car code reads it (and then cached).
+
+  card converts carControlSP on every 100 Hz tick, and capnp's to_dict() of the whole struct took ~0.6 ms of the
+  device's CPU per tick (16% of Fisker card's tick on route 000000f6) when the car controller reads one field
+  (mads.active). Each field gets exactly the value convert_carControlSP gives it."""
+  _SUBS = {"mads": structs.ModularAssistiveDrivingSystem, "leadOne": structs.LeadData, "leadTwo": structs.LeadData,
+           "intelligentCruiseButtonManagement": structs.IntelligentCruiseButtonManagement}
+
+  def __init__(self, struct: capnp.lib.capnp._DynamicStructReader):
+    self._struct = struct
+
+  def __getattr__(self, name: str):
+    if name.startswith("_"):
+      raise AttributeError(name)
+    if name in self._SUBS:
+      # field by field: the sub-struct's own to_dict() leaves out fields at their capnp default, which would then take the
+      # dataclass's default instead (LeadData.radarTrackId: -1, not 0)
+      # (and a sub-struct that was never set is left out of to_dict() entirely: all the dataclass's defaults)
+      cls = self._SUBS[name]
+      if not self._struct._has(name):
+        value = cls()
+      else:
+        sub = getattr(self._struct, name)
+        value = cls(**{f.name: _plain(getattr(sub, f.name)) for f in dataclasses.fields(cls) if not f.name.endswith("DEPRECATED")})
+    elif name in _CC_SP_FIELDS:
+      value = getattr(self._struct, name)
+      if not isinstance(value, (bool, int, float, str)):
+        value = getattr(convert_carControlSP(self._struct), name)   # anything else: the full conversion's value
+    else:
+      raise AttributeError(name)
+    self.__dict__[name] = value
+    return value
+
+
+_CC_SP_FIELDS = {f.name for f in dataclasses.fields(structs.CarControlSP)}
+
+
+def _plain(v):
+  return v if isinstance(v, (bool, int, float, str)) else str(v)   # enums read as their name, as to_dict() gives them
 
 
 def convert_carControlSP(struct: capnp.lib.capnp._DynamicStructReader) -> structs.CarControlSP:
