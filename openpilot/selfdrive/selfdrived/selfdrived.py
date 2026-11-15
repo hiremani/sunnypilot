@@ -119,6 +119,10 @@ class SelfdriveD(CruiseHelper):
     self.speed_limit_chime = (self.params.get("SpeedLimitMode", return_default=True) or 0) > 0
     self.narrow_street_assist = self.params.get_bool("NarrowStreetAssist")
     self.narrow_street_prev = False
+    try:
+      self.speed_bump_alert = self.params.get_bool("SpeedBumpAlert")
+    except Exception:
+      self.speed_bump_alert = False
     self.speed_limit_posted = SpeedLimitPosted(DT_CTRL)
     self.blinker_blind_spot = BlinkerBlindSpot(DT_CTRL)
     self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
@@ -391,6 +395,10 @@ class SelfdriveD(CruiseHelper):
     if narrow and not self.narrow_street_prev and self.narrow_street_assist and self.enabled:
       self.events_sp.add(custom.OnroadEventSP.EventName.narrowStreet)
     self.narrow_street_prev = narrow
+
+    # Speed bump ahead: once per bump, while it is near and the car is faster than its crossing speed
+    if self.sm['longitudinalPlanSP'].speedBump.warn and self.speed_bump_alert:
+      self.events_sp.add(custom.OnroadEventSP.EventName.speedBumpAhead)
 
     # Handle lane turn
     lane_turn_direction = self.sm['modelDataV2SP'].laneTurnDirection

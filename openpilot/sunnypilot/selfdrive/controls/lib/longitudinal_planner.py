@@ -20,6 +20,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_crui
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import StopSignAssist
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_bump import SpeedBumpAssist
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile, narrow_street, profile_long
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
@@ -45,6 +46,15 @@ class LongitudinalPlannerSP:
       self.stop_sign_shadow = StopSignAssist(stop_map=self.stop_sign.map if self.stop_sign else None, shadow=True)
     except Exception:
       cloudlog.exception("stop sign assist unavailable")
+    # Speed bumps: the live copy eases off only with openpilot longitudinal; the shadow copy runs on every drive, logs,
+    # and is where the "Speed bump ahead" warning comes from whatever drives the speed.
+    self.speed_bump = None
+    self.speed_bump_shadow = None
+    try:
+      self.speed_bump = SpeedBumpAssist() if CP.openpilotLongitudinalControl else None
+      self.speed_bump_shadow = SpeedBumpAssist(bump_map=self.speed_bump.map if self.speed_bump else None, shadow=True)
+    except Exception:
+      cloudlog.exception("speed bump assist unavailable")
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
     # Narrow streets (narrow_street.py): always detected and published; the speed cap only with NarrowStreetAssist
     # and openpilot longitudinal. Re-read the param about once a second.
@@ -104,6 +114,17 @@ class LongitudinalPlannerSP:
         self.stop_sign_shadow.update(sm, True, False, sm['carState'].vEgo, a_ego, now_s)
       except Exception:
         cloudlog.exception("stop sign shadow update failed")
+    if self.speed_bump is not None:
+      try:
+        self.speed_bump.update(sm, long_enabled, long_override, v_ego, a_ego, now_s)
+      except Exception:
+        self.speed_bump._finish()   # idle: no target from a failed update
+        cloudlog.exception("speed bump update failed")
+    if self.speed_bump_shadow is not None:
+      try:
+        self.speed_bump_shadow.update(sm, True, False, sm['carState'].vEgo, a_ego, now_s)
+      except Exception:
+        cloudlog.exception("speed bump shadow update failed")
 
     if self._narrow_param_frame % 20 == 0:
       try:
@@ -134,6 +155,8 @@ class LongitudinalPlannerSP:
     }
     if self.stop_sign is not None:
       targets[LongitudinalPlanSource.stopSign] = (self.stop_sign.output_v_target, self.stop_sign.output_a_target)
+    if self.speed_bump is not None and self.speed_bump.is_active:
+      targets[LongitudinalPlanSource.speedBump] = (self.speed_bump.output_v_target, self.speed_bump.output_a_target)
     if self.narrow_street and self.narrow_enabled and self.openpilot_long:
       a_narrow = narrow_street.NARROW_ACCEL if v_ego > self.narrow_speed else a_ego
       targets[LongitudinalPlanSource.narrowStreet] = (self.narrow_speed, a_narrow)
@@ -245,6 +268,19 @@ class LongitudinalPlannerSP:
       stopSign.vTarget = float(ss.output_v_target)
       stopSign.confirmed = ss.confirmed
       stopSign.signId = int(ss.node_id or 0)
+
+    # Speed Bump Assist: the live one when it runs, else the shadow; the warning always from the shadow copy
+    sb = self.speed_bump if self.speed_bump is not None and self.speed_bump.enabled else self.speed_bump_shadow
+    if sb is not None:
+      speedBump = longitudinalPlanSP.speedBump
+      speedBump.state = int(sb.state)
+      speedBump.active = sb.is_active
+      speedBump.shadow = sb.shadow
+      speedBump.distance = float(sb.distance)
+      speedBump.vCross = float(min(sb.v_cross, 255.0))
+      speedBump.vTarget = float(min(sb.output_v_target, 255.0))
+      speedBump.bumpId = int(sb.node_id or 0)
+      speedBump.warn = bool(self.speed_bump_shadow is not None and self.speed_bump_shadow.warn)
 
     # E2E Alerts
     e2eAlerts = longitudinalPlanSP.e2eAlerts

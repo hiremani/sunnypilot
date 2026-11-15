@@ -207,6 +207,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
   stopSign @8 :StopSign;
   narrowStreet @9 :Bool;   # no lane lines, curbs close together (narrow_street.py); the speed cap applies with NarrowStreetAssist
   leadCoast @10 :Bool;     # driver profile: not accelerating toward a slower lead inside lead_coast_s (profile_long.py)
+  speedBump @11 :SpeedBump;
 
   struct DynamicExperimentalControl {
     state @0 :DynamicExperimentalControlState;
@@ -307,6 +308,26 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     narrowStreet @5;
     junctionTurn @6;   # driver profile: a signaled sharp slow turn, at the driver's junction speed
     driverSpeed @7;    # driver profile (DriverProfileSpeed): posted limit + the driver's offset for it
+    speedBump @8;      # Speed Bump Assist: easing off to a mapped bump's crossing speed
+  }
+
+  struct SpeedBump {
+    # Speed Bump Assist (speed_bump.py); when only the shadow copy runs (shadow = true) this is what it would be doing
+    state @0 :SpeedBumpState;
+    active @1 :Bool;
+    shadow @2 :Bool;
+    distance @3 :Float32;   # m to the bump's map point
+    vCross @4 :Float32;     # m/s, its crossing speed
+    vTarget @5 :Float32;    # m/s, 255 when not limiting
+    bumpId @6 :Int64;       # OSM node (negative: local_speed_bumps.json), 0 when none
+    warn @7 :Bool;          # "Speed bump ahead" is due (once per bump, whatever drives the speed)
+
+    enum SpeedBumpState {
+      disabled @0;
+      idle @1;
+      easing @2;
+      crossing @3;
+    }
   }
 
   struct StopSign {
@@ -383,6 +404,7 @@ struct OnroadEventSP @0xda96579883444c35 {
     speedLimitPosted @26;
     blindSpotBlinker @27;
     narrowStreet @28;
+    speedBumpAhead @29;
   }
 }
 

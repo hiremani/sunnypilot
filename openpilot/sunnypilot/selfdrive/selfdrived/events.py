@@ -239,6 +239,14 @@ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
       Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 4.),
   },
 
+  EventNameSP.speedBumpAhead: {
+    ET.WARNING: Alert(
+      "Speed Bump Ahead",
+      "Ease off",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlertSP.promptSingleHigh, 3.),
+  },
+
   EventNameSP.blindSpotBlinker: {
     ET.WARNING: Alert(
       "Car in Blind Spot",

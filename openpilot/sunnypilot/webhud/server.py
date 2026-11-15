@@ -82,6 +82,10 @@ PARAM_ALLOWLIST: dict[str, tuple[type, Callable[[int], bool] | None]] = {
   # sunnypilot: switch to the model's end-to-end speed (lights, stops) only when it predicts a stop; curve speed
   "DynamicExperimentalControl": (bool, None),
   "SmartCruiseControlVision": (bool, None),
+  # Speed Bump Assist: ease off for mapped bumps (openpilot speed control), the "Speed bump ahead" chime, log-only mode
+  "SpeedBumpAssist": (bool, None),
+  "SpeedBumpAlert": (bool, None),
+  "SpeedBumpAssistShadow": (bool, None),
   "IsMetric": (bool, None),
   "FiskerACCAutoSpeed": (bool, None),   # these two are the 0x52A spoof's baseline; ICC_0x52A overrides win
   "FiskerACCTerrain": (bool, None),
