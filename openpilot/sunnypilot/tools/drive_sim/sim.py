@@ -715,8 +715,10 @@ STYLE = {
   "fast_zone_mph": 55.0,
   "lat_accel": 2.2,            # m/s^2 in curves (driver p50 1.5, p95 3.2)
   "decel": 1.1,                # m/s^2 planned braking for stops and curves (driver average 1.12)
-  "gap_s": 1.65,               # following gap behind a lead (driver median)
-  "standstill_gap_m": 4.0,
+  "gap_s": 1.65,               # following gap behind a lead (driver median); the car's MPC: 6 m + t_follow * v
+  "limit_offsets": {},         # per posted limit (mph, as a string), the driver's offset; else town / fast
+  "lead_coast_s": 0.0,         # no accelerating toward a slower lead inside this time gap; 0 = off
+  "junction_mph": 0.0,         # speed through a signaled sharp slow turn; 0 = only the curve speed
   "accel_max": 1.0,            # m/s^2: the car's openpilot limit (ACCEL_MAX); the driver launches at ~1.6
   "decel_max": 3.5,
 }
@@ -747,15 +749,19 @@ def style_from_profile(name: str | None) -> tuple[dict, str]:
   p = dp.load(name)
   return STYLE | {"town_offset_mph": p.town_offset_mph, "fast_offset_mph": p.fast_offset_mph, "fast_zone_mph": p.fast_zone_mph,
                   "lat_accel": p.curve_lat_accel, "decel": p.stop_decel, "gap_s": p.follow_gap_s,
-                  "accel_max": min(p.launch_accel, STYLE["accel_max"])}, name
+                  "accel_max": min(p.launch_accel, STYLE["accel_max"]), "limit_offsets": dict(p.limit_offsets_mph),
+                  "lead_coast_s": p.lead_coast_s, "junction_mph": p.junction_turn_mph}, name
 
 
 def simulate_style(data: dict, style: dict | None = None, profile: str | None = None) -> dict:
   """The recorded route driven by openpilot longitudinal tuned to the driver's style: the posted limit (+ offset), the
   driver's lateral accel in curves, the driver's braking to each place the driver stopped (held as long), the
   driver's gap to the lead the recording saw at that spot, and the car's accel limit. Compared with the recorded speed
-  at the same place."""
+  at the same place. The rules are the car's own (profile_long.py): the MPC's gap from the profile's following gap,
+  per-limit offsets, no accelerating toward a slower lead inside lead_coast_s, the junction speed in signaled sharp
+  slow turns."""
   from openpilot.common.realtime import DT_MDL
+  from openpilot.sunnypilot.selfdrive.controls.lib import profile_long as pl
   base, profile_used = style_from_profile(profile)
   st = base | (style or {})
   frames = data["frames"]
@@ -802,6 +808,7 @@ def simulate_style(data: dict, style: dict | None = None, profile: str | None = 
     limit = fr.get("limit", 0.0)
     if limit > 0.0:
       off = st["fast_offset_mph"] if limit * MPH >= st["fast_zone_mph"] - 2 else st["town_offset_mph"]
+      off = st["limit_offsets"].get(str(int(round(limit * MPH / 5.0) * 5)), off)
       target, why = limit + off / MPH, "limit"
     else:
       target, why = max(fr["cs"][0], 5.0), "your speed (no limit)"
@@ -814,6 +821,11 @@ def simulate_style(data: dict, style: dict | None = None, profile: str | None = 
         if vc < target:
           target, why = vc, "curve"
       q += 1
+    # a signaled sharp slow turn under way: the driver's junction speed
+    if st["junction_mph"] > 0 and pl.junction_turn(fr["cs"][4], fr["cs"][5], v, curv[pk]):
+      vj = st["junction_mph"] / MPH
+      if vj < target:
+        target, why = vj, "junction"
     # the next place the driver stopped
     while si < len(stop_at) and stop_at[si][0] < s - 3.0 and hold == 0:
       si += 1
@@ -834,12 +846,14 @@ def simulate_style(data: dict, style: dict | None = None, profile: str | None = 
     present, d_rel, v_lead = (frames[ri]["lead"] + (0.0,))[:3]
     gap = s_of_frame[ri] + d_rel - s if present else 999.0
     if present and 0.0 < gap < 120:
-      want = st["standstill_gap_m"] + st["gap_s"] * v
+      want = pl.STOP_DISTANCE + pl.follow_t(st["gap_s"], v) * v
       vl = max(0.0, v_lead + 0.3 * (gap - want))
       if vl < target:
         target, why = vl, "lead"
 
     a_want = max(-st["decel_max"], min(st["accel_max"], (target - v) / 1.0))
+    if a_want > 0.0 and pl.lead_coast(st["lead_coast_s"], v, present and 0.0 < gap < 120, gap, v_lead - v):
+      a_want, why = 0.0, "coast"
     a_cmd = a_prev + (a_want - a_prev) * min(1.0, DT_MDL / 0.3)    # the planner's smoothing
     v = max(0.0, v + a_cmd * DT_MDL)
     if target == 0.0 and v < 0.3:

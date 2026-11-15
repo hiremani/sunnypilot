@@ -24,6 +24,13 @@ class TestProfileLong(unittest.TestCase):
     self.assertFalse(pl.lead_coast(0.0, v, True, 20.0, -3.0))                # off
     self.assertFalse(pl.lead_coast(4.5, 0.5, True, 5.0, -0.6))               # standing
 
+  def test_lead_coast_covers_pull_away(self):
+    # route f5 12.6 min, pulling away: 10.6 mph, lead 8 m ahead at 7.3 mph. With the measured 2.5 s this is coasting:
+    # no separate pull-away rule is needed (closing on a slower lead under 15 mph, the driver was on the accelerator
+    # only 1-12% of the time at any distance up to 30 m; behind a lead at our speed, down to ~4.5 m, like the MPC)
+    v = 10.6 * CV.MPH_TO_MS
+    self.assertTrue(pl.lead_coast(2.49, v, True, 8.0, (7.3 - 10.6) * CV.MPH_TO_MS))
+
   def test_junction_turn(self):
     self.assertTrue(pl.junction_turn(True, False, 4.0, 0.08))
     self.assertTrue(pl.junction_turn(False, True, 4.0, -0.08))
