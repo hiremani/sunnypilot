@@ -210,6 +210,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
   speedBump @11 :SpeedBump;
   signalCoast @12 :Bool;        # map caution: not accelerating toward a mapped traffic light (map_caution.py)
   crosswalkCaution @13 :Bool;   # map caution: capped for a marked crosswalk on a narrow street
+  wetRoad @14 :WetRoad;         # wet road (wet_road.py): rain from the wipers / traction control
 
   struct DynamicExperimentalControl {
     state @0 :DynamicExperimentalControlState;
@@ -312,6 +313,14 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     driverSpeed @7;    # driver profile (DriverProfileSpeed): posted limit + the driver's offset for it
     speedBump @8;      # Speed Bump Assist: easing off to a mapped bump's crossing speed
     crosswalk @9;      # map caution: a marked crosswalk ahead on a narrow street
+    wetRoad @10;       # wet road: at most the posted limit (+0 wet, -5 mph heavy rain)
+  }
+
+  struct WetRoad {
+    level @0 :UInt8;       # detected: 0 dry, 1 wet, 2 heavy rain
+    applied @1 :UInt8;     # what the planner uses (0 unless WetRoadAssist, or wet with WetRoadForce)
+    wiperSpeed @2 :UInt8;
+    tractionControlActive @3 :Bool;
   }
 
   struct SpeedBump {
@@ -501,6 +510,8 @@ struct BackupManagerSP @0xf98d843bfd7004a3 {
 
 struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
+  wiperSpeed @1 :UInt8;              # front wipers, wipes a minute (0 = off); wet road detection
+  tractionControlActive @2 :Bool;    # traction control stepping in
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

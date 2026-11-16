@@ -7,6 +7,7 @@ See the LICENSE.md file in the root directory for more details.
 from openpilot.cereal import log
 
 from openpilot.common.params import Params
+from openpilot.sunnypilot.selfdrive.controls.lib import wet_road
 from openpilot.common.realtime import DT_MDL
 
 
@@ -44,6 +45,7 @@ class AutoLaneChangeController:
 
     self.lane_change_set_timer = self.params.get("AutoLaneChangeTimer", return_default=True)
     self.lane_change_bsm_delay = False
+    self.wet_road_ok = True
 
     self.prev_brake_pressed = False
     self.auto_lane_change_allowed = False
@@ -61,6 +63,7 @@ class AutoLaneChangeController:
 
   def read_params(self) -> None:
     self.lane_change_bsm_delay = self.params.get_bool("AutoLaneChangeBsmDelay")
+    self.wet_road_ok = wet_road.lane_changes_and_turns_ok(self.params)   # no auto lane change in heavy rain
     self.lane_change_set_timer = self.params.get("AutoLaneChangeTimer", return_default=True)
 
   def update_params(self) -> None:
@@ -87,6 +90,9 @@ class AutoLaneChangeController:
     # 3. We've waited long enough
 
     if self.lane_change_set_timer in (AutoLaneChangeMode.OFF, AutoLaneChangeMode.NUDGE):
+      return False
+
+    if not self.wet_road_ok:
       return False
 
     if self.prev_brake_pressed:

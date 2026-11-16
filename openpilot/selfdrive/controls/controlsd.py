@@ -25,6 +25,7 @@ from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile
 from openpilot.sunnypilot.selfdrive.controls.lib.turn_planner import TurnPlanner
+from openpilot.sunnypilot.selfdrive.controls.lib import wet_road
 from openpilot.sunnypilot.selfdrive.controls.lib.narrow_street import PARAM as NARROW_PARAM, CenterLineKeeper
 from openpilot.common.gps import get_gps_location_service
 
@@ -64,6 +65,7 @@ class Controls(ControlsExt):
     # MapTurnAssist and LaneTurnDesire are set; re-read about once a second.
     self.turn_planner = TurnPlanner()
     self.map_turn_assist = False
+    self.map_turn_wet_ok = True
     self.map_turn_curvature: float | None = None
     self._turn_param_frame = 0
     # Center-line keeper (narrow_street.py): with NarrowStreetAssist, keep the car's left side off a seen left line by
@@ -94,10 +96,14 @@ class Controls(ControlsExt):
     if self._turn_param_frame % 100 == 0:
       try:   # never let a params problem (e.g. code newer than the built params) take controlsd down
         self.map_turn_assist = self.params.get_bool("MapTurnAssist") and self.params.get_bool("LaneTurnDesire")
-        if self.map_turn_assist:
-          self.turn_planner.roads_src.warm()   # the map worker reads the road tiles, never controlsd
+        self.map_turn_wet_ok = wet_road.lane_changes_and_turns_ok(self.params)
       except Exception:
         self.map_turn_assist = False
+      if self.map_turn_assist:
+        try:   # the map worker reads the road tiles, never controlsd; a worker problem must not switch turns off
+          self.turn_planner.roads_src.warm()
+        except Exception:
+          cloudlog.exception("map worker warm-up failed")
       try:   # separately: an unknown key here must not switch the map turn assist off
         self.narrow_street_assist = self.params.get_bool(NARROW_PARAM)
       except Exception:
@@ -113,6 +119,8 @@ class Controls(ControlsExt):
     self.map_turn_curvature = None
     if not self.map_turn_assist:
       return None
+    if not self.map_turn_wet_ok and self.turn_planner.state == "idle":
+      return None   # heavy rain: no new turns (one already under way is finished, never dropped halfway)
     try:
       self.map_turn_curvature = self.turn_planner.update(DT_CTRL, CS.vEgo, CS.yawRate, CS.leftBlinker, CS.rightBlinker,
                                                          CC.latActive, CS.steeringPressed, self.sm[self.gps_service],

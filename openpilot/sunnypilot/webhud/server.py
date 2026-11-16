@@ -90,6 +90,8 @@ PARAM_ALLOWLIST: dict[str, tuple[type, Callable[[int], bool] | None]] = {
   # map caution (map_caution.py): no accelerating toward a mapped traffic light; slow for crosswalks on narrow streets
   "TrafficSignalCoast": (bool, None),
   "CrosswalkCaution": (bool, None),
+  "WetRoadAssist": (bool, None),
+  "WetRoadForce": (bool, None),
   # sunnypilot's e2e chimes while stopped and not engaged: the car ahead pulled away / the model sees the way clear
   "LeadDepartAlert": (bool, None),
   "GreenLightAlert": (bool, None),

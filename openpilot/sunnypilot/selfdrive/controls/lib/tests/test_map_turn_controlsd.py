@@ -19,8 +19,11 @@ class FakeParams:
       raise KeyError(key)
     return self.values[key]
 
+  def get(self, key, return_default=False):
+    return self.values.get(key, 0)
 
-def controls(params, planner_out=0.05, raises=False):
+
+def controls(params, planner_out=0.05, raises=False, state="idle"):
   c = Controls.__new__(Controls)   # just the map-turn hook, without the rest of controlsd
   c.params, c.gps_service, c._turn_param_frame = params, "gpsLocationExternal", 0
   c.map_turn_assist, c.map_turn_curvature = False, None
@@ -30,7 +33,7 @@ def controls(params, planner_out=0.05, raises=False):
     if raises:
       raise RuntimeError("boom")
     return planner_out
-  c.turn_planner = SimpleNamespace(update=update)
+  c.turn_planner = SimpleNamespace(update=update, state=state)
   return c
 
 
@@ -43,6 +46,13 @@ class TestMapTurnHook(unittest.TestCase):
     self.assertIsNone(controls(FakeParams(MapTurnAssist=False, LaneTurnDesire=True)).update_map_turn(CS, CC))
     self.assertIsNone(controls(FakeParams(MapTurnAssist=True, LaneTurnDesire=False)).update_map_turn(CS, CC))
     self.assertEqual(controls(FakeParams(MapTurnAssist=True, LaneTurnDesire=True)).update_map_turn(CS, CC), 0.05)
+
+  def test_heavy_rain_starts_no_new_turn_but_finishes_one_under_way(self):
+    p = FakeParams(MapTurnAssist=True, LaneTurnDesire=True, WetRoadLevel=2)
+    self.assertIsNone(controls(p).update_map_turn(CS, CC))
+    self.assertEqual(controls(p, state="turning").update_map_turn(CS, CC), 0.05)
+    self.assertEqual(controls(FakeParams(MapTurnAssist=True, LaneTurnDesire=True, WetRoadLevel=1)).update_map_turn(CS, CC),
+                     0.05)
 
   def test_unknown_param_means_off_not_a_crash(self):
     self.assertIsNone(controls(FakeParams(LaneTurnDesire=True)).update_map_turn(CS, CC))

@@ -123,6 +123,8 @@ def summarize(root: str, route: str) -> dict:
 
   # rlogs: the planners' own log events
   turns, stops, bumps = [], defaultdict(dict), defaultdict(dict)
+  wet_changes: list[tuple[float, str, str, int]] = []   # (t, level, applied, wiper)
+  t_end = 0.0
   errors: Counter = Counter()
   cur_turn = None
   for seg in _segments(root, route):
@@ -137,6 +139,7 @@ def summarize(root: str, route: str) -> dict:
       except ValueError:
         continue
       msg, t = j.get("msg"), m.logMonoTime * 1e-9 - t0
+      t_end = max(t_end, t)
       noise = (isinstance(msg, dict) and msg.get("event") in STARTUP_NOISE_EVENTS) or \
         any(x in str(msg) for x in STARTUP_NOISE_TEXT)
       if j.get("levelnum", 0) >= 40 and not noise:
@@ -166,6 +169,8 @@ def summarize(root: str, route: str) -> dict:
           s["left_to_driver"] = msg.get("why")
         else:
           s.setdefault("states", []).append(msg.get("state"))
+      elif ev == "wet_road":
+        wet_changes.append((t, msg.get("level", "dry"), msg.get("applied", "dry"), msg.get("wiper") or 0))
       elif ev in ("speed_bump", "speed_bump_left_to_driver"):
         bump = msg.get("bump")
         if bump is None:
@@ -194,10 +199,25 @@ def summarize(root: str, route: str) -> dict:
     "map_turns": turns,
     "stop_signs": list(stops.values()),
     "speed_bumps": list(bumps.values()),
+    "wet_road": wet_summary(wet_changes, t_end),
     "errors": [{"process": d, "msg": msg, "n": n} for (d, msg), n in errors.most_common(10)],
   }
   out["headline"] = headline(out)
   return out
+
+
+def wet_summary(changes: list[tuple[float, str, str, int]], t_end: float) -> dict:
+  """Minutes in each wet road level from the planner's wet_road events (one per change)."""
+  mins = {"wet": 0.0, "heavy": 0.0, "applied": 0.0}
+  for i, (t, level, applied, _) in enumerate(changes):
+    t_next = changes[i + 1][0] if i + 1 < len(changes) else t_end
+    dur = max(t_next - t, 0.0) / 60
+    if level in mins:
+      mins[level] += dur
+    if applied != "dry":
+      mins["applied"] += dur
+  return {"wet_min": round(mins["wet"], 1), "heavy_min": round(mins["heavy"], 1), "applied_min": round(mins["applied"], 1),
+          "max_wiper": max((c[3] for c in changes), default=0)}
 
 
 def headline(s: dict) -> list[str]:
@@ -214,6 +234,10 @@ def headline(s: dict) -> list[str]:
   if s["speed_bumps"]:
     shadow = all(b.get("shadow") for b in s["speed_bumps"])
     lines.append(f"{len(s['speed_bumps'])} speed bumps {'seen (log only)' if shadow else 'eased for'}")
+  wet = s.get("wet_road") or {}
+  if wet.get("wet_min", 0) + wet.get("heavy_min", 0) > 0:
+    how = "driven cautiously" if wet.get("applied_min", 0) > 0 else "log only"
+    lines.append(f"wet road {wet['wet_min']} min, heavy rain {wet['heavy_min']} min ({how})")
   if s["stop_signs"]:
     lines.append(f"{len(s['stop_signs'])} stop signs approached")
   if s["errors"]:

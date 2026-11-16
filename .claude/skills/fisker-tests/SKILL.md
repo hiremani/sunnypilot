@@ -12,6 +12,9 @@ The Mac venvs have no pytest; use unittest.
 - sunnypilot (from `openpilot/`):
   `PYTHONPATH=.:../opendbc_repo ../.venv/bin/python -m unittest <module>` for example
   `sunnypilot.selfdrive.controls.lib.tests.test_turn_planner`, `...test_driver_profile`, `...test_profile_long`, `...test_map_turn_controlsd`, `...test_narrow_street`, `sunnypilot.webhud.tests.test_server`, `sunnypilot.tools.tests.test_fisker_drive_review`, `sunnypilot.tools.drive_sim` tests.
+- All of `sunnypilot/selfdrive/controls/lib/tests/` at once (zsh; that folder has no `__init__.py`, so `unittest discover`
+  silently skips it and its "OK" does NOT cover the map, worker, wet road, speed bump or turn tests):
+  `mods=(${(f)"$(ls sunnypilot/selfdrive/controls/lib/tests/test_*.py | sed 's|/|.|g; s|\.py$||')"}); ../.venv/bin/python -m unittest $mods sunnypilot.selfdrive.controls.lib.stop_sign.tests.test_stop_sign`
 - Lint: `../.venv/bin/ruff check <paths>` (openpilot), `.venv/bin/ruff check opendbc/car/fisker/` (opendbc).
 
 `test_map_turn_controlsd` prints a "RuntimeError: boom" traceback on purpose (it checks controlsd falls back to the model when the planner fails).

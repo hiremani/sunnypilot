@@ -7,7 +7,7 @@ See the LICENSE.md file in the root directory for more details.
 
 import time
 
-from openpilot.cereal import messaging, custom
+from openpilot.cereal import messaging, custom, log
 from opendbc.car import structs
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
@@ -23,6 +23,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller 
 from openpilot.sunnypilot.selfdrive.controls.lib.cpu_budget import CpuBudget
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_bump import SpeedBumpAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.map_caution import MapCaution
+from openpilot.sunnypilot.selfdrive.controls.lib.wet_road import WetRoad
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T_FOLLOW
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile, narrow_street, profile_long
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
@@ -68,6 +70,9 @@ class LongitudinalPlannerSP:
     self.budget_stop_shadow = CpuBudget("stop_sign_shadow")
     self.budget_bump_shadow = CpuBudget("speed_bump_shadow", on_pause=self._bump_shadow_quiet)
     self.budget_map_caution = CpuBudget("map_caution", on_pause=self._map_caution_neutral)
+    # Wet road (wet_road.py): rain from the wipers and traction control; changes only settings the planner already has
+    self.wet = WetRoad()
+    self.personality = log.LongitudinalPersonality.standard
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
     # Narrow streets (narrow_street.py): always detected and published; the speed cap only with NarrowStreetAssist
     # and openpilot longitudinal. Re-read the param about once a second.
@@ -139,20 +144,27 @@ class LongitudinalPlannerSP:
       except Exception:
         cloudlog.exception("speed bump shadow update failed")
 
+    try:
+      cs_sp = sm['carStateSP']
+      self.wet.update(cs_sp.wiperSpeed, cs_sp.tractionControlActive, DT_MDL)
+    except Exception:
+      cloudlog.exception("wet road update failed")
+    self.personality = sm['selfdriveState'].personality
+
     if self._narrow_param_frame % 20 == 0:
       try:
         self.narrow_enabled = Params().get_bool(narrow_street.PARAM)
       except Exception:
         self.narrow_enabled = False
-    if self._narrow_param_frame % 100 == 0:
+    if self._narrow_param_frame % 100 == 0 or self.wet.changed:
       self.profile = driver_profile.active()
       self.profile_on = driver_profile.is_on()
       self.profile_speed_on = self.profile_on and driver_profile.is_on(param=driver_profile.SPEED_PARAM)
       self.narrow_speed = self.profile.narrow_speed_mph * CV.MPH_TO_MS
       for ss in (self.stop_sign, self.stop_sign_shadow):
         if ss is not None:
-          ss.set_profile(self.profile.stop_decel, self.profile.coast_s)
-      self.scc.vision.set_lat_accel_max(self.profile.curve_lat_accel)
+          ss.set_profile(min(self.profile.stop_decel, self.wet.stop_decel()), self.profile.coast_s)
+      self.scc.vision.set_lat_accel_max(self.profile.curve_lat_accel * self.wet.curve_factor())
     self._narrow_param_frame += 1
     try:
       self.narrow_street = self.narrow.update(sm['modelV2'], v_ego)
@@ -198,6 +210,12 @@ class LongitudinalPlannerSP:
         if v_cap is not None:
           targets[LongitudinalPlanSource.driverSpeed] = (v_cap, profile_long.PROFILE_SPEED_ACCEL if v_ego > v_cap + 0.5 else a_ego)
 
+    # wet road: cruise no faster than the posted limit + the level's offset
+    wet_offset = self.wet.speed_offset_mph()
+    if wet_offset is not None and self.openpilot_long and self.resolver.speed_limit_valid:
+      v_wet = max(self.resolver.speed_limit + wet_offset * CV.MPH_TO_MS, 0.0)
+      targets[LongitudinalPlanSource.wetRoad] = (v_wet, profile_long.PROFILE_SPEED_ACCEL if v_ego > v_wet + 0.5 else a_ego)
+
     self.source = min(targets, key=lambda k: targets[k][0])
     self.output_v_target, self.output_a_target = targets[self.source]
     return self.output_v_target, self.output_a_target
@@ -212,14 +230,21 @@ class LongitudinalPlannerSP:
       self.map_caution.v_target = float('inf')
 
   def t_follow(self, v_ego: float) -> float | None:
-    """The MPC's following gap from the driver profile, or None for the personality's."""
-    if not (self.profile_on and self.openpilot_long):
+    """The MPC's following gap from the driver profile, or None for the personality's; longer on a wet road."""
+    if not self.openpilot_long:
       return None
-    return profile_long.follow_t(self.profile.follow_gap_s, v_ego)
+    factor = self.wet.gap_factor()
+    if self.profile_on:
+      return profile_long.follow_t(self.profile.follow_gap_s * factor, v_ego)
+    if factor == 1.0:
+      return None
+    return get_T_FOLLOW(self.personality) * factor
 
   def map_accel_cap(self) -> float:
-    """No accelerating toward a mapped traffic light (map caution); inf when it doesn't limit."""
-    return self.map_caution.accel_cap() if self.map_caution is not None else float('inf')
+    """No accelerating toward a mapped traffic light (map caution), a softer pull-away on a wet road; inf when neither
+    limits."""
+    cap = self.map_caution.accel_cap() if self.map_caution is not None else float('inf')
+    return min(cap, self.wet.accel_max()) if self.openpilot_long else cap
 
   def lead_coast_cap(self, sm: messaging.SubMaster, v_ego: float) -> float:
     """The most acceleration the driver profile allows: none toward a slower lead inside the coasting gap, and the
@@ -249,6 +274,11 @@ class LongitudinalPlannerSP:
     longitudinalPlanSP.events = self.events_sp.to_msg()
     longitudinalPlanSP.narrowStreet = bool(self.narrow_street)
     longitudinalPlanSP.leadCoast = bool(self.lead_coasting)
+    wet = longitudinalPlanSP.wetRoad
+    wet.level = self.wet.level
+    wet.applied = self.wet.applied
+    wet.wiperSpeed = min(self.wet.wiper, 255)
+    wet.tractionControlActive = self.wet.tcs
     if self.map_caution is not None:
       longitudinalPlanSP.signalCoast = bool(self.map_caution.signal_coast)
       longitudinalPlanSP.crosswalkCaution = bool(self.map_caution.crosswalk_caution)
