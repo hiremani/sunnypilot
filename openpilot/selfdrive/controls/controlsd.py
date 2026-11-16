@@ -94,6 +94,8 @@ class Controls(ControlsExt):
     if self._turn_param_frame % 100 == 0:
       try:   # never let a params problem (e.g. code newer than the built params) take controlsd down
         self.map_turn_assist = self.params.get_bool("MapTurnAssist") and self.params.get_bool("LaneTurnDesire")
+        if self.map_turn_assist:
+          self.turn_planner.roads_src.warm()   # the map worker reads the road tiles, never controlsd
       except Exception:
         self.map_turn_assist = False
       try:   # separately: an unknown key here must not switch the map turn assist off

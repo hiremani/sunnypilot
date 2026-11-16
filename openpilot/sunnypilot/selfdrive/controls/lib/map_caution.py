@@ -18,8 +18,6 @@ for openpilot longitudinal. Each is off unless its param is set.
 import json
 import math
 import os
-import threading
-import time
 from dataclasses import dataclass
 
 from openpilot.common.constants import CV
@@ -27,9 +25,9 @@ from openpilot.common.gps import get_gps_location_service
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
-from openpilot.sunnypilot.selfdrive.controls.lib.map_near import REFRESH_M, NearCache
+from openpilot.sunnypilot.selfdrive.controls.lib.map_near import REFRESH_M, CellMap
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
-from openpilot.sunnypilot.webhud.maptiles import FEAT_DEG, MapFeatures
+from openpilot.sunnypilot.webhud.maptiles import MapFeatures
 
 SIGNAL_PARAM = "TrafficSignalCoast"
 CROSSWALK_PARAM = "CrosswalkCaution"
@@ -99,56 +97,30 @@ def find_point_ahead(lat: float, lon: float, bearing_deg: float, points, kind: s
   return best
 
 
-class PointMap:
-  """Signals and crosswalks in the 3 x 3 feature cells around the car, loaded in the background."""
+class PointMap(CellMap):
+  """Signals and crosswalks in the 3 x 3 feature cells around the car (map_near.CellMap; read in the map worker on the
+  device)."""
+  KIND = "points"
+  RETRY_S = RETRY_S
 
   def __init__(self, features: MapFeatures | None = None):
+    super().__init__(SIGNAL_MAX_M + REFRESH_M + 10.0, use_worker=features is None)
     self.features = features or MapFeatures()
-    self._cells: dict[tuple[int, int], list[MapPoint]] = {}
-    self._pending: set[tuple[int, int]] = set()
-    self._failed: dict[tuple[int, int], float] = {}
-    self._lock = threading.Lock()
-    self._version = 0
-    self._near = NearCache(SIGNAL_MAX_M + REFRESH_M + 10.0)
+    if self._worker is not None:
+      self._worker.start()
 
-  def _load(self, key: tuple[int, int]) -> None:
-    points = None
-    try:
+  def _compute(self, key: tuple[int, int], cell: dict | None = None) -> list[MapPoint] | None:
+    if cell is None:
       path = self.features.cell_path(*key)
-      if path is not None and os.path.isfile(path):
-        with open(path) as f:
-          points = points_from_cell(json.load(f))
-    except Exception:
-      cloudlog.exception(f"map caution: loading feature cell {key} failed")
-    with self._lock:
-      self._pending.discard(key)
-      if points is not None:
-        self._version += 1
-        self._cells[key] = points
-        self._failed.pop(key, None)
-      else:
-        self._failed[key] = time.monotonic()
+      if path is None or not os.path.isfile(path):
+        return None
+      with open(path) as f:
+        cell = json.load(f)
+    return points_from_cell(cell)
 
   def points_near(self, lat: float, lon: float) -> list[MapPoint]:
-    """The loaded MapPoints near the car (map_near.NearCache): rebuilt every REFRESH_M or so, not every tick."""
-    cell = (math.floor(lat / FEAT_DEG), math.floor(lon / FEAT_DEG))
-    return self._near.get(lat, lon, cell, self._version, lambda: self._all_near(lat, lon))
-
-  def _all_near(self, lat: float, lon: float) -> list[MapPoint]:
-    klat, klon = math.floor(lat / FEAT_DEG), math.floor(lon / FEAT_DEG)
-    out: list[MapPoint] = []
-    with self._lock:
-      for key in [(klat + i, klon + j) for i in (-1, 0, 1) for j in (-1, 0, 1)]:
-        if key in self._cells:
-          out.extend(self._cells[key])
-        elif key not in self._pending and time.monotonic() - self._failed.get(key, -RETRY_S) >= RETRY_S:
-          self._pending.add(key)
-          threading.Thread(target=self._load, args=(key,), daemon=True).start()
-      if len(self._cells) > 64:
-        for key in [k for k in self._cells if abs(k[0] - klat) > 3 or abs(k[1] - klon) > 3]:
-          del self._cells[key]
-          self._version += 1
-    return out
+    """The loaded points near the car (rebuilt every REFRESH_M or so, not every tick)."""
+    return self.near(lat, lon)
 
 
 class MapCaution:

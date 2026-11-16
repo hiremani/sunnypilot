@@ -29,6 +29,7 @@ thread: update() never blocks. RoadSource(sync=True) reads inline, for the simul
 import math
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -90,6 +91,7 @@ MAX_CURVATURE = 0.2             # 1/m (drive_helpers)
 LOG_TICK_S = 0.5                # armed or turning: a "map_turn_tick" log event this often (state changes log at once)
 
 LOCAL_RADIUS_M = 250.0          # road ways within this of the load point are kept in local coordinates
+LOAD_RETRY_S = 2.0              # s: wait this long after a road load that found nothing
 RELOAD_M = 120.0                # reload once the car is this far from the load point
 
 
@@ -384,9 +386,10 @@ def read_local_roads(root: str, lat: float, lon: float, radius: float = LOCAL_RA
 
 
 class RoadSource:
-  """LocalRoads around the car, (re)loaded on a background thread as it moves. get() never blocks unless sync."""
+  """LocalRoads around the car, (re)loaded in the map worker process as it moves (a thread with use_worker=False).
+  get() never blocks unless sync."""
 
-  def __init__(self, root: str | None = None, sync: bool = False):
+  def __init__(self, root: str | None = None, sync: bool = False, use_worker: bool = True):
     if root is None:
       from openpilot.common.hardware.hw import Paths
       root = os.path.join(Paths.mapd_root(), "offline")
@@ -395,6 +398,29 @@ class RoadSource:
     self.roads: LocalRoads | None = None
     self._loading = False
     self._lock = threading.Lock()
+    # on the device the tiles are read in the map worker process (map_worker.py), never on a controlsd thread
+    self.use_worker = not sync and use_worker
+    self._worker = None
+    self._retry_at = 0.0    # after a load that found nothing, don't ask again every tick
+
+  def warm(self) -> None:
+    """Start the map worker before the first turn needs it."""
+    if self.use_worker:
+      self._get_worker().start()
+
+  def _get_worker(self):
+    if self._worker is None:
+      from openpilot.sunnypilot.selfdrive.controls.lib.map_worker import MapWorker
+      self._worker = MapWorker.shared()
+    return self._worker
+
+  def _loaded(self, roads) -> None:
+    with self._lock:
+      if roads is not None:
+        self.roads = roads
+      else:
+        self._retry_at = time.monotonic() + LOAD_RETRY_S
+      self._loading = False
 
   def _load(self, lat: float, lon: float) -> None:
     roads = None
@@ -412,13 +438,16 @@ class RoadSource:
     with self._lock:
       roads = self.roads
       fresh = roads is not None and math.hypot(*roads.to_xy(lat, lon)) <= RELOAD_M
-      if fresh or self._loading:
+      if fresh or self._loading or time.monotonic() < self._retry_at:
         return roads if roads is not None and math.hypot(*roads.to_xy(lat, lon)) <= LOCAL_RADIUS_M else None
       self._loading = True
     if self.sync:
       self._load(lat, lon)
       return self.roads
-    threading.Thread(target=self._load, args=(lat, lon), daemon=True).start()
+    if self.use_worker:
+      self._get_worker().request_roads(self.root, lat, lon, self._loaded)
+    else:
+      threading.Thread(target=self._load, args=(lat, lon), daemon=True).start()
     return roads if roads is not None and math.hypot(*roads.to_xy(lat, lon)) <= LOCAL_RADIUS_M else None
 
 

@@ -14,6 +14,10 @@ def ll(x, y):
   return LAT0 + math.degrees(y / map_near.EARTH_R), LON0 + math.degrees(x / (map_near.EARTH_R * math.cos(math.radians(LAT0))))
 
 
+def _xy(p, lat, lon):
+  return (math.radians(p.lon - lon) * math.cos(math.radians(lat)) * map_near.EARTH_R, math.radians(p.lat - lat) * map_near.EARTH_R)
+
+
 class TestNearCache(unittest.TestCase):
   def setUp(self):
     rng = random.Random(7)
@@ -56,12 +60,29 @@ class TestMapsUseIt(unittest.TestCase):
     lat, lon = ll(0.0, 0.0)
     self.assertEqual(m.signs_near(lat, lon), [])
     sign = type("S", (), {"lat": ll(0, 100)[0], "lon": lon, "node_id": 1})()
-    key = (math.floor(lat / 0.05), math.floor(lon / 0.05))
-    with m._lock:
-      m._cells[key] = [sign]
-      m._version += 1
+    m._store((math.floor(lat / 0.05), math.floor(lon / 0.05)), [sign])
     self.assertEqual(m.signs_near(lat, lon), [sign])
     self.assertGreater(m._near.radius_m, STOP_LOOKAHEAD_M + map_near.REFRESH_M)
+
+  def test_the_bucket_index_keeps_what_the_radius_needs(self):
+    m = StopSignMap(features=type("F", (), {"root": "/nonexistent", "cell_path": lambda *a: None})(), geometry=object())
+    rng = random.Random(3)
+    lat0, lon0 = ll(0.0, 0.0)
+    signs = [MapPoint(i, lat0 + rng.uniform(-0.07, 0.07), lon0 + rng.uniform(-0.07, 0.07), "signal") for i in range(6000)]
+    by_cell = {}
+    for p in signs:
+      by_cell.setdefault((math.floor(p.lat / 0.05), math.floor(p.lon / 0.05)), []).append(p)
+    for key, ps in by_cell.items():
+      m._store(key, ps)
+    r = m._near.radius_m
+    for k in range(200):
+      lat, lon = ll(rng.uniform(-2000, 2000), rng.uniform(-2000, 2000))
+      got = {p.node_id for p in m._gather(lat, lon, (math.floor(lat / 0.05), math.floor(lon / 0.05)))}
+      want = {p.node_id for p in signs if math.hypot(*_xy(p, lat, lon)) <= r}
+      self.assertTrue(want <= got, k)
+      self.assertLess(len(got), 300)
+    m._store(next(iter(by_cell)), [])          # a cell re-read empty: its points are gone from the index
+    self.assertFalse(any(next(iter(by_cell)) in d for d in m._grid.values()))
 
   def test_radii_cover_each_lookahead(self):
     bm = sb.SpeedBumpMap(features=type("F", (), {"root": "/nonexistent", "cell_path": lambda *a: None})())

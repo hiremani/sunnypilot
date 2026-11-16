@@ -20,6 +20,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_crui
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import StopSignAssist
+from openpilot.sunnypilot.selfdrive.controls.lib.cpu_budget import CpuBudget
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_bump import SpeedBumpAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.map_caution import MapCaution
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile, narrow_street, profile_long
@@ -62,6 +63,11 @@ class LongitudinalPlannerSP:
       self.map_caution = MapCaution() if CP.openpilotLongitudinalControl else None
     except Exception:
       cloudlog.exception("map caution unavailable")
+    # CPU budgets (cpu_budget.py): an extra that runs long is paused, never the planner. Map caution can cap the speed,
+    # so a pause leaves it neutral.
+    self.budget_stop_shadow = CpuBudget("stop_sign_shadow")
+    self.budget_bump_shadow = CpuBudget("speed_bump_shadow", on_pause=self._bump_shadow_quiet)
+    self.budget_map_caution = CpuBudget("map_caution", on_pause=self._map_caution_neutral)
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
     # Narrow streets (narrow_street.py): always detected and published; the speed cap only with NarrowStreetAssist
     # and openpilot longitudinal. Re-read the param about once a second.
@@ -118,7 +124,7 @@ class LongitudinalPlannerSP:
     # take the planner down with it.
     if self.stop_sign_shadow is not None:
       try:
-        self.stop_sign_shadow.update(sm, True, False, sm['carState'].vEgo, a_ego, now_s)
+        self.budget_stop_shadow.run(self.stop_sign_shadow.update, sm, True, False, sm['carState'].vEgo, a_ego, now_s)
       except Exception:
         cloudlog.exception("stop sign shadow update failed")
     if self.speed_bump is not None:
@@ -129,7 +135,7 @@ class LongitudinalPlannerSP:
         cloudlog.exception("speed bump update failed")
     if self.speed_bump_shadow is not None:
       try:
-        self.speed_bump_shadow.update(sm, True, False, sm['carState'].vEgo, a_ego, now_s)
+        self.budget_bump_shadow.run(self.speed_bump_shadow.update, sm, True, False, sm['carState'].vEgo, a_ego, now_s)
       except Exception:
         cloudlog.exception("speed bump shadow update failed")
 
@@ -156,10 +162,11 @@ class LongitudinalPlannerSP:
 
     if self.map_caution is not None:
       try:
-        self.map_caution.update(sm, long_enabled, long_override, v_ego, a_ego, self.narrow_street, now_s)
+        if not self.budget_map_caution.run(self.map_caution.update, sm, long_enabled, long_override, v_ego, a_ego,
+                                           self.narrow_street, now_s):
+          self._map_caution_neutral()
       except Exception:
-        self.map_caution.signal_coast = self.map_caution.crosswalk_caution = False
-        self.map_caution.v_target = float('inf')
+        self._map_caution_neutral()
         cloudlog.exception("map caution update failed")
 
     targets = {
@@ -194,6 +201,15 @@ class LongitudinalPlannerSP:
     self.source = min(targets, key=lambda k: targets[k][0])
     self.output_v_target, self.output_a_target = targets[self.source]
     return self.output_v_target, self.output_a_target
+
+  def _bump_shadow_quiet(self) -> None:
+    if self.speed_bump_shadow is not None:
+      self.speed_bump_shadow.warn = False
+
+  def _map_caution_neutral(self) -> None:
+    if self.map_caution is not None:
+      self.map_caution.signal_coast = self.map_caution.crosswalk_caution = False
+      self.map_caution.v_target = float('inf')
 
   def t_follow(self, v_ego: float) -> float | None:
     """The MPC's following gap from the driver profile, or None for the personality's."""

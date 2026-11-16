@@ -36,8 +36,6 @@ beside the cached map data, out of git):
 import json
 import math
 import os
-import threading
-import time
 from dataclasses import dataclass
 from enum import IntEnum
 
@@ -46,7 +44,7 @@ from openpilot.common.gps import get_gps_location_service
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
-from openpilot.sunnypilot.selfdrive.controls.lib.map_near import REFRESH_M, NearCache
+from openpilot.sunnypilot.selfdrive.controls.lib.map_near import REFRESH_M, CellMap
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 from openpilot.sunnypilot.webhud.maptiles import FEAT_DEG, MapFeatures
@@ -157,66 +155,37 @@ def find_bump_ahead(lat: float, lon: float, bearing_deg: float, bumps, skip_ids=
   return best
 
 
-class SpeedBumpMap:
-  """The bumps in the 3 x 3 feature cells around the car, loaded in the background."""
+class SpeedBumpMap(CellMap):
+  """The bumps in the 3 x 3 feature cells around the car (map_near.CellMap; read in the map worker on the device)."""
+  KIND = "bumps"
+  RETRY_S = RETRY_S
 
   def __init__(self, features: MapFeatures | None = None):
+    super().__init__(LOOKAHEAD_M + REFRESH_M + 10.0, use_worker=features is None)
     self.features = features or MapFeatures()
-    self._cells: dict[tuple[int, int], list[SpeedBump]] = {}
-    self._pending: set[tuple[int, int]] = set()
-    self._failed: dict[tuple[int, int], float] = {}
-    self._lock = threading.Lock()
-    self._version = 0
-    self._near = NearCache(LOOKAHEAD_M + REFRESH_M + 10.0)
     self.local_path = os.path.join(os.path.dirname(os.path.normpath(self.features.root)), LOCAL_FILE)
+    if self._worker is not None:
+      self._worker.start()
 
-  def _load(self, key: tuple[int, int]) -> None:
-    bumps = None
-    try:
+  def _compute(self, key: tuple[int, int], cell: dict | None = None) -> list[SpeedBump] | None:
+    if cell is None:
       path = self.features.cell_path(*key)
-      if path is not None and os.path.isfile(path):
-        with open(path) as f:
-          bumps = bumps_from_cell(json.load(f))
-        try:
-          added, ignore = local_bumps(self.local_path)
-        except Exception:
-          cloudlog.exception(f"speed bump: reading {self.local_path} failed")
-          added, ignore = [], set()
-        bumps = [b for b in bumps if b.node_id not in ignore]
-        bumps += [b for b in added if (math.floor(b.lat / FEAT_DEG), math.floor(b.lon / FEAT_DEG)) == key]
+      if path is None or not os.path.isfile(path):
+        return None
+      with open(path) as f:
+        cell = json.load(f)
+    bumps = bumps_from_cell(cell)
+    try:
+      added, ignore = local_bumps(self.local_path)
     except Exception:
-      cloudlog.exception(f"speed bump: loading feature cell {key} failed")
-      bumps = None
-    with self._lock:
-      self._pending.discard(key)
-      if bumps is not None:
-        self._version += 1
-        self._cells[key] = bumps
-        self._failed.pop(key, None)
-      else:
-        self._failed[key] = time.monotonic()
+      cloudlog.exception(f"speed bump: reading {self.local_path} failed")
+      added, ignore = [], set()
+    bumps = [b for b in bumps if b.node_id not in ignore]
+    return bumps + [b for b in added if (math.floor(b.lat / FEAT_DEG), math.floor(b.lon / FEAT_DEG)) == key]
 
   def bumps_near(self, lat: float, lon: float) -> list[SpeedBump]:
-    """The loaded SpeedBumps near the car (map_near.NearCache): rebuilt every REFRESH_M or so, not every tick."""
-    cell = (math.floor(lat / FEAT_DEG), math.floor(lon / FEAT_DEG))
-    return self._near.get(lat, lon, cell, self._version, lambda: self._all_near(lat, lon))
-
-  def _all_near(self, lat: float, lon: float) -> list[SpeedBump]:
-    klat, klon = math.floor(lat / FEAT_DEG), math.floor(lon / FEAT_DEG)
-    keys = [(klat + i, klon + j) for i in (-1, 0, 1) for j in (-1, 0, 1)]
-    out: list[SpeedBump] = []
-    with self._lock:
-      for key in keys:
-        if key in self._cells:
-          out.extend(self._cells[key])
-        elif key not in self._pending and time.monotonic() - self._failed.get(key, -RETRY_S) >= RETRY_S:
-          self._pending.add(key)
-          threading.Thread(target=self._load, args=(key,), daemon=True).start()
-      if len(self._cells) > 64:
-        for key in [k for k in self._cells if abs(k[0] - klat) > 3 or abs(k[1] - klon) > 3]:
-          del self._cells[key]
-          self._version += 1
-    return out
+    """The loaded bumps near the car (rebuilt every REFRESH_M or so, not every tick)."""
+    return self.near(lat, lon)
 
 
 def easing_v_target(dist: float, v_cross: float, v_ego: float, a: float = A_EASE) -> float:

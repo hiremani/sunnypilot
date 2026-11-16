@@ -6,13 +6,13 @@ See the LICENSE.md file in the root directory for more details.
 
 Stop signs near the car, from the OpenStreetMap point features the webhud already caches (webhud/maptiles.py
 MapFeatures: highway=stop nodes, FEAT_DEG cells under <mapd root>/features/). Cells load, and download when
-missing, on a background thread, so the 20 Hz planner never waits on disk or the network.
+missing, in the map worker process (map_worker.py), so the 20 Hz planner never waits on disk, the network or the
+road-tile geometry.
 
 A sign that clearly holds another direction of travel (stop_sign_direction.py: its direction tag, or the road it
 sits on in mapd's road tiles, road_geometry.py) is skipped; one that can't be told apart is kept as before. That
-includes a stop=all node with an explicit forward/backward: it is one approach's node of an all-way stop. A cell's
-signs are usable as soon as the cell is read; the road-tile lookup that follows, on the same background thread,
-only adds the approaches it could resolve.
+includes a stop=all node with an explicit forward/backward: it is one approach's node of an all-way stop. The
+road-tile lookup runs as the cell is read and only adds the approaches it could resolve.
 
 Signs OpenStreetMap is missing can be added in <mapd root>/local_stop_signs.json (kept beside the cached map data, out of
 git, since it holds the driver's own streets):
@@ -24,12 +24,10 @@ traffic it holds. Each is merged into its feature cell when the cell loads.
 import json
 import math
 import os
-import threading
-import time
 from dataclasses import dataclass, replace
 
 from openpilot.common.swaglog import cloudlog
-from openpilot.sunnypilot.selfdrive.controls.lib.map_near import REFRESH_M, NearCache
+from openpilot.sunnypilot.selfdrive.controls.lib.map_near import REFRESH_M, CellMap
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.road_geometry import RoadGeometry
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_direction import (
   Applies, approaches_from_tags, approaches_from_ways, direction_from_tags, is_both, is_relative, sign_applies,
@@ -155,19 +153,19 @@ def find_stop_ahead(lat: float, lon: float, bearing_deg: float, signs, skip_ids=
   return best
 
 
-class StopSignMap:
-  """The stop signs in the 3 x 3 feature cells around the car, loaded in the background."""
+class StopSignMap(CellMap):
+  """The stop signs in the 3 x 3 feature cells around the car (map_near.CellMap): on the device each cell is read, and
+  its approaches resolved from the road tiles, in the map worker process."""
+  KIND = "stops"
+  RETRY_S = RETRY_S
 
   def __init__(self, features: MapFeatures | None = None, geometry: RoadGeometry | None = None):
+    super().__init__(LOOKAHEAD_M + REFRESH_M + 10.0, use_worker=features is None and geometry is None)
     self.features = features or MapFeatures()
     self.geometry = geometry or RoadGeometry()
-    self._cells: dict[tuple[int, int], list[StopSign]] = {}
-    self._pending: set[tuple[int, int]] = set()
-    self._failed: dict[tuple[int, int], float] = {}
-    self._lock = threading.Lock()
-    self._version = 0
-    self._near = NearCache(LOOKAHEAD_M + REFRESH_M + 10.0)
     self.local_path = os.path.join(os.path.dirname(os.path.normpath(self.features.root)), LOCAL_SIGNS_FILE)
+    if self._worker is not None:
+      self._worker.start()
 
   def _local_in_cell(self, key: tuple[int, int]) -> list[StopSign]:
     try:
@@ -177,54 +175,22 @@ class StopSignMap:
       return []
     return [s for s in signs if (math.floor(s.lat / FEAT_DEG), math.floor(s.lon / FEAT_DEG)) == key]
 
-  def _load(self, key: tuple[int, int]) -> None:
-    signs: list[StopSign] | None = None
-    try:
+  def _compute(self, key: tuple[int, int], cell: dict | None = None) -> list[StopSign] | None:
+    """The cell's signs (OSM and local) with the approaches the road tiles resolve. Blocking: seconds for a big cell."""
+    if cell is None:
       path = self.features.cell_path(*key)
-      if path is not None and os.path.isfile(path):
-        with open(path) as f:
-          signs = stop_signs_from_cell(json.load(f)) + self._local_in_cell(key)
-    except Exception:
-      cloudlog.exception(f"stop sign: loading feature cell {key} failed")
-    with self._lock:
-      self._pending.discard(key)
-      if signs is not None:
-        self._version += 1
-        self._cells[key] = signs
-        self._failed.pop(key, None)
-      else:
-        self._failed[key] = time.monotonic()
-    if signs is None or not any(s.needs_geometry for s in signs):
-      return
-    try:
-      resolved = resolve_approaches(signs, self.geometry)
-    except Exception:
-      cloudlog.exception(f"stop sign: road geometry for cell {key} failed")
-      return
-    with self._lock:
-      if key in self._cells:
-        self._version += 1
-        self._cells[key] = resolved
+      if path is None or not os.path.isfile(path):
+        return None
+      with open(path) as f:
+        cell = json.load(f)
+    signs = stop_signs_from_cell(cell) + self._local_in_cell(key)
+    if any(s.needs_geometry for s in signs):
+      try:
+        signs = resolve_approaches(signs, self.geometry)
+      except Exception:
+        cloudlog.exception(f"stop sign: road geometry for cell {key} failed")
+    return signs
 
   def signs_near(self, lat: float, lon: float) -> list[StopSign]:
-    """The loaded StopSigns near the car (map_near.NearCache): rebuilt every REFRESH_M or so, not every tick."""
-    cell = (math.floor(lat / FEAT_DEG), math.floor(lon / FEAT_DEG))
-    return self._near.get(lat, lon, cell, self._version, lambda: self._all_near(lat, lon))
-
-  def _all_near(self, lat: float, lon: float) -> list[StopSign]:
-    klat, klon = math.floor(lat / FEAT_DEG), math.floor(lon / FEAT_DEG)
-    keys = [(klat + i, klon + j) for i in (-1, 0, 1) for j in (-1, 0, 1)]
-    out: list[StopSign] = []
-    with self._lock:
-      for key in keys:
-        if key in self._cells:
-          out.extend(self._cells[key])
-        elif key not in self._pending and time.monotonic() - self._failed.get(key, -RETRY_S) >= RETRY_S:
-          self._pending.add(key)
-          threading.Thread(target=self._load, args=(key,), daemon=True).start()
-      # forget cells far behind so a long drive doesn't grow without bound
-      if len(self._cells) > 64:
-        for key in [k for k in self._cells if abs(k[0] - klat) > 3 or abs(k[1] - klon) > 3]:
-          del self._cells[key]
-          self._version += 1
-    return out
+    """The loaded signs near the car (rebuilt every REFRESH_M or so, not every tick)."""
+    return self.near(lat, lon)
