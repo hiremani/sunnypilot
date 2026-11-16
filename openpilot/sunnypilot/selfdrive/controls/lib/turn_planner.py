@@ -490,6 +490,7 @@ class TurnPlanner:
     self.roads_src = road_source if road_source is not None else RoadSource()
     self.tuning = tuning or TurnTuning()
     self.log = TurnLog()
+    self._ended = (0.0, 0.0)
     self._reset()
     self.heading: float | None = None    # deg, the car's heading (GPS course, carried on by the yaw rate)
     self._last_fix = None
@@ -527,6 +528,7 @@ class TurnPlanner:
     if self.state in (ARMED, TURNING):
       self._done_side = self.side
     side = self.side
+    self._ended = (self.planned, self.progress)   # the end-of-turn log event reports the turn that just ended
     self._reset()
     if reason:
       self.log.reason = reason
@@ -768,6 +770,10 @@ class TurnPlanner:
     lg = self.log
     lg.state, lg.side = self.state, self.side
     lg.junction_dist = self.dist if self.state in (ARMED, TURNING) else 0.0
-    lg.planned_deg, lg.progress_deg = self.planned, self.progress
+    if self.state in (ARMED, TURNING):
+      lg.planned_deg, lg.progress_deg = self.planned, self.progress
+      self._ended = (0.0, 0.0)
+    else:
+      lg.planned_deg, lg.progress_deg = self._ended
     lg.radius, lg.curvature = self.radius, self.curvature if self.state == TURNING else 0.0
     lg.branch_way_id = self.junction.branch.way_id if self.junction else 0

@@ -375,6 +375,8 @@ class TestTurnLog(unittest.TestCase):
     self.assertTrue(any(prev == tp.TURNING for prev, _ in changes))
     done = [f for n, f in events if n == "map_turn" and f["prev"] == tp.TURNING][0]
     self.assertEqual(done["reason"], "done")
+    self.assertGreater(abs(done["progress_deg"]), 60.0)   # how far the finished turn went, not the reset 0
+    self.assertGreater(abs(done["planned_deg"]), 60.0)
     ticks = [f for n, f in events if n == "map_turn_tick"]
     self.assertTrue(any(f["state"] == tp.TURNING and f["curvature"] is not None for f in ticks))
     self.assertTrue(all(f["blinker"] == "L" for f in ticks))
