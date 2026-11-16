@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass, replace
 
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.selfdrive.controls.lib.map_near import REFRESH_M, NearCache
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.road_geometry import RoadGeometry
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_direction import (
   Applies, approaches_from_tags, approaches_from_ways, direction_from_tags, is_both, is_relative, sign_applies,
@@ -164,6 +165,8 @@ class StopSignMap:
     self._pending: set[tuple[int, int]] = set()
     self._failed: dict[tuple[int, int], float] = {}
     self._lock = threading.Lock()
+    self._version = 0
+    self._near = NearCache(LOOKAHEAD_M + REFRESH_M + 10.0)
     self.local_path = os.path.join(os.path.dirname(os.path.normpath(self.features.root)), LOCAL_SIGNS_FILE)
 
   def _local_in_cell(self, key: tuple[int, int]) -> list[StopSign]:
@@ -186,6 +189,7 @@ class StopSignMap:
     with self._lock:
       self._pending.discard(key)
       if signs is not None:
+        self._version += 1
         self._cells[key] = signs
         self._failed.pop(key, None)
       else:
@@ -199,9 +203,15 @@ class StopSignMap:
       return
     with self._lock:
       if key in self._cells:
+        self._version += 1
         self._cells[key] = resolved
 
   def signs_near(self, lat: float, lon: float) -> list[StopSign]:
+    """The loaded StopSigns near the car (map_near.NearCache): rebuilt every REFRESH_M or so, not every tick."""
+    cell = (math.floor(lat / FEAT_DEG), math.floor(lon / FEAT_DEG))
+    return self._near.get(lat, lon, cell, self._version, lambda: self._all_near(lat, lon))
+
+  def _all_near(self, lat: float, lon: float) -> list[StopSign]:
     klat, klon = math.floor(lat / FEAT_DEG), math.floor(lon / FEAT_DEG)
     keys = [(klat + i, klon + j) for i in (-1, 0, 1) for j in (-1, 0, 1)]
     out: list[StopSign] = []
@@ -216,4 +226,5 @@ class StopSignMap:
       if len(self._cells) > 64:
         for key in [k for k in self._cells if abs(k[0] - klat) > 3 or abs(k[1] - klon) > 3]:
           del self._cells[key]
+          self._version += 1
     return out

@@ -46,6 +46,7 @@ from openpilot.common.gps import get_gps_location_service
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.selfdrive.controls.lib.map_near import REFRESH_M, NearCache
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 from openpilot.sunnypilot.webhud.maptiles import FEAT_DEG, MapFeatures
@@ -165,6 +166,8 @@ class SpeedBumpMap:
     self._pending: set[tuple[int, int]] = set()
     self._failed: dict[tuple[int, int], float] = {}
     self._lock = threading.Lock()
+    self._version = 0
+    self._near = NearCache(LOOKAHEAD_M + REFRESH_M + 10.0)
     self.local_path = os.path.join(os.path.dirname(os.path.normpath(self.features.root)), LOCAL_FILE)
 
   def _load(self, key: tuple[int, int]) -> None:
@@ -187,12 +190,18 @@ class SpeedBumpMap:
     with self._lock:
       self._pending.discard(key)
       if bumps is not None:
+        self._version += 1
         self._cells[key] = bumps
         self._failed.pop(key, None)
       else:
         self._failed[key] = time.monotonic()
 
   def bumps_near(self, lat: float, lon: float) -> list[SpeedBump]:
+    """The loaded SpeedBumps near the car (map_near.NearCache): rebuilt every REFRESH_M or so, not every tick."""
+    cell = (math.floor(lat / FEAT_DEG), math.floor(lon / FEAT_DEG))
+    return self._near.get(lat, lon, cell, self._version, lambda: self._all_near(lat, lon))
+
+  def _all_near(self, lat: float, lon: float) -> list[SpeedBump]:
     klat, klon = math.floor(lat / FEAT_DEG), math.floor(lon / FEAT_DEG)
     keys = [(klat + i, klon + j) for i in (-1, 0, 1) for j in (-1, 0, 1)]
     out: list[SpeedBump] = []
@@ -206,6 +215,7 @@ class SpeedBumpMap:
       if len(self._cells) > 64:
         for key in [k for k in self._cells if abs(k[0] - klat) > 3 or abs(k[1] - klon) > 3]:
           del self._cells[key]
+          self._version += 1
     return out
 
 
