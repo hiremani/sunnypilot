@@ -19,6 +19,7 @@ Scripts (run on the device, detached; see `comma-device`):
 | `lag.py` | `ROOT ROUTE` | `selfdrivedLagging`/`commIssue` clusters with CPU/temperature around each, top processes by CPU |
 | `procs.py` | `ROOT ROUTE SEG_FROM SEG_TO` | CPU per process by command line (card vs selfdrived vs controlsd...) |
 | `overrides.py` | `ROOT ROUTE...` | gas/brake takeovers while openpilot had speed control (with lead and command), steady-lead time gaps openpilot vs driver |
+| `stops.py` | `ROOT ROUTE... [--segs 12,14]` | every stop to standstill: who stopped (op-long / car-ACC / driver), peak decel, the jerk in the last 0.5 s (the "head nod"), the decel at the stop, op-long request error, how far it rolled after, ACC states from `fisker_long_handover` |
 
 ```
 scp .claude/skills/drive-review/scripts/*.py comma@192.168.0.207:/data/tmp/
