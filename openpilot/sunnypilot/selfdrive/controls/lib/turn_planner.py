@@ -38,8 +38,14 @@ EARTH_R = 6371000.0
 
 # ---- arming ----
 V_ARM_MAX = 7.2                 # m/s (16 mph): the planner only starts a turn at or below this speed
-V_ABORT = 9.0                   # m/s (20 mph): release above this speed at any point
-JUNCTION_LOOKAHEAD_M = 35.0     # junctions this far ahead along the current road are considered
+V_ABORT = 9.0                   # m/s (20 mph): release above this speed while turning
+V_ARM_APPROACH = 11.2           # m/s (25 mph): armed already while still slowing down for the turn (the driver signals
+                                # at 20-34 mph and brakes late: 4 of 12 turns of 00000100/00000101 never armed under
+                                # 16 mph in time); nothing is commanded until the car is at V_ARM_MAX
+JUNCTION_LOOKAHEAD_M = 35.0     # junctions this far ahead along the current road are considered...
+JUNCTION_LOOKAHEAD_S = 4.0      # ...or this many seconds ahead at the current speed, whichever is further...
+JUNCTION_LOOKAHEAD_MAX_M = 50.0  # ...up to this
+DONE_FRACTION = 0.75            # a turn released (too fast, blinker) this far through counts as done
 TURN_MIN_DEG = 45.0             # a branch is a turn on the blinker side when it leaves this much...
 TURN_MAX_DEG = 135.0            # ...and at most this much (beyond is a U-turn or a road doubling back)
 STRAIGHT_MAX_DEG = 30.0         # where the current way ends, the walk ahead follows a way continuing within this
@@ -58,6 +64,20 @@ PASSED_M = 3.0                  # armed, but the junction is this far behind: re
 
 # ---- the turn ----
 A_LAT_MAX = 2.5                 # m/s^2: the arc's radius is never tighter than v^2 / A_LAT_MAX
+# Comfort (the driver, 2026-11-17: "slow, nice and easy ... non-jerky"): the commanded curvature builds up and unwinds
+# no faster than a lateral jerk of TURN_LAT_JERK or a wheel speed of TURN_WHEEL_RATE_DEG_S (the driver's own turns
+# wound the wheel at ~100 deg/s; the car's limit is 150-250 deg/s). The start moves earlier to make room for the slower
+# build-up. The arc itself still fits the road (radius_right_m / radius_left_m, A_LAT_MAX): a lower lateral
+# acceleration at the driver's speed widened it to 31-34 m, 7 m off the driver's path on the recorded turns (into the
+# kerb or the other lane). A slower turn is a lower speed (junctionTurn with openpilot longitudinal), not a wider arc.
+TURN_LAT_JERK = 1.5             # m/s^3
+TURN_WHEEL_RATE_DEG_S = 120.0   # deg/s of steering wheel
+UNWIND_RATE_FACTOR = 1.5        # unwinding may be this much quicker (the wheel self-centres; nobody feels it)
+# The end of the turn: over the last BLEND_DEG before the release, the command blends from the map arc into the
+# driving model's own curvature, so the car settles into the lane it turned into with the model's lane centering
+# (which sees the lane lines and the kerb; the map arc doesn't) and the hand-back has no step.
+BLEND_DEG = 30.0
+BLEND_HANDOVER_DEG = 5.0      # ...and hands over (done) this far before the release point, fully on the model
 R_MIN = 6.0                     # m: tightest arc ever planned (a late start may tighten the arc down to this)
 R_FROM_STOP_MAX = 30.0          # m: widest arc a turn started early from a stop (TurnTuning.stop_start_*_m) is fitted to
 LATE_SLACK_M = 2.0              # a start so late the arc would need to be this much tighter than R_MIN is abandoned;
@@ -134,6 +154,16 @@ def curvature_rate(v: float, unwind: bool = False) -> float:
   rates = ANGLE_RATE_DOWN_DEG_S if unwind else ANGLE_RATE_DEG_S
   wheel = math.radians(float(np.interp(v, ANGLE_RATE_BP, rates))) / STEER_RATIO_X_WHEELBASE
   return max(min(jerk, wheel), CURV_RATE_MIN)
+
+
+def comfort_curvature_rate(v: float, unwind: bool = False) -> float:
+  """1/m/s: how fast the planner lets its commanded curvature change at speed v (TURN_LAT_JERK, TURN_WHEEL_RATE_DEG_S),
+  never faster than the car can follow (curvature_rate)."""
+  v = max(v, 1.0)
+  rate = min(TURN_LAT_JERK / v ** 2, math.radians(TURN_WHEEL_RATE_DEG_S) / STEER_RATIO_X_WHEELBASE)
+  if unwind:
+    rate *= UNWIND_RATE_FACTOR
+  return max(min(rate, curvature_rate(v, unwind)), CURV_RATE_MIN)
 
 
 def unwind_heading_deg(v: float, curvature: float) -> float:
@@ -492,6 +522,7 @@ class TurnPlanner:
     self.log = TurnLog()
     self._ended = (0.0, 0.0)
     self._reset()
+    self._k_meas = 0.0
     self.heading: float | None = None    # deg, the car's heading (GPS course, carried on by the yaw rate)
     self._last_fix = None
     self._done_side: str | None = None   # a turn on this side ended: no new one until that blinker goes off
@@ -545,7 +576,7 @@ class TurnPlanner:
     distance covered while the actuator delay passes and the curvature builds up."""
     half = math.radians(abs(change_deg)) / 2.0
     corner = self.tuning.lane_offset_m * math.tan(math.radians(change_deg) / 2.0)
-    build = (1.0 / radius) / curvature_rate(v)
+    build = (1.0 / radius) / comfort_curvature_rate(v)
     return radius * math.tan(half) + corner + v * (ACTUATOR_DELAY_S + 0.5 * build + self.tuning.lead_s)
 
   def _new_fix(self, gps) -> bool:
@@ -560,14 +591,18 @@ class TurnPlanner:
     return True
 
   def update(self, dt: float, v_ego: float, yaw_rate: float, left_blinker: bool, right_blinker: bool, lat_active: bool,
-             steering_pressed: bool, gps, steering_torque: float = 0.0) -> float | None:
+             steering_pressed: bool, gps, steering_torque: float = 0.0,
+             model_curvature: float | None = None) -> float | None:
     """
     dt: s since the last call. v_ego: m/s. yaw_rate: carState.yawRate, rad/s, positive = left.
     left_blinker / right_blinker: carState (held through the flash). lat_active: carControl.latActive.
     steering_pressed / steering_torque: carState (torque positive = left). gps: a gpsLocationExternal-like object
     (latitude, longitude, bearingDeg, speed, hasFix, horizontalAccuracy, unixTimestampMillis) or None.
+    model_curvature: the driving model's desired curvature this tick (1/m, positive = RIGHT); the end of the turn blends
+    into it (BLEND_DEG). None: the end only tapers.
     Returns the curvature to command (1/m, positive = RIGHT) while turning, None otherwise.
     """
+    self._k_meas = -yaw_rate / max(v_ego, 0.5)   # the car's own curvature now (positive = right)
     side = "left" if left_blinker and not right_blinker else "right" if right_blinker and not left_blinker else ""
     if side != self._done_side:
       self._done_side = None
@@ -591,12 +626,12 @@ class TurnPlanner:
       self.heading = (self.heading - math.degrees(yaw_rate) * dt) % 360.0
 
     if self.state == TURNING:
-      out = self._turning(dt, v_ego, yaw_rate, side, lat_active, steering_pressed, steering_torque)
+      out = self._turning(dt, v_ego, yaw_rate, side, lat_active, steering_pressed, steering_torque, model_curvature)
     elif self.state == ARMED:
       out = self._armed(dt, v_ego, side, lat_active, gps, new_fix)
     else:
       out = None
-      if self.state == IDLE and side and lat_active and v_ego <= V_ARM_MAX and new_fix and self.heading is not None:
+      if self.state == IDLE and side and lat_active and v_ego <= V_ARM_APPROACH and new_fix and self.heading is not None:
         self._try_arm(side, v_ego, gps)
     self._fill_log()
     self._emit_log(dt, v_ego, left_blinker, right_blinker, lat_active, steering_pressed, steering_torque, out)
@@ -639,7 +674,8 @@ class TurnPlanner:
       return
     self._prefer_way = roads.ways[m.way].way_id
     self.log.way_id, self.log.lateral = self._prefer_way, m.lateral
-    j = roads.junction_ahead(m, x, y, side)
+    lookahead = min(max(JUNCTION_LOOKAHEAD_M, v * JUNCTION_LOOKAHEAD_S), JUNCTION_LOOKAHEAD_MAX_M)
+    j = roads.junction_ahead(m, x, y, side, lookahead)
     if j is None:
       return
     self.state, self.side, self.roads, self.junction = ARMED, side, roads, j
@@ -661,7 +697,7 @@ class TurnPlanner:
     if not lat_active:
       self._end("lateral inactive")
       return None
-    if v > V_ABORT:
+    if v > V_ARM_APPROACH:
       self._end("too fast")
       return None
     self.dist -= v * dt
@@ -708,10 +744,13 @@ class TurnPlanner:
       r = max(r_fit, R_MIN, v ** 2 / A_LAT_MAX)
     self.state, self.radius, self.progress, self.t_turn = TURNING, r, 0.0, 0.0
     self.stall_t, self.stall_ref, self.override_t = 0.0, 0.0, 0.0
+    # the command starts from the curvature the car already has toward the turn (a driver who started it)
+    sign = 1.0 if self.side == "right" else -1.0
+    self.curvature = sign * max(0.0, sign * self._k_meas)
     self.log.start_dist = self.dist
-    return self._turning(0.0, v, 0.0, side, lat_active, False, 0.0)
+    return self._turning(0.0, v, 0.0, side, lat_active, False, 0.0, None)
 
-  def _turning(self, dt, v, yaw_rate, side, lat_active, pressed, torque) -> float | None:
+  def _turning(self, dt, v, yaw_rate, side, lat_active, pressed, torque, model_curvature) -> float | None:
     sign = 1.0 if self.side == "right" else -1.0
     if not lat_active:
       self._end("lateral inactive")
@@ -726,7 +765,7 @@ class TurnPlanner:
       self._end("other blinker")
       return None
     if v > V_ABORT:
-      self._end("too fast")
+      self._end("done" if self.progress >= DONE_FRACTION * abs(self.planned) else "too fast")
       return None
     # progress in the turn's direction only (yawRate positive = left, so a right turn has yawRate < 0)
     self.progress += max(0.0, -sign * math.degrees(yaw_rate)) * dt
@@ -742,7 +781,10 @@ class TurnPlanner:
       self._end("blinker off")
       return None
     k_meas = -yaw_rate / max(v, 0.5)   # the car's own curvature now (positive = right)
-    if remaining <= self.tuning.release_deg + unwind_heading_deg(v, max(0.0, sign * k_meas)):
+    release_at = self.tuning.release_deg + unwind_heading_deg(v, max(0.0, sign * k_meas))
+    if model_curvature is not None:
+      release_at += BLEND_HANDOVER_DEG   # the model is steering by then: its lane centering finishes the turn
+    if remaining <= release_at:
       self._end("done")
       return None
     if self.t_turn > TURN_TIMEOUT_S:
@@ -763,7 +805,15 @@ class TurnPlanner:
       return None
     kappa = min(1.0 / self.radius, A_LAT_MAX / max(v, 0.1) ** 2, MAX_CURVATURE)
     taper = 1.0 if self.tuning.taper_deg <= 0 else min(1.0, max(self.tuning.taper_min, remaining / self.tuning.taper_deg))
-    self.curvature = sign * kappa * taper
+    target = sign * kappa * taper
+    if model_curvature is not None:
+      # the last BLEND_DEG before the release: from the map arc into the model's lane centering
+      w = min(1.0, max(0.0, (remaining - release_at) / BLEND_DEG))
+      target = w * target + (1.0 - w) * model_curvature
+    # build up and unwind at the comfort rate, never in a step
+    unwind = abs(target) < abs(self.curvature) or target * self.curvature < 0.0
+    step = comfort_curvature_rate(v, unwind) * max(dt, 0.01)   # the start tick (dt 0) takes its first step too
+    self.curvature = min(max(target, self.curvature - step), self.curvature + step)
     return self.curvature
 
   def _fill_log(self) -> None:

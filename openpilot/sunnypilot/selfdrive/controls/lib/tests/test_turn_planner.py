@@ -40,12 +40,12 @@ class Car:
     self.outputs: list[float | None] = []
     self.states: list[str] = []
 
-  def step(self, left=False, right=False, lat_active=True, pressed=False, torque=0.0) -> float | None:
+  def step(self, left=False, right=False, lat_active=True, pressed=False, torque=0.0, model=None) -> float | None:
     lat, lon = _ll(self.x, self.y)
     gps = SimpleNamespace(latitude=lat, longitude=lon, bearingDeg=self.h % 360.0, speed=self.v, hasFix=True,
                           horizontalAccuracy=1.0, unixTimestampMillis=int(self.t * 1000))
     yaw = -self.v * self.k   # yawRate is positive to the left; curvature is positive to the right
-    out = self.p.update(DT, self.v, yaw, left, right, lat_active, pressed, gps, torque)
+    out = self.p.update(DT, self.v, yaw, left, right, lat_active, pressed, gps, torque, model_curvature=model)
     self.queue.append(out if out is not None else 0.0)
     target = self.queue.pop(0)
     rate = tp.curvature_rate(self.v, unwind=abs(target) < abs(self.k)) * DT
@@ -227,10 +227,6 @@ class TestTurnPlanner(unittest.TestCase):
         self.assertLessEqual(v ** 2 / p.radius_for(side, v), tp.A_LAT_MAX + 1e-9)
 
 
-if __name__ == "__main__":
-  unittest.main()
-
-
 def crossroads() -> tp.LocalRoads:
   """A north-south road and an east-west road crossing at a junction node at the origin."""
   return tp.LocalRoads(LAT0, LON0, [(1, "residential", False, [_ll(0, y) for y in (-200, -40, 0, 40, 200)]),
@@ -390,3 +386,58 @@ class TestTurnLog(unittest.TestCase):
     car = Car(p)
     car.drive(30.0, left=True)
     self.assertEqual(car.p.log.reason, "done")
+
+class TestComfort(unittest.TestCase):
+  """The driver's spec (2026-11-17): turns slow, easy and non-jerky, settling into the lane with lane centering."""
+
+  def test_curvature_builds_up_and_unwinds_gradually(self):
+    car = Car(planner(t_junction(right=True)))
+    car.drive(30.0, right=True)
+    curv = [o for o in car.outputs if o is not None]
+    self.assertEqual(car.p.log.reason, "done")
+    up = tp.comfort_curvature_rate(car.v) * DT
+    self.assertLessEqual(curv[0], up + 1e-9)                       # no step at the start
+    steps = [b - a for a, b in zip(curv, curv[1:], strict=False)]
+    self.assertLessEqual(max(steps), up + 1e-9)
+    self.assertGreaterEqual(min(steps), -tp.comfort_curvature_rate(car.v, unwind=True) * DT - 1e-9)
+    # the wheel never winds faster than the comfort wheel rate (curvature x steer ratio x wheelbase)
+    wheel_rate = max(steps) / DT * tp.STEER_RATIO_X_WHEELBASE
+    self.assertLessEqual(math.degrees(wheel_rate), tp.TURN_WHEEL_RATE_DEG_S + 1e-6)
+
+  def test_the_end_blends_into_the_model_lane_centering(self):
+    # the model sees the new road straight ahead once the car is round: the hand-back lands on its curvature
+    # (a model that steers toward the east road's heading, 0.002 1/m per degree short of it)
+    car = Car(planner(t_junction(right=True)))
+    model_ks = []
+    for _ in range(int(30.0 / DT)):
+      model_ks.append(min(0.1, max(-0.1, 0.002 * (90.0 - car.h))))
+      car.step(right=True, model=model_ks[-1])
+    curv = [o for o in car.outputs if o is not None]
+    last = car.outputs.index(curv[-1])
+    self.assertEqual(car.p.log.reason, "done")
+    self.assertAlmostEqual(curv[-1], model_ks[last], delta=0.005)   # handed back onto the model's own command
+    self.assertAlmostEqual(car.h, 90.0, delta=10.0)
+
+  def test_arms_while_slowing_but_waits_for_turn_speed(self):
+    p = planner(t_junction(right=True))
+    car = Car(p, v=10.0, y0=-60.0)          # 22 mph, 60 m out: armed (lookahead 40 m at this speed) but no command
+    car.drive(2.5, right=True)
+    self.assertEqual(p.state, tp.ARMED)
+    self.assertTrue(all(o is None for o in car.outputs))
+    car.v = 4.0                              # slowed to turn speed: the turn happens
+    car.drive(20.0, right=True)
+    self.assertEqual(p.log.reason, "done")
+    self.assertAlmostEqual(car.h, 90.0, delta=10.0)
+
+  def test_speeding_up_out_of_a_finished_turn_counts_as_done(self):
+    p = planner(t_junction(right=True))
+    car = Car(p)
+    while p.state != tp.TURNING or p.progress < 0.8 * abs(p.planned):
+      car.step(right=True)
+    car.v = tp.V_ABORT + 0.5
+    car.step(right=True)
+    self.assertEqual(p.log.reason, "done")
+
+
+if __name__ == "__main__":
+  unittest.main()

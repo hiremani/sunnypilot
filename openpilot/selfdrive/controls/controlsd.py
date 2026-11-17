@@ -90,7 +90,7 @@ class Controls(ControlsExt):
 
     self.LaC = ControlsExt.initialize_lateral_control(self, self.LaC, self.CI, DT_CTRL)
 
-  def update_map_turn(self, CS, CC) -> float | None:
+  def update_map_turn(self, CS, CC, model_curvature: float | None = None) -> float | None:
     """The map turn planner's curvature (1/m, positive turns right, as desiredCurvature) or None. Any failure means no
     turn: the model keeps steering."""
     if self._turn_param_frame % 100 == 0:
@@ -124,7 +124,7 @@ class Controls(ControlsExt):
     try:
       self.map_turn_curvature = self.turn_planner.update(DT_CTRL, CS.vEgo, CS.yawRate, CS.leftBlinker, CS.rightBlinker,
                                                          CC.latActive, CS.steeringPressed, self.sm[self.gps_service],
-                                                         CS.steeringTorque)
+                                                         CS.steeringTorque, model_curvature=model_curvature)
     except Exception:
       cloudlog.exception("map turn planner failed")
       self.map_turn_curvature = None
@@ -203,7 +203,7 @@ class Controls(ControlsExt):
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
-      turn_curvature = self.update_map_turn(CS, CC)
+      turn_curvature = self.update_map_turn(CS, CC, model_v2.action.desiredCurvature)
       if turn_curvature is not None and CC.latActive:
         new_desired_curvature = turn_curvature
       elif self.narrow_street_assist and CC.latActive:

@@ -502,7 +502,8 @@ def evaluate_turns(data: dict, tuning=None, osm_root: str | None = None) -> dict
     gps = SimpleNamespace(latitude=lat, longitude=lon, bearingDeg=bearing, speed=gspeed, hasFix=has_fix,
                           horizontalAccuracy=acc, unixTimestampMillis=ts)
     yaw_in = -v * ghost["k_act"] if ghost is not None else yaw
-    cmd = planner.update(DT_MDL, v, yaw_in, left_hold > 0, right_hold > 0, bool(fr["lat_active"]), False, gps)
+    cmd = planner.update(DT_MDL, v, yaw_in, left_hold > 0, right_hold > 0, bool(fr["lat_active"]), False, gps,
+                         model_curvature=fr.get("curv"))
     st = planner.state
     if st == tp.ARMED and prev_state != tp.ARMED:
       arms.append({"i": i, "dist": planner.dist, "planned": planner.planned, "side": planner.side})
@@ -519,7 +520,8 @@ def evaluate_turns(data: dict, tuning=None, osm_root: str | None = None) -> dict
     if ghost is not None:
       if cmd is None and ghost["released"] is None:
         ghost["released"] = i
-      k_cmd = cmd if cmd is not None else 0.0
+      # after the hand-back the model steers: the recorded model command (it saw the road the driver turned onto)
+      k_cmd = cmd if cmd is not None else fr.get("curv", 0.0)
       ghost["queue"].append(k_cmd)
       k_target = ghost["queue"].pop(0)
       unwind = abs(k_target) < abs(ghost["k_act"])
