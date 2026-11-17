@@ -70,9 +70,16 @@ SHADOW_PARAM = "StopSignAssistShadow"  # run and log only, never touching the sp
 COAST_START_M = 45.72    # m (150 ft): lift off the gas at least this far out
 A_COMFORT = 1.0          # m/s^2 planned braking; the planner's cruise floor is -1.2, so this leaves headroom
 COAST_TIME_S = 2.0       # at speed, coast this long before the braking point
+COAST_MIN_S = 1.5        # ...and never less, whatever the driver profile says. With 0 s (the profile learned from the
+                         # driver's own stops, route 00000103, 2026-11-16) the coast point WAS the braking point, so a
+                         # sign came into range already "too close" and every sign approached above ~16 mph was left to
+                         # the driver: the car drove through a stop sign at 20 mph
+A_TAKE_ON_MAX = 1.2      # m/s^2: a sign is still taken on (and braked for) if stopping needs up to this; beyond it, it is
+                         # left to the driver. The planner's cruise floor is -1.2: a speed target can't brake harder
 COAST_DV = 0.4           # m/s under the current speed while coasting: ~ -0.4 m/s^2, an EV's gentle lift-off
-MAX_APPROACH_V = 9.0     # m/s (~20 mph): above this the assist doesn't take on a sign (first supervised tests: slow
-                         # approaches only); once active for a sign it carries on
+MAX_APPROACH_V = 11.2    # m/s (25 mph): above this the assist doesn't take on a sign; once active for a sign it carries
+                         # on. Was 9.0 (20 mph): the driver profile cruises town streets at 20 mph, right at the cap, so a
+                         # sign was taken on only when the speed happened to dip under it (route 00000103)
 COAST_FLOOR_V = 2.5      # m/s (~5.6 mph): coasting eases off down to here and no further. Only a confirmed stop brings
                          # the car to a halt; an unconfirmed coast used to decay to 0 and hold the car short of the sign
                          # with no way out but the gas (found with drive_sim's closed loop, 2026-11-14)
@@ -105,11 +112,16 @@ class StopSignState(IntEnum):
 
 
 def coast_distance(v_ego: float, a: float = A_COMFORT, coast_s: float = COAST_TIME_S) -> float:
-  return max(COAST_START_M, braking_distance(v_ego, a) + v_ego * coast_s)
+  return max(COAST_START_M, braking_distance(v_ego, a) + v_ego * max(coast_s, COAST_MIN_S))
 
 
 def braking_distance(v_ego: float, a: float = A_COMFORT) -> float:
   return v_ego ** 2 / (2 * a) + v_ego * LAG_S
+
+
+def required_decel(dist_to_stop: float, v_ego: float) -> float:
+  """The steady braking (m/s^2) that stops in dist_to_stop, after the planner's lag."""
+  return v_ego ** 2 / (2 * max(dist_to_stop - v_ego * LAG_S, 0.5))
 
 
 def coast_target(v_ego: float) -> float:
@@ -190,6 +202,7 @@ class StopSignAssist:
     # profile's bounds, 0.7-1.5 m/s^2 and 0-4 s)
     self.a_comfort = A_COMFORT
     self.coast_s = COAST_TIME_S
+    self.a_brake = A_COMFORT       # this sign's braking: a_comfort, or more (up to A_TAKE_ON_MAX) when taken on late
     self.gave_up = 0               # signs left to the driver because a comfortable stop was no longer possible
     self.confirm_filter = FirstOrderFilter(0.0, CONFIRM_FILTER_S, DT_MDL)
     self.cue = StopCue()           # the last frame the confirmer read, for the log
@@ -204,6 +217,11 @@ class StopSignAssist:
     self.coast_s = float(coast_s)
 
   @property
+  def a_limit(self) -> float:
+    """The firmest braking a sign is still taken on for (never below the profile's own comfortable rate)."""
+    return max(A_TAKE_ON_MAX, self.a_comfort)
+
+  @property
   def is_active(self) -> bool:
     return self.state in (StopSignState.coasting, StopSignState.braking, StopSignState.stopped)
 
@@ -214,6 +232,7 @@ class StopSignAssist:
     self.distance = 0.0
     self.confirmed = False
     self.too_late = False
+    self.a_brake = self.a_comfort
     self.confirm_filter.x = 0.0
     self.cue = StopCue()
     self.cue_lead = False
@@ -287,7 +306,9 @@ class StopSignAssist:
       # Too late for a comfortable stop: never brake for it. On route 000000e5 (2026-11-14) a cross-street sign
       # confirmed at 2.6 m and 24 mph; braking to a stop from there would be an emergency stop at a junction the driver
       # was driving through. The driver handles this sign.
-      self.too_late = self.distance < braking_distance(v_ego, self.a_comfort)
+      self.too_late = self.distance < braking_distance(v_ego, self.a_limit)
+      if not self.too_late:
+        self.a_brake = max(self.a_brake, min(required_decel(self.distance, v_ego), self.a_limit))
       cloudlog.event("stop_sign_confirmed", shadow=self.shadow, sign=self.node_id, dist=round(self.distance, 1),
                      v=round(v_ego, 2), state=self.state.name, too_late=self.too_late, **self._confirm_log())
 
@@ -330,14 +351,18 @@ class StopSignAssist:
       self.state = StopSignState.idle
       self.output_v_target = V_CRUISE_UNSET
     else:
-      if not self.is_active and self.distance < braking_distance(v_ego, self.a_comfort):
-        # Taking a sign on (it just came into range, or the driver just slowed under max_approach_v) with no room left
-        # for a comfortable stop: leave it to the driver, however early the model confirmed. Found with drive_sim's
-        # closed loop: a fast approach taken on late overshot the stop point by 7.6 m.
-        self.too_late = True
-        self._give_up(v_ego, "taken on too close")
-        return
+      if not self.is_active:
+        if self.distance < braking_distance(v_ego, self.a_limit):
+          # Taking a sign on (it just came into range, or the driver just slowed under max_approach_v) with no room
+          # left even for A_TAKE_ON_MAX: leave it to the driver, however early the model confirmed. Found with
+          # drive_sim's closed loop: a fast approach taken on late overshot the stop point by 7.6 m.
+          self.too_late = True
+          self._give_up(v_ego, "taken on too close")
+          return
+        # a little late (inside the comfortable braking distance, not past A_TAKE_ON_MAX): brake for it a little
+        # firmer, on a profile that can actually stop in the room left
+        self.a_brake = max(self.a_comfort, min(required_decel(self.distance, v_ego), self.a_limit))
       coast_v = coast_target(v_ego)
-      brake_v = braking_v_target(self.distance, v_ego, self.a_comfort) if may_brake else coast_v
+      brake_v = braking_v_target(self.distance, v_ego, self.a_brake) if may_brake else coast_v
       self.state = StopSignState.braking if brake_v < coast_v else StopSignState.coasting
       self.output_v_target = min(coast_v, brake_v)

@@ -495,6 +495,70 @@ class TestMultiLane(unittest.TestCase):
       self.assertEqual(tp.exit_shift(tp.Branch(2, "residential", 90.0, 90.0, False, lanes), "right"), 0.0)
       self.assertEqual(tp.exit_shift(tp.Branch(2, "residential", 270.0, -90.0, False, lanes), "left"), 0.0)
 
+def two_streets(near_y: float = 0.0, far_y: float = 65.0) -> tp.LocalRoads:
+  """A north-south main road crossed by two east-west streets (both sides), at near_y and far_y."""
+  ys = sorted({-200.0, -100.0, -40.0, near_y, far_y, 200.0})
+  ways = [(1, "residential", False, [_ll(0, y) for y in ys])]
+  for wid, y in ((2, near_y), (3, far_y)):
+    ways.append((wid, "residential", False, [_ll(x, y) for x in (-150, -30, 0, 30, 150)]))
+  return tp.LocalRoads(LAT0, LON0, ways)
+
+
+class TestApproach(unittest.TestCase):
+  """Route 00000103 (2026-11-16): the driver signals 60-80 m before the turn, often just before a cross street. At 20
+  mph the planner took the cross street 5-18 m ahead (no way to slow down for it) and passed it; the turn the driver
+  meant never got the turn assist."""
+
+  def test_cross_street_too_close_to_slow_for_is_skipped(self):
+    car = Car(planner(two_streets()), v=8.9, y0=-12.0)
+    car.drive(0.2, right=True)
+    self.assertEqual(car.p.state, tp.ARMED)
+    self.assertEqual(car.p.junction.branch.way_id, 3)
+    state, dist = car.p.approach()
+    self.assertEqual(state, 1)
+    self.assertAlmostEqual(dist, 77.0, delta=3.0)
+
+  def test_slow_car_takes_the_near_street(self):
+    car = Car(planner(two_streets()), v=4.0, y0=-25.0)
+    car.drive(0.2, right=True)
+    self.assertIn(car.p.state, (tp.ARMED, tp.TURNING))
+    self.assertEqual(car.p.junction.branch.way_id, 2)
+
+  def test_min_distance(self):
+    self.assertEqual(tp.min_junction_distance(4.0, 4.5), 0.0)
+    self.assertAlmostEqual(tp.min_junction_distance(8.9, 4.5), (8.9 ** 2 - 4.5 ** 2) / 3.0)
+
+  def test_idle_reports_nothing(self):
+    self.assertEqual(planner(two_streets()).approach(), (0, 0.0))
+
+class TestSameStreet(unittest.TestCase):
+  """Route 000000fe: Warm Springs Blvd bends right where OSM splits it into another way; the bend is not a turn."""
+
+  def bend(self, other_straight: bool = False, name2: str = "Main St") -> tp.LocalRoads:
+    ways = [(1, "primary", False, [_ll(0, y) for y in (-200, -100, 0)], 0, "Main St"),
+            (2, "primary", False, [_ll(x, 0) for x in (0, 60, 200)], 0, name2),
+            (4, "residential", False, [_ll(0, y) for y in (60, 70, 80)], 0, "Far St"),
+            (5, "residential", False, [_ll(x, 70) for x in (200, 300)], 0, "Far St")]
+    if other_straight:
+      ways.append((3, "residential", False, [_ll(0, y) for y in (0, 100, 200)], 0, "Side St"))
+    return tp.LocalRoads(LAT0, LON0, ways)
+
+  def test_the_street_bending_is_not_a_turn(self):
+    roads = self.bend()
+    m = roads.match(2.0, -20.0, 0.0)
+    j = roads.junction_ahead(m, 2.0, -20.0, "right", 100.0)
+    self.assertTrue(j is None or j.branch.way_id != 2)
+
+  def test_a_differently_named_road_there_is_a_turn(self):
+    roads = self.bend(name2="Other Rd")
+    m = roads.match(2.0, -20.0, 0.0)
+    self.assertEqual(roads.junction_ahead(m, 2.0, -20.0, "right", 100.0).branch.way_id, 2)
+
+  def test_staying_on_the_street_round_its_corner_is_a_turn(self):
+    roads = self.bend(other_straight=True)   # something goes straight on: the street's corner is a real junction
+    m = roads.match(2.0, -20.0, 0.0)
+    self.assertEqual(roads.junction_ahead(m, 2.0, -20.0, "right", 100.0).branch.way_id, 2)
+
 
 if __name__ == "__main__":
   unittest.main()

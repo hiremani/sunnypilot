@@ -44,11 +44,44 @@ class TestProfileLong(unittest.TestCase):
     self.assertAlmostEqual(pl.profile_speed(65 * CV.MPH_TO_MS, 4.5) * CV.MS_TO_MPH, 69.5, places=3)
 
 
-if __name__ == "__main__":
-  unittest.main()
-
 
 class TestTurnExit(unittest.TestCase):
   def test_turn_exit_cap(self):
     self.assertEqual(pl.turn_exit_cap(1.0, 0.7), 0.7)
     self.assertEqual(pl.turn_exit_cap(0.0, 0.7), float("inf"))
+
+
+class TestComfortAccel(unittest.TestCase):
+  def test_gentle_in_town(self):
+    # route 00000103: openpilot asked for +1.0 after every turn and stop and the car delivered up to +1.44
+    for v in (0.0, 3.0, 8.9, 11.2):
+      self.assertLessEqual(pl.comfort_accel_cap(v), 0.6)
+
+  def test_opens_up_on_faster_roads(self):
+    self.assertAlmostEqual(pl.comfort_accel_cap(25.0), 1.0)
+    self.assertGreater(pl.comfort_accel_cap(15.0), 0.6)
+
+class TestJunctionApproach(unittest.TestCase):
+  def test_slows_to_turn_speed_before_the_turn_starts(self):
+    # route 00000103: armed for a turn 77 m ahead at 20 mph; following the target (braking at most 1.2 m/s^2 with a
+    # 1 s lag, as the planner does) the car is at turn speed when the turn planner's arc starts (~12 m out)
+    v, d, a, dt, v_turn, peak = 8.9, 77.0, 0.0, 0.05, 2.57, 0.0
+    while d > 12.0:
+      target = pl.junction_approach_v(d, v_turn, v)
+      want = max(min((target - v) / 1.0, 0.0), -1.2)
+      a += (want - a) * dt / 1.0
+      v = max(v + a * dt, 0.0)
+      d -= v * dt
+      peak = min(peak, a)
+    self.assertLess(v, v_turn + 0.6)
+    self.assertGreater(peak, -1.0)   # gentle: the profile's rate, not the planner's floor
+
+  def test_far_away_no_effect(self):
+    self.assertGreater(pl.junction_approach_v(100.0, 2.57, 8.9), 10.0)
+
+  def test_at_the_junction_turn_speed(self):
+    self.assertAlmostEqual(pl.junction_approach_v(5.0, 2.57, 3.0), 2.57)
+
+
+if __name__ == "__main__":
+  unittest.main()

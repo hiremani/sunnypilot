@@ -210,6 +210,25 @@ class LongitudinalPlannerSP:
         if v_cap is not None:
           targets[LongitudinalPlanSource.driverSpeed] = (v_cap, profile_long.PROFILE_SPEED_ACCEL if v_ego > v_cap + 0.5 else a_ego)
 
+    # map turn assist armed for a signaled turn ahead (or turning): slow to the junction speed before it
+    if self.openpilot_long:
+      try:
+        mt = sm['carControlSP'].mapTurn
+        state, dist = int(mt.state), float(mt.junctionDistance)
+      except Exception:
+        state, dist = 0, 0.0
+      v_turn = self.profile.junction_turn_mph * CV.MPH_TO_MS if self.profile_on else profile_long.V_TURN_DEFAULT
+      v_turn_target = None
+      if state == 1:
+        v_turn_target = profile_long.junction_approach_v(dist, v_turn, v_ego)
+      elif state == 2:
+        v_turn_target = v_turn
+        self.turn_exit_left = profile_long.TURN_EXIT_S   # the driver profile's pull-away after the turn
+      if v_turn_target is not None:
+        prev = targets.get(LongitudinalPlanSource.junctionTurn, (float('inf'), a_ego))
+        if v_turn_target < prev[0]:
+          targets[LongitudinalPlanSource.junctionTurn] = (v_turn_target, profile_long.JUNCTION_ACCEL if v_ego > v_turn_target else a_ego)
+
     # wet road: cruise no faster than the posted limit + the level's offset
     wet_offset = self.wet.speed_offset_mph()
     if wet_offset is not None and self.openpilot_long and self.resolver.speed_limit_valid:
@@ -240,11 +259,13 @@ class LongitudinalPlannerSP:
       return None
     return get_T_FOLLOW(self.personality) * factor
 
-  def map_accel_cap(self) -> float:
-    """No accelerating toward a mapped traffic light (map caution), a softer pull-away on a wet road; inf when neither
-    limits."""
+  def map_accel_cap(self, v_ego: float) -> float:
+    """No accelerating toward a mapped traffic light (map caution); with openpilot speed control also a softer pull-away
+    on a wet road and the comfort ceiling (profile_long.comfort_accel_cap); inf when nothing limits."""
     cap = self.map_caution.accel_cap() if self.map_caution is not None else float('inf')
-    return min(cap, self.wet.accel_max()) if self.openpilot_long else cap
+    if not self.openpilot_long:
+      return cap
+    return min(cap, self.wet.accel_max(), profile_long.comfort_accel_cap(v_ego))
 
   def lead_coast_cap(self, sm: messaging.SubMaster, v_ego: float) -> float:
     """The most acceleration the driver profile allows: none toward a slower lead inside the coasting gap, and the

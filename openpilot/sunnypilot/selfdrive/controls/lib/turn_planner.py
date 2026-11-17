@@ -43,8 +43,14 @@ V_ARM_APPROACH = 11.2           # m/s (25 mph): armed already while still slowin
                                 # at 20-34 mph and brakes late: 4 of 12 turns of 00000100/00000101 never armed under
                                 # 16 mph in time); nothing is commanded until the car is at V_ARM_MAX
 JUNCTION_LOOKAHEAD_M = 35.0     # junctions this far ahead along the current road are considered...
-JUNCTION_LOOKAHEAD_S = 4.0      # ...or this many seconds ahead at the current speed, whichever is further...
-JUNCTION_LOOKAHEAD_MAX_M = 50.0  # ...up to this
+JUNCTION_LOOKAHEAD_S = 9.0      # ...or this many seconds ahead at the current speed, whichever is further...
+JUNCTION_LOOKAHEAD_MAX_M = 100.0  # ...up to this. The driver signals 60-80 m (7-9 s at 20 mph) before the turn,
+                                  # often before an intermediate cross street (route 00000103, 3 of 5 turns)
+# A junction closer than the car can slow down for (from v to the turn speed at APPROACH_SKIP_DECEL) is not the one the
+# driver means: it is a cross street passed with the blinker already on. Route 00000103 (2026-11-16): the planner took
+# the street 5-18 m ahead at 20 mph three times; the driver turned at the next one, 60-80 m on.
+APPROACH_SKIP_DECEL = 1.5       # m/s^2: firmer than anyone slows for a turn
+V_TURN_DEFAULT = 4.5            # m/s (10 mph): the turn speed when the driver profile gives none
 DONE_FRACTION = 0.75            # a turn released (too fast, blinker) this far through counts as done
 
 # ---- the lane the turn ends in ----
@@ -147,6 +153,7 @@ class TurnTuning:
                                    # the driver profile (turn_stop_start_*_m): from a stop the driver starts a left turn
                                    # ~25 m before the junction node in a ~20 m arc, the planner's own start is ~10 m
                                    # (4 turns, routes f0 f3 f5 f6; f6 is the Doane St turn the driver led by 2 s)
+  v_turn: float = V_TURN_DEFAULT   # m/s: the driver's junction speed (driver profile junction_turn_mph)
 
 
 def _wrap(a: float) -> float:
@@ -165,6 +172,11 @@ def curvature_rate(v: float, unwind: bool = False) -> float:
   rates = ANGLE_RATE_DOWN_DEG_S if unwind else ANGLE_RATE_DEG_S
   wheel = math.radians(float(np.interp(v, ANGLE_RATE_BP, rates))) / STEER_RATIO_X_WHEELBASE
   return max(min(jerk, wheel), CURV_RATE_MIN)
+
+
+def min_junction_distance(v: float, v_turn: float) -> float:
+  """m: junctions closer than this can't be slowed down for (v to v_turn at APPROACH_SKIP_DECEL)."""
+  return max(0.0, v * v - v_turn * v_turn) / (2.0 * APPROACH_SKIP_DECEL)
 
 
 def comfort_curvature_rate(v: float, unwind: bool = False) -> float:
@@ -218,6 +230,7 @@ class LocalWay:
   xy: np.ndarray            # (n, 2) metres east, north of the LocalRoads origin, in OSM node order
   keys: list                # per node: its position key, shared by every way through that node
   lanes: int = 0            # OSM lanes (both directions on a two-way road); 0 = not tagged
+  name: str = ""            # OSM name; "" = untagged
 
 
 @dataclass
@@ -263,13 +276,14 @@ class LocalRoads:
     self.nodes: dict[tuple[int, int], list[tuple[int, int]]] = {}
     seg_a, seg_b, seg_w, seg_i = [], [], [], []
     for way in ways:
-      way_id, highway, oneway, pts, *rest = way   # (id, highway, oneway, points[, lanes])
+      way_id, highway, oneway, pts, *rest = way   # (id, highway, oneway, points[, lanes[, name]])
       if len(pts) < 2:
         continue
       xy = np.array([self.to_xy(la, lo) for la, lo in pts], dtype=np.float64)
       keys = [_key(la, lo) for la, lo in pts]
       wi = len(self.ways)
-      self.ways.append(LocalWay(int(way_id), highway, bool(oneway), xy, keys, int(rest[0]) if rest else 0))
+      self.ways.append(LocalWay(int(way_id), highway, bool(oneway), xy, keys, int(rest[0]) if rest else 0,
+                                str(rest[1]) if len(rest) > 1 else ""))
       for ni, k in enumerate(keys):
         self.nodes.setdefault(k, []).append((wi, ni))
       seg_a.append(xy[:-1])
@@ -351,9 +365,11 @@ class LocalRoads:
         out.append((wj, nj, direction, _bearing(pt[0] - x, pt[1] - y)))
     return out
 
-  def junction_ahead(self, m: Match, x: float, y: float, side: str, lookahead: float = JUNCTION_LOOKAHEAD_M) -> Junction | None:
-    """The nearest junction ahead along the matched road with a branch leaving toward side ('left'/'right') by
-    TURN_MIN_DEG..TURN_MAX_DEG. The walk follows the road through junctions where it continues straight."""
+  def junction_ahead(self, m: Match, x: float, y: float, side: str, lookahead: float = JUNCTION_LOOKAHEAD_M,
+                     min_distance: float = 0.0) -> Junction | None:
+    """The nearest junction ahead along the matched road, at least min_distance away, with a branch leaving toward
+    side ('left'/'right') by TURN_MIN_DEG..TURN_MAX_DEG. The walk follows the road through junctions where it continues
+    straight."""
     wi, direction = m.way, m.direction
     w = self.ways[wi]
     a, b = w.xy[m.seg], w.xy[m.seg + 1]
@@ -376,23 +392,34 @@ class LocalRoads:
       visited.add((wi, ni))
       trail.append(node)
       arrival = self._arrival_bearing(trail)
-      best, cont = None, None
+      best, cont, same = None, None, None
+      cands = []
       for wj, nj, dj, bear in self.branches(key, float(node[0]), float(node[1])):
         change = _wrap(bear - arrival)
-        if TURN_MIN_DEG <= sign * change <= TURN_MAX_DEG:
-          if best is None or abs(abs(change) - 90.0) < abs(abs(best[4]) - 90.0):
-            best = (wj, nj, dj, bear, change)
         if abs(change) <= STRAIGHT_MAX_DEG and (cont is None or abs(change) < abs(cont[3])):
           if not (wj == wi and dj == direction):
             cont = (wj, nj, dj, change)
-      if best is not None:
+        cands.append((wj, nj, dj, bear, change))
+      straight_on = cont is not None or 0 <= ni + direction < len(w.xy)
+      for wj, nj, dj, bear, change in cands:
+        # The street itself bending on (OSM splits it into another way there, and nothing else goes straight on) is
+        # not a turn: route 000000fe, Warm Springs Blvd bends right where OSM splits it and the planner took the bend
+        # for one. Where something does go straight on, staying on the street round its corner is a real turn.
+        same_street = not straight_on and bool(w.name) and self.ways[wj].name == w.name
+        if same_street and abs(change) <= TURN_MAX_DEG and same is None and not (wj == wi and dj == -direction):
+          same = (wj, nj, dj, change)
+        if TURN_MIN_DEG <= sign * change <= TURN_MAX_DEG and not same_street:
+          if best is None or abs(abs(change) - 90.0) < abs(abs(best[4]) - 90.0):
+            best = (wj, nj, dj, bear, change)
+      if best is not None and dist >= min_distance:
         bw = self.ways[best[0]]
         return Junction(float(node[0]), float(node[1]), dist, arrival,
                         Branch(bw.way_id, bw.highway, best[3], best[4], bw.oneway, bw.lanes))
       # carry on along the road: the same way if it continues, else the straightest continuation
       if 0 <= ni + direction < len(w.xy):
         nxt = ni + direction
-      elif cont is not None:
+      elif cont is not None or same is not None:
+        cont = cont if cont is not None else same   # the road bends on into another way of the same street
         wi, ni, direction = cont[0], cont[1], cont[2]
         w = self.ways[wi]
         nxt = ni + direction
@@ -451,7 +478,7 @@ def read_local_roads(root: str, lat: float, lon: float, radius: float = LOCAL_RA
         continue
       seen.add(w.id)
       cls = HIGHWAY_CLASSES[w.highway] if w.highway < len(HIGHWAY_CLASSES) else "unknown"
-      ways.append((int(w.id), cls, bool(w.oneWay), pts, int(w.lanes)))
+      ways.append((int(w.id), cls, bool(w.oneWay), pts, int(w.lanes), str(w.name)))
   return LocalRoads(lat, lon, ways) if found else None
 
 
@@ -678,6 +705,14 @@ class TurnPlanner:
     self._emit_log(dt, v_ego, left_blinker, right_blinker, lat_active, steering_pressed, steering_torque, out)
     return out
 
+  def approach(self) -> tuple[int, float]:
+    """For the longitudinal planner: (1, m to the junction) while armed, (2, 0) while turning, else (0, 0)."""
+    if self.state == ARMED and self.junction is not None:
+      return 1, max(float(self.dist), 0.0)
+    if self.state == TURNING:
+      return 2, 0.0
+    return 0, 0.0
+
   def _emit_log(self, dt, v_ego, left_blinker, right_blinker, lat_active, pressed, torque, out) -> None:
     changed = self.state != self._logged_state
     self._log_t += dt
@@ -716,7 +751,7 @@ class TurnPlanner:
     self._prefer_way = roads.ways[m.way].way_id
     self.log.way_id, self.log.lateral = self._prefer_way, m.lateral
     lookahead = min(max(JUNCTION_LOOKAHEAD_M, v * JUNCTION_LOOKAHEAD_S), JUNCTION_LOOKAHEAD_MAX_M)
-    j = roads.junction_ahead(m, x, y, side, lookahead)
+    j = roads.junction_ahead(m, x, y, side, lookahead, min_junction_distance(v, self.tuning.v_turn))
     if j is None:
       return
     self.state, self.side, self.roads, self.junction = ARMED, side, roads, j

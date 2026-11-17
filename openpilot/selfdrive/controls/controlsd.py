@@ -119,6 +119,7 @@ class Controls(ControlsExt):
           profile = driver_profile.active(self.params)
           self.turn_planner.tuning.stop_start_left_m = profile.turn_stop_start_left_m
           self.turn_planner.tuning.stop_start_right_m = profile.turn_stop_start_right_m
+          self.turn_planner.tuning.v_turn = profile.junction_turn_mph * CV.MPH_TO_MS
         except Exception:
           cloudlog.exception("driver profile turn starts failed")
     self._turn_param_frame += 1

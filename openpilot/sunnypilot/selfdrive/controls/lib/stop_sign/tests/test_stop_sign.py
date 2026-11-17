@@ -831,9 +831,10 @@ def test_fast_approach_is_left_to_the_driver():
 def test_sign_taken_on_too_close_is_never_braked_for():
   # closed loop on route e5: confirmed early while above the approach cap, taken on only once slowed under it, then
   # braked from too close and overshot by 7.6 m
-  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import MAX_APPROACH_V, braking_distance
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import (A_TAKE_ON_MAX, MAX_APPROACH_V,
+                                                                                         braking_distance)
   v_fast, v_slow = MAX_APPROACH_V + 2.0, MAX_APPROACH_V - 0.5
-  d = braking_distance(v_slow) - 4.0     # no room for a comfortable stop at v_slow
+  d = braking_distance(v_slow, A_TAKE_ON_MAX) - 4.0     # no room for a stop at v_slow, even braking firmer
   ctrl = make([StopSign(1, *north_of(LAT0, LON0, STOP_MARGIN_M + d))], max_approach_v=MAX_APPROACH_V)
   ctrl.node_id = 1
   ctrl.confirmed = True                  # the model confirmed while the car was still too fast to take it on
@@ -843,6 +844,44 @@ def test_sign_taken_on_too_close_is_never_braked_for():
     ctrl.update(sm_at(gps(LAT0, LON0, speed=v_slow), model(stop=True)), True, False, v_slow, 0.0, NOW)
     assert ctrl.state == StopSignState.idle and ctrl.output_v_target > 200
   assert ctrl.gave_up == 1 and 1 in ctrl.done_ids
+
+
+def _closed_loop(start_m, v, ctrl, steps=900):
+  """Drive north toward a sign at the origin + start_m, following the assist's speed target the way the planner does
+  (at most -1.2 m/s^2, a 1 s lag). Returns (final speed, distance left to the stop point, peak decel)."""
+  x, a, peak = 0.0, 0.0, 0.0
+  for _ in range(steps):
+    ctrl.update(sm_at(gps(*north_of(LAT0, LON0, x), speed=max(v, 0.0)), model(stop=True)), True, False, v, a, NOW)
+    want = 0.0 if ctrl.output_v_target > 200 else max(min(ctrl.output_v_target - v, 0.0), -1.2)
+    a += (want - a) * DT_MDL / 1.0
+    v = max(0.0, v + a * DT_MDL)
+    x += v * DT_MDL
+    peak = min(peak, a)
+  return v, start_m - STOP_MARGIN_M - x, peak
+
+
+def test_profile_without_coast_still_stops_from_20_mph():
+  # route 00000103 (2026-11-16): profile coast 0 s, stop braking 0.94 m/s^2, 20 mph. The sign was left to the driver at
+  # 51 m ("taken on too close") and the car drove through it.
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import MAX_APPROACH_V
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, 150.0))], max_approach_v=MAX_APPROACH_V)
+  ctrl.set_profile(0.94, 0.0)
+  v, left, peak = _closed_loop(150.0, 8.97, ctrl)
+  assert ctrl.gave_up == 0
+  assert v < 0.3 and -1.0 < left < 4.0, (v, left)
+  assert peak > -1.25
+
+
+def test_taken_on_a_little_late_brakes_firmer_and_stops():
+  # in range only once already inside the comfortable braking distance (e.g. slowed under the approach cap late)
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import A_TAKE_ON_MAX, braking_distance
+  v = 9.0
+  d = (braking_distance(v) + braking_distance(v, A_TAKE_ON_MAX)) / 2
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, STOP_MARGIN_M + d))])
+  ctrl.node_id = 1
+  ctrl.confirmed = True                  # the model confirmed while the car was still too fast to take it on
+  v, left, _ = _closed_loop(STOP_MARGIN_M + d, v, ctrl)
+  assert ctrl.gave_up == 0 and v < 0.3 and left > -1.5, (v, left)
 
 
 def test_crawling_past_a_sign_releases_it():

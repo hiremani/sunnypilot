@@ -104,6 +104,14 @@ class ControlsExt(ModelStateBase):
     CC_SP.intelligentCruiseButtonManagement.sendButton = icbm_src.sendButton
     CC_SP.intelligentCruiseButtonManagement.vTarget = icbm_src.vTarget
 
+    # map turn planner: the approach to a signaled turn, for the longitudinal planner's slow-down
+    turn_planner = getattr(self, "turn_planner", None)
+    if turn_planner is not None and getattr(self, "map_turn_assist", False):
+      try:
+        CC_SP.mapTurn.state, CC_SP.mapTurn.junctionDistance = turn_planner.approach()
+      except Exception:
+        pass
+
     return CC_SP
 
   @staticmethod

@@ -17,7 +17,10 @@ How the longitudinal planner drives by the driver profile (driver_profile.py), a
   junction_turn(...)        a signaled, sharp, slow turn is under way: cap the speed at the driver's junction speed.
   profile_speed(...)        the cruising speed cap: the posted limit + the driver's own offset for that limit.
   turn_exit_cap(...)        for TURN_EXIT_S after a junction turn, pull away no harder than the driver does out of one.
+  comfort_accel_cap(v)      the gentlest of all: openpilot never asks for more than this (0.6 m/s^2 in town).
 """
+import numpy as np
+
 from openpilot.common.constants import CV
 
 STOP_DISTANCE = 6.0         # m, long_mpc.STOP_DISTANCE
@@ -32,7 +35,35 @@ JUNCTION_V_MAX = 9.0        # m/s (20 mph, the turn planner's abort speed): abov
 JUNCTION_CURVATURE = 1 / 25.0   # 1/m (R < 25 m)
 JUNCTION_ACCEL = -0.8       # m/s^2 to get down to the junction speed
 
+# Slowing down before a signaled turn the map turn planner is armed for (carControlSP.mapTurn): reach the junction speed
+# APPROACH_MARGIN_M before the junction (the turn planner starts its arc ~10-13 m out), braking at JUNCTION_ACCEL's
+# rate, leading by the planner's ~1 s speed-loop lag. Route 00000103 (2026-11-16): with openpilot speed control nothing
+# slowed the car before a turn; it held 20 mph through 4 of 5 signaled junctions and the turn assist (starts at 16 mph
+# at most) passed every one of them.
+APPROACH_MARGIN_M = 15.0
+APPROACH_LAG_S = 1.0
+V_TURN_DEFAULT = 4.5        # m/s (10 mph) without a driver profile
+
+
+def junction_approach_v(dist_m: float, v_turn: float, v_ego: float) -> float:
+  """The speed target (m/s) dist_m before an armed junction turn."""
+  d = max(dist_m - APPROACH_MARGIN_M - v_ego * APPROACH_LAG_S, 0.0)
+  return (v_turn * v_turn + 2.0 * abs(JUNCTION_ACCEL) * d) ** 0.5
+
+
 PROFILE_SPEED_ACCEL = -0.5  # m/s^2 to get down to a lower cap (a new, lower limit)
+
+# A gentle pull-away with openpilot speed control, whatever the profile: the most acceleration openpilot asks for, by
+# speed. Route 00000103 (2026-11-16): after every turn and stop openpilot asked for its +1.0 m/s^2 maximum (the stock
+# planner wanted 1.3-1.45) and the Ocean delivered up to +1.44: "accelerated fast". The car overshoots a request by
+# ~40% at town speeds, so 0.6 asked is ~0.8 felt; on faster roads the cap opens back up to the car's 1.0.
+COMFORT_ACCEL_BP = [0.0, 11.2, 20.0]   # m/s (0, 25 mph, 45 mph)
+COMFORT_ACCEL_V = [0.6, 0.6, 1.0]      # m/s^2
+
+
+def comfort_accel_cap(v_ego: float) -> float:
+  return float(np.interp(v_ego, COMFORT_ACCEL_BP, COMFORT_ACCEL_V))
+
 
 TURN_EXIT_S = 3.0           # s after a junction turn (fisker_drive_style.TURN_EXIT_S, what the profile measures over)
 
