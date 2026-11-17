@@ -439,5 +439,62 @@ class TestComfort(unittest.TestCase):
     self.assertEqual(p.log.reason, "done")
 
 
+def divided(lanes: int = 0, gap: float = 20.0) -> tp.LocalRoads:
+  """A side road north (x = 0) onto a divided road drawn as two one-way halves: the near half y = 0 eastbound, the far
+  half y = gap westbound, `lanes` each."""
+  return tp.LocalRoads(LAT0, LON0, [
+    (10, "primary", True, [_ll(x, 0) for x in (-200, -60, 0, 60, 200)], lanes),
+    (11, "primary", True, [_ll(x, gap) for x in (200, 60, 0, -60, -200)], lanes),
+    (1, "residential", False, [_ll(0, y) for y in (-200, -100, -40, 0, gap)])])
+
+
+def two_way(lanes: int) -> tp.LocalRoads:
+  return tp.LocalRoads(LAT0, LON0, [(1, "residential", False, [_ll(0, y) for y in (-200, -100, -40, 0, 60, 200)]),
+                                    (2, "residential", False, [_ll(x, 0) for x in (-150, -30, 0, 30, 150)], lanes)])
+
+
+def turn(roads, side: str) -> Car:
+  car = Car(planner(roads))
+  car.drive(30.0, left=side == "left", right=side == "right")
+  return car
+
+
+class TestMultiLane(unittest.TestCase):
+  def test_left_onto_a_divided_road_crosses_the_near_half_first(self):
+    car = turn(divided(), "left")
+    first = next(i for i, o in enumerate(car.outputs) if o is not None)
+    self.assertEqual(car.p.log.reason, "done")
+    self.assertAlmostEqual(car.h % 360, 270.0, delta=8.0)          # westbound, on the far half
+    self.assertGreater(car.y, 10.0)
+    ys = []
+    c2 = Car(planner(divided()))
+    for _ in range(first + 1):
+      c2.step(left=True)
+      ys.append(c2.y)
+    self.assertGreater(ys[-1], 0.0)                                 # no steering before the near half is crossed
+
+  def test_right_onto_a_divided_road_takes_the_near_half(self):
+    car = turn(divided(), "right")
+    self.assertEqual(car.p.log.reason, "done")
+    self.assertAlmostEqual(car.h % 360, 90.0, delta=8.0)
+    self.assertLess(car.y, 10.0)
+
+  def test_right_turns_end_in_the_rightmost_lane(self):
+    base, four, six = (turn(two_way(n), "right").y for n in (2, 4, 6))
+    self.assertAlmostEqual(base - four, tp.LANE_W, delta=0.5)      # one lane further right per extra lane each way
+    self.assertAlmostEqual(base - six, 2 * tp.LANE_W, delta=0.5)
+
+  def test_left_turns_end_in_the_nearest_lane(self):
+    ends = [turn(two_way(n), "left").y for n in (2, 4, 6)]
+    self.assertLess(max(ends) - min(ends), 0.2)                    # the lane next to the centre, whatever the count
+    one, three = turn(divided(1), "left").y, turn(divided(3), "left").y
+    self.assertAlmostEqual(one - three, tp.LANE_W, delta=0.5)       # the inner lane of the far half, by the median
+
+  def test_the_tuned_case_is_unchanged(self):
+    for lanes in (0, 2):
+      self.assertEqual(tp.exit_shift(tp.Branch(2, "residential", 90.0, 90.0, False, lanes), "right"), 0.0)
+      self.assertEqual(tp.exit_shift(tp.Branch(2, "residential", 270.0, -90.0, False, lanes), "left"), 0.0)
+
+
 if __name__ == "__main__":
   unittest.main()

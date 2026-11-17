@@ -46,6 +46,17 @@ JUNCTION_LOOKAHEAD_M = 35.0     # junctions this far ahead along the current roa
 JUNCTION_LOOKAHEAD_S = 4.0      # ...or this many seconds ahead at the current speed, whichever is further...
 JUNCTION_LOOKAHEAD_MAX_M = 50.0  # ...up to this
 DONE_FRACTION = 0.75            # a turn released (too fast, blinker) this far through counts as done
+
+# ---- the lane the turn ends in ----
+# The arc ends on the exit road's OSM line, which is the middle of a one-way carriageway (a divided road's half) and
+# the centre of a two-way road. The tuning (TurnTuning) comes from two-way residential streets, one lane each way, where
+# the car's lane is half a lane right of that line. On other roads the turn starts earlier or later by the difference,
+# so it ends in the rightmost lane on a right turn and the nearest lane on a left (the driver's choice, 2026-11-17;
+# California expects the nearest lane on a left). A divided road's near half is one-way the wrong way for a left
+# turn, so the left branch is always found on the far half, after crossing the median.
+LANE_W = 3.5                    # m
+EXIT_SHIFT_MAX_M = 8.0
+BIG_ROADS = ("motorway", "trunk", "primary", "secondary")   # without a lanes tag: 2 lanes each way, else 1
 TURN_MIN_DEG = 45.0             # a branch is a turn on the blinker side when it leaves this much...
 TURN_MAX_DEG = 135.0            # ...and at most this much (beyond is a U-turn or a road doubling back)
 STRAIGHT_MAX_DEG = 30.0         # where the current way ends, the walk ahead follows a way continuing within this
@@ -173,6 +184,30 @@ def unwind_heading_deg(v: float, curvature: float) -> float:
   return math.degrees(v * k * (ACTUATOR_DELAY_S + 0.5 * k / curvature_rate(v, unwind=True)))
 
 
+def exit_lane_offset(branch, side: str) -> float:
+  """m right of the exit road's OSM line (in its direction of travel) of the lane the turn should end in: the rightmost
+  lane on a right turn, the nearest on a left."""
+  big = branch.highway in BIG_ROADS
+  if branch.oneway:
+    n = branch.lanes if branch.lanes > 0 else (2 if big else 1)
+    half = (n - 1) / 2.0 * LANE_W
+    return half if side == "right" else -half
+  n = branch.lanes if branch.lanes > 0 else (4 if big else 2)
+  per_dir = max(1, n // 2)
+  inner = LANE_W * (1.0 if (n % 2 == 1 and n >= 3) else 0.5)   # an odd count: a centre turn lane
+  return inner + (per_dir - 1) * LANE_W if side == "right" else inner
+
+
+def exit_shift(branch, side: str) -> float:
+  """m earlier (+) the turn starts than on the tuned case (a two-way road, one lane each way: the lane half a lane right
+  of the line), so it ends in the exit_lane_offset lane. An exit lane further toward the approach needs an earlier
+  start, by the lateral difference over sin(turn angle)."""
+  d = exit_lane_offset(branch, side) - 0.5 * LANE_W
+  sign = 1.0 if side == "right" else -1.0
+  shift = sign * d / max(math.sin(math.radians(abs(branch.change))), 0.5)
+  return min(max(shift, -EXIT_SHIFT_MAX_M), EXIT_SHIFT_MAX_M)
+
+
 # ---- local road network ----
 
 @dataclass
@@ -182,6 +217,7 @@ class LocalWay:
   oneway: bool
   xy: np.ndarray            # (n, 2) metres east, north of the LocalRoads origin, in OSM node order
   keys: list                # per node: its position key, shared by every way through that node
+  lanes: int = 0            # OSM lanes (both directions on a two-way road); 0 = not tagged
 
 
 @dataclass
@@ -200,6 +236,8 @@ class Branch:
   highway: str
   bearing: float            # deg, leaving the junction
   change: float             # deg, signed: positive = right
+  oneway: bool = False
+  lanes: int = 0            # OSM lanes; 0 = not tagged
 
 
 @dataclass
@@ -224,13 +262,14 @@ class LocalRoads:
     self.ways: list[LocalWay] = []
     self.nodes: dict[tuple[int, int], list[tuple[int, int]]] = {}
     seg_a, seg_b, seg_w, seg_i = [], [], [], []
-    for way_id, highway, oneway, pts in ways:
+    for way in ways:
+      way_id, highway, oneway, pts, *rest = way   # (id, highway, oneway, points[, lanes])
       if len(pts) < 2:
         continue
       xy = np.array([self.to_xy(la, lo) for la, lo in pts], dtype=np.float64)
       keys = [_key(la, lo) for la, lo in pts]
       wi = len(self.ways)
-      self.ways.append(LocalWay(int(way_id), highway, bool(oneway), xy, keys))
+      self.ways.append(LocalWay(int(way_id), highway, bool(oneway), xy, keys, int(rest[0]) if rest else 0))
       for ni, k in enumerate(keys):
         self.nodes.setdefault(k, []).append((wi, ni))
       seg_a.append(xy[:-1])
@@ -348,7 +387,8 @@ class LocalRoads:
             cont = (wj, nj, dj, change)
       if best is not None:
         bw = self.ways[best[0]]
-        return Junction(float(node[0]), float(node[1]), dist, arrival, Branch(bw.way_id, bw.highway, best[3], best[4]))
+        return Junction(float(node[0]), float(node[1]), dist, arrival,
+                        Branch(bw.way_id, bw.highway, best[3], best[4], bw.oneway, bw.lanes))
       # carry on along the road: the same way if it continues, else the straightest continuation
       if 0 <= ni + direction < len(w.xy):
         nxt = ni + direction
@@ -411,7 +451,7 @@ def read_local_roads(root: str, lat: float, lon: float, radius: float = LOCAL_RA
         continue
       seen.add(w.id)
       cls = HIGHWAY_CLASSES[w.highway] if w.highway < len(HIGHWAY_CLASSES) else "unknown"
-      ways.append((int(w.id), cls, bool(w.oneWay), pts))
+      ways.append((int(w.id), cls, bool(w.oneWay), pts, int(w.lanes)))
   return LocalRoads(lat, lon, ways) if found else None
 
 
@@ -544,6 +584,7 @@ class TurnPlanner:
     self.roads: LocalRoads | None = None
     self.dist = 0.0
     self.planned = 0.0
+    self.exit_shift = 0.0         # m earlier (+) or later (-) the turn starts, for the lane it ends in (exit_shift)
     self.progress = 0.0
     self.radius = 0.0
     self.curvature = 0.0
@@ -577,7 +618,7 @@ class TurnPlanner:
     half = math.radians(abs(change_deg)) / 2.0
     corner = self.tuning.lane_offset_m * math.tan(math.radians(change_deg) / 2.0)
     build = (1.0 / radius) / comfort_curvature_rate(v)
-    return radius * math.tan(half) + corner + v * (ACTUATOR_DELAY_S + 0.5 * build + self.tuning.lead_s)
+    return radius * math.tan(half) + corner + self.exit_shift + v * (ACTUATOR_DELAY_S + 0.5 * build + self.tuning.lead_s)
 
   def _new_fix(self, gps) -> bool:
     if gps is None or not getattr(gps, "hasFix", False):
@@ -681,6 +722,7 @@ class TurnPlanner:
     self.state, self.side, self.roads, self.junction = ARMED, side, roads, j
     self.junction_xy = (j.x, j.y)
     self.planned = j.branch.change
+    self.exit_shift = exit_shift(j.branch, side)
     self.dist = self._along(x, y)
     self.log.reason = ""
 
