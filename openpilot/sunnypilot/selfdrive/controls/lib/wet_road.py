@@ -12,9 +12,14 @@ already decodes, published in carStateSP. No camera, no network. The state is ev
 
   dry   -> wet    wipers running (a wipe at least every WIPE_GAP_S) for WET_ON_S: a single wipe or a washer squirt
                   doesn't count
-  wet   -> heavy  wipers at HEAVY_WPM or faster for HEAVY_ON_S, or traction control stepping in while wet (held
+  wet   -> heavy  the wipers moving HEAVY_DUTY of the time over the last DUTY_WINDOW_S (continuous wiping), or the
+                  signal at HEAVY_WPM or more, for HEAVY_ON_S; or traction control stepping in while wet (held
                   TCS_HOLD_S)
-  heavy -> wet    neither for HEAVY_OFF_S
+  heavy -> wet    none of these for HEAVY_OFF_S
+
+The wiper signal is not wipes a minute: on this car it reads a constant 9 while the blade moves and 0 between wipes
+(route 000000fe, 2026-11-16: 395 wipes of ~1.1 s, 2-15 s apart on intermittent/auto, continuous for minutes 6-8 and
+20). So how wet it is shows in how much of the time the wipers move, sampled every planner tick.
   wet   -> dry    wipers off for DRY_AFTER_S (the road stays wet after the rain stops)
 
 What each level changes (applied with WetRoadAssist; otherwise the level is only detected, published and logged):
@@ -24,6 +29,7 @@ What each level changes (applied with WetRoadAssist; otherwise the level is only
 WetRoadForce holds "wet" whatever the wipers say.
 """
 import math
+from collections import deque
 
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
@@ -38,7 +44,11 @@ NAMES = ("dry", "wet", "heavy")
 EVERY_S = 1.0           # evaluated this often
 WIPE_GAP_S = 15.0       # a wipe at least this often is "the wipers are running" (intermittent included)
 WET_ON_S = 30.0
-HEAVY_WPM = 50          # wipes a minute: fast wiping (to be confirmed against the stalk positions on the car)
+HEAVY_WPM = 50          # a signal value this high also counts as fast (in case the fast stalk position reads higher;
+                        # not seen yet: every recorded wipe read 9)
+HEAVY_DUTY = 0.85       # the wipers moving this fraction of the time...
+DUTY_WINDOW_S = 60.0    # ...over this long (and at least DUTY_MIN_S of it seen)
+DUTY_MIN_S = 30.0
 HEAVY_ON_S = 10.0
 HEAVY_OFF_S = 120.0
 TCS_HOLD_S = 120.0
@@ -61,7 +71,12 @@ class WetRoad:
     self.level = DRY             # detected
     self.applied = DRY           # what the planner uses: level (or wet when forced) with WetRoadAssist, else dry
     self.changed = False         # applied changed on this update
-    self.wiper = 0
+    self.wiper = 0               # the largest wiper signal over the last second
+    self.duty = 0.0              # fraction of the last DUTY_WINDOW_S the wipers were moving
+    self._on_s = 0.0             # this second: time the wiper signal was non-zero
+    self._sec_s = 0.0
+    self._sec_max = 0
+    self._duty_hist: deque[float] = deque(maxlen=round(DUTY_WINDOW_S / EVERY_S))
     self.tcs = False
     self._t = 0.0
     self._next = 0.0
@@ -84,6 +99,10 @@ class WetRoad:
     """Every planner tick (cheap: it only counts time); the state moves once every EVERY_S."""
     self.changed = False
     self._t += dt
+    self._sec_s += dt
+    if wiper_wpm > 0:   # every tick: a wipe lasts ~1.1 s, a once-a-second sample would miss some
+      self._on_s += dt
+      self._sec_max = max(self._sec_max, int(wiper_wpm))
     if self._t < self._next:
       return
     self._next = self._t + EVERY_S
@@ -92,7 +111,12 @@ class WetRoad:
       self._next_params = now + PARAMS_EVERY_S
       self._read_params()
 
-    self.wiper, self.tcs = int(wiper_wpm), bool(tcs_active)
+    self.wiper, self.tcs = self._sec_max, bool(tcs_active)
+    self._duty_hist.append(min(1.0, self._on_s / max(self._sec_s, 1e-3)))
+    self._on_s = self._sec_s = 0.0
+    self._sec_max = 0
+    seen_s = len(self._duty_hist) * EVERY_S
+    self.duty = sum(self._duty_hist) / len(self._duty_hist)
     if self.wiper > 0:
       self._wipe_last = now
     running = now - self._wipe_last <= WIPE_GAP_S
@@ -100,7 +124,7 @@ class WetRoad:
       self._wiping_since = now if self._wiping_since is None else self._wiping_since
     else:
       self._wiping_since = None
-    if self.wiper >= HEAVY_WPM:
+    if self.wiper >= HEAVY_WPM or (seen_s >= DUTY_MIN_S and self.duty >= HEAVY_DUTY):
       self._fast_since = now if self._fast_since is None else self._fast_since
       self._fast_last = now
     else:
@@ -125,7 +149,7 @@ class WetRoad:
     applied = max(self.level, WET if self.force else DRY) if (self.enabled or self.force) else DRY
     if applied != self.applied or self.level != prev:
       cloudlog.event("wet_road", level=NAMES[self.level], prev=NAMES[prev], applied=NAMES[applied], wiper=self.wiper,
-                     tcs=self.tcs, enabled=self.enabled, force=self.force)
+                     duty=round(self.duty, 2), tcs=self.tcs, enabled=self.enabled, force=self.force)
     self.changed = applied != self.applied
     self.applied = applied
     if self.applied != self._written:

@@ -18,12 +18,13 @@ Writes <media>/drive_summaries/<route>.json:
   error messages by process, and a few plain "headline" lines.
 """
 import argparse
+import bisect
 import glob
 import json
 import os
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 
 MPH = 2.23694
 SUMMARY_DIR = "drive_summaries"
@@ -74,6 +75,8 @@ def summarize(root: str, route: str) -> dict:
   events: Counter = Counter()
   lag_t: list[float] = []
   steer_override_t: list[float] = []
+  stop_track = StopTracker()
+  long_active = False
   # qlogs: driving data and events
   for seg in _segments(root, route):
     f = os.path.join(seg, "qlog.zst")
@@ -92,8 +95,10 @@ def summarize(root: str, route: str) -> dict:
           moving_s += dt if v > 0.5 else 0.0
         last_t = t
         v_max = max(v_max, v)
+        stop_track.add(t - t0, cs.vEgo, cs.aEgo, cs.standstill, brake, cs.cruiseState.enabled, long_active)
       elif w == "carControl":
         cc = m.carControl
+        long_active = cc.longActive
         if last_t is not None:
           lat_s += 0.1 if cc.latActive and v > 0.5 else 0.0
           long_s += 0.1 if cc.longActive else 0.0
@@ -123,7 +128,9 @@ def summarize(root: str, route: str) -> dict:
 
   # rlogs: the planners' own log events
   turns, stops, bumps = [], defaultdict(dict), defaultdict(dict)
-  wet_changes: list[tuple[float, str, str, int]] = []   # (t, level, applied, wiper)
+  wet_changes: list[tuple[float, str, str, int, float]] = []   # (t, level, applied, wiper, duty)
+  lat_handover: list[tuple[float, dict]] = []
+  long_handover: list[tuple[float, dict]] = []
   t_end = 0.0
   errors: Counter = Counter()
   cur_turn = None
@@ -170,7 +177,12 @@ def summarize(root: str, route: str) -> dict:
         else:
           s.setdefault("states", []).append(msg.get("state"))
       elif ev == "wet_road":
-        wet_changes.append((t, msg.get("level", "dry"), msg.get("applied", "dry"), msg.get("wiper") or 0))
+        wet_changes.append((t, msg.get("level", "dry"), msg.get("applied", "dry"), msg.get("wiper") or 0,
+                            msg.get("duty") or 0.0))
+      elif ev == "fisker_lat_handover":
+        lat_handover.append((t, msg))
+      elif ev == "fisker_long_handover":
+        long_handover.append((t, msg))
       elif ev in ("speed_bump", "speed_bump_left_to_driver"):
         bump = msg.get("bump")
         if bump is None:
@@ -188,6 +200,8 @@ def summarize(root: str, route: str) -> dict:
           b["mph_at_bump"] = round((msg.get("v") or 0) * MPH, 1)
 
   lag = [{"at_min": round(a / 60, 1), "s": round(b - a, 1)} for a, b in _clusters(lag_t)]
+  for tr in turns:
+    tr["steering"] = turn_steering(lat_handover, tr["at_min"] * 60, tr["at_min"] * 60 + (tr.get("s") or 0))
   out = {
     "route": route, "summarized": time.strftime("%Y-%m-%dT%H:%M:%S"),
     "miles": round(miles, 1), "moving_min": round(moving_s / 60, 1), "max_mph": round(v_max * MPH),
@@ -200,16 +214,95 @@ def summarize(root: str, route: str) -> dict:
     "stop_signs": list(stops.values()),
     "speed_bumps": list(bumps.values()),
     "wet_road": wet_summary(wet_changes, t_end),
+    "stops": stop_track.stops,
+    "long_handover": long_handover_summary(long_handover),
     "errors": [{"process": d, "msg": msg, "n": n} for (d, msg), n in errors.most_common(10)],
   }
   out["headline"] = headline(out)
   return out
 
 
-def wet_summary(changes: list[tuple[float, str, str, int]], t_end: float) -> dict:
+LAT_FLAGS = ("intervening", "torque_latch_only", "angle_latch", "eps_recovery", "coop")
+EPS_STS = {0: "off", 1: "available", 2: "active", 3: "failure"}
+
+
+def turn_steering(handover: list[tuple[float, dict]], t_a: float, t_b: float) -> dict:
+  """Who held the wheel during an assisted turn, from the car controller's fisker_lat_handover lines: the share of
+  the turn the EPS was active (in control) and which yield latches were set at any point. Empty without the lines."""
+  if not handover:
+    return {}
+  times = [t for t, _ in handover]
+  i = max(bisect.bisect_right(times, t_a) - 1, 0)
+  active_s, flags, sts = 0.0, set(), set()
+  while i < len(handover) and handover[i][0] < t_b:
+    a = max(handover[i][0], t_a)
+    b = min(handover[i + 1][0] if i + 1 < len(handover) else t_b, t_b)
+    h = handover[i][1]
+    sts.add(EPS_STS.get(h.get("eps_sts"), str(h.get("eps_sts"))))
+    if h.get("eps_sts") == 2 and h.get("tx"):
+      active_s += max(b - a, 0.0)
+    flags.update(f for f in LAT_FLAGS if h.get(f))
+    i += 1
+  dur = max(t_b - t_a, 1e-3)
+  return {"eps_active_pct": round(100 * active_s / dur), "eps_states": sorted(sts), "flags": sorted(flags)}
+
+
+def long_handover_summary(handover: list[tuple[float, dict]]) -> dict:
+  """openpilot speed control commanding periods, and why each ended (fisker_long_handover lines)."""
+  runs, ends, start = 0, Counter(), None
+  for t, h in handover:
+    if h.get("commanding") and start is None:
+      start, runs = t, runs + 1
+    elif not h.get("commanding") and start is not None:
+      why = ("gas" if h.get("gas") else "vcu not ready" if h.get("vcu_acc_rdy_lost") else
+             "openpilot off" if not h.get("long_active") else f"acc state {h.get('acc_state')}" if h.get("acc_state") not in (3, 5, 6, 11)
+             else "oem frame not valid" if h.get("oem_vld") != 1 else "other")
+      ends[why] += 1
+      start = None
+  return {"runs": runs, "ended": dict(ends)} if handover else {}
+
+
+class StopTracker:
+  """Stops to standstill from the 10 Hz qlog carState: who stopped the car, the jerk over the last 0.5 s (a coarse
+  10 Hz estimate of the "head nod"; tools stops.py has the 100 Hz figure) and how far it rolled in the 3 s after."""
+  def __init__(self):
+    self.rows: deque = deque(maxlen=60)   # 6 s at 10 Hz
+    self.stops: list[dict] = []
+    self.moving = False
+    self.pending: dict | None = None
+    self.prev_standstill = False
+
+  def add(self, t, v, a, standstill, brake, cruise, long_active):
+    self.rows.append((t, v, a, brake, cruise, long_active))
+    if self.pending is not None:
+      if t - self.pending["_t"] <= 3.0:
+        self.pending["rolled_m"] = round(self.pending["rolled_m"] + v * 0.1, 2)
+      else:
+        self.pending.pop("_t")
+        self.pending = None
+    if v > 3.0:
+      self.moving = True
+    if self.moving and standstill and not self.prev_standstill:
+      self.moving = False
+      rows = list(self.rows)
+      late = [r for r in rows if t - r[0] <= 1.0]
+      who = ("op-long" if any(r[5] for r in late) else "driver" if any(r[3] for r in late)
+             else "car-ACC" if any(r[4] for r in late) else "driver")
+      # aEgo smoothed over 3 samples (0.3 s) first: the 10 Hz samples alone read gentle pedal stops at 3-6 m/s^3
+      sm = [(rows[k][0], sum(r[2] for r in rows[max(0, k - 2):k + 1]) / len(rows[max(0, k - 2):k + 1])) for k in range(len(rows))]
+      fin = [x for x in sm if t - x[0] <= 0.7]
+      jerk = max((abs(fin[k + 1][1] - fin[k][1]) / max(fin[k + 1][0] - fin[k][0], 1e-3) for k in range(len(fin) - 1)),
+                 default=0.0)
+      self.pending = {"at_min": round(t / 60, 2), "who": who, "decel": round(min(r[2] for r in rows), 2),
+                      "final_jerk": round(jerk, 1), "rolled_m": 0.0, "_t": t}
+      self.stops.append(self.pending)
+    self.prev_standstill = standstill
+
+
+def wet_summary(changes: list[tuple], t_end: float) -> dict:
   """Minutes in each wet road level from the planner's wet_road events (one per change)."""
   mins = {"wet": 0.0, "heavy": 0.0, "applied": 0.0}
-  for i, (t, level, applied, _) in enumerate(changes):
+  for i, (t, level, applied, *_) in enumerate(changes):
     t_next = changes[i + 1][0] if i + 1 < len(changes) else t_end
     dur = max(t_next - t, 0.0) / 60
     if level in mins:
@@ -217,7 +310,8 @@ def wet_summary(changes: list[tuple[float, str, str, int]], t_end: float) -> dic
     if applied != "dry":
       mins["applied"] += dur
   return {"wet_min": round(mins["wet"], 1), "heavy_min": round(mins["heavy"], 1), "applied_min": round(mins["applied"], 1),
-          "max_wiper": max((c[3] for c in changes), default=0)}
+          "max_wiper": max((c[3] for c in changes), default=0),
+          "max_duty": max((c[4] if len(c) > 4 else 0.0 for c in changes), default=0.0)}
 
 
 def headline(s: dict) -> list[str]:
@@ -240,6 +334,16 @@ def headline(s: dict) -> list[str]:
     lines.append(f"wet road {wet['wet_min']} min, heavy rain {wet['heavy_min']} min ({how})")
   if s["stop_signs"]:
     lines.append(f"{len(s['stop_signs'])} stop signs approached")
+  stops = s.get("stops") or []
+  if stops:
+    by = defaultdict(list)
+    for st in stops:
+      by[st["who"]].append(st["final_jerk"])
+    lines.append("stops: " + ", ".join(f"{who} {len(j)} (worst final jerk {max(j)})" for who, j in by.items()))
+  steer = [t["steering"] for t in s["map_turns"] if t.get("steering")]
+  if steer:
+    held = sum(1 for x in steer if x["eps_active_pct"] >= 80)
+    lines.append(f"turn assist held the wheel in {held} of {len(steer)} turns")
   if s["errors"]:
     lines.append(f"{sum(e['n'] for e in s['errors'])} error log lines (top: {s['errors'][0]['process']})")
   return lines

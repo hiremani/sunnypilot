@@ -325,6 +325,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"WetRoadAssist", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"WetRoadForce", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"WetRoadLevel", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, INT, "0"}},
+    {"FiskerStopTest", {CLEAR_ON_MANAGER_START, INT, "0"}},
     {"SmartCruiseControlVision", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // Torque lateral control custom params

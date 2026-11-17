@@ -91,6 +91,7 @@ PARAM_ALLOWLIST: dict[str, tuple[type, Callable[[int], bool] | None]] = {
   "TrafficSignalCoast": (bool, None),
   "CrosswalkCaution": (bool, None),
   "WetRoadAssist": (bool, None),
+  "FiskerStopTest": (int, lambda v: v in (0, 1, 2)),
   "WetRoadForce": (bool, None),
   # sunnypilot's e2e chimes while stopped and not engaged: the car ahead pulled away / the model sees the way clear
   "LeadDepartAlert": (bool, None),

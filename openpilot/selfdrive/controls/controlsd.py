@@ -24,6 +24,7 @@ from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile
+from openpilot.sunnypilot.selfdrive.controls.lib import stop_test
 from openpilot.sunnypilot.selfdrive.controls.lib.turn_planner import TurnPlanner
 from openpilot.sunnypilot.selfdrive.controls.lib import wet_road
 from openpilot.sunnypilot.selfdrive.controls.lib.narrow_street import PARAM as NARROW_PARAM, CenterLineKeeper
@@ -72,6 +73,7 @@ class Controls(ControlsExt):
     # a small curvature correction, only ever to the right. Re-read with the map turn params.
     self.center_line_keeper = CenterLineKeeper(DT_CTRL)
     self.narrow_street_assist = False
+    self.stop_test = 0                   # FiskerStopTest (stop_test.py), re-read with the map turn params
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -108,6 +110,10 @@ class Controls(ControlsExt):
         self.narrow_street_assist = self.params.get_bool(NARROW_PARAM)
       except Exception:
         self.narrow_street_assist = False
+      try:
+        self.stop_test = int(self.params.get(stop_test.PARAM, return_default=True) or 0)
+      except Exception:
+        self.stop_test = 0
       if self._turn_param_frame % 1000 == 0:   # the driver profile's turn starts from a stop (about every 10 s)
         try:   # a problem here keeps the planner's current tuning (default: off)
           profile = driver_profile.active(self.params)
@@ -196,6 +202,8 @@ class Controls(ControlsExt):
     # accel PID loop
     pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, self.CP_SP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
     actuators.accel = float(self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits))
+    if self.stop_test and CC.longActive:   # low-speed stop test (off unless FiskerStopTest is set for a test drive)
+      actuators.accel = stop_test.soften(actuators.accel, CS.vEgo, long_plan.aTarget, self.stop_test)
 
     # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage
