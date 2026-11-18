@@ -19,6 +19,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Polic
 SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
 
 ALL_SOURCES = tuple(SpeedLimitSource.schema.enumerants.values())
+CAR_DROP_MAX = 10 * CV.MPH_TO_MS   # the car's reading this far below the map's limit: use the map's
 
 
 class SpeedLimitResolver:
@@ -173,6 +174,12 @@ class SpeedLimitResolver:
     self._get_from_map_data(sm)
 
     source = self._get_source_solution_according_to_policy()
+    # Car-first policy: the car's sign reading far below the map's limit is not trusted (driver's choice, 2026-11-18): route 0000010d,
+    # Warm Springs Blvd, the car read 25 mph (most likely a school-zone sign) on a 40 mph road and openpilot slowed.
+    map_limit = self.limit_solutions[SpeedLimitSource.map]
+    if Policy(self.policy) == Policy.car_state_priority and source == SpeedLimitSource.car and map_limit > 0. \
+       and self.limit_solutions[SpeedLimitSource.car] < map_limit - CAR_DROP_MAX:
+      source = SpeedLimitSource.map
     speed_limit = self.limit_solutions[source] if source else 0.
     distance = self.distance_solutions[source] if source else 0.
 

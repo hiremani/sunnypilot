@@ -89,6 +89,8 @@ class TestSpeedLimitResolverValidation(OpenpilotTestCase):
     resolver = resolver_class()
     resolver.policy = policy
     sm_mock = setup_sm_mock(mocker)
+    if policy == Policy.car_state_priority:   # the car's reading far below the map's is not used (test_car_drop_guard)
+      sm_mock['liveMapDataSP'].speedLimit = min(sm_mock['liveMapDataSP'].speedLimit, sm_mock['carStateSP'].speedLimit)
     source_speed_limit = sm_mock[sm_key].speedLimit
 
     # Assert the resolver

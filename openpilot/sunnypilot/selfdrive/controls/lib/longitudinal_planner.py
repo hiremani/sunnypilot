@@ -86,6 +86,7 @@ class LongitudinalPlannerSP:
     self.profile = driver_profile.DriverProfile()
     self.profile_on = False
     self.profile_speed_on = False
+    self.speed_cap = profile_long.ProfileSpeedCap()   # the driverSpeed target: coasts down, keeps the driver's choice
     self.turn_exit_left = 0.0     # s left of the pull-away window after a junction turn
     self.narrow_speed = narrow_street.NARROW_SPEED
     self.lead_coasting = False
@@ -207,8 +208,11 @@ class LongitudinalPlannerSP:
       limit = self.resolver.speed_limit
       if self.profile_speed_on and self.resolver.speed_limit_valid:
         v_cap = profile_long.profile_speed(limit, self.profile.speed_offset_mph(limit * CV.MS_TO_MPH))
+        v_cap = self.speed_cap.update(v_cap, limit, v_ego, bool(sm['carState'].gasPressed), DT_MDL)
         if v_cap is not None:
-          targets[LongitudinalPlanSource.driverSpeed] = (v_cap, profile_long.PROFILE_SPEED_ACCEL if v_ego > v_cap + 0.5 else a_ego)
+          targets[LongitudinalPlanSource.driverSpeed] = (v_cap, -profile_long.PROFILE_COAST_DECEL if v_ego > v_cap + 0.5 else a_ego)
+      else:
+        self.speed_cap.update(None, 0.0, v_ego, False, DT_MDL)
 
     # map turn assist armed for a signaled turn ahead (or turning): slow to the junction speed before it
     if self.openpilot_long:

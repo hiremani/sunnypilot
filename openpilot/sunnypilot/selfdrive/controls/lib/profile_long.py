@@ -53,6 +53,38 @@ def junction_approach_v(dist_m: float, v_turn: float, v_ego: float) -> float:
 
 PROFILE_SPEED_ACCEL = -0.5  # m/s^2 to get down to a lower cap (a new, lower limit)
 
+# The speed-by-limit cap only coasts (driver's choice, 2026-11-18). Route 0000010d (Warm Springs Blvd): the car's sign
+# reading dropped from 40 to 25 mph and the cap braked at -1.2 m/s^2 from 38 mph; the driver pressed the gas, and on
+# every release it braked again (16 gas take-overs in one drive). Now the cap comes down no faster than
+# PROFILE_COAST_DECEL from the current speed, and once the driver drives above it with the gas it stays at the speed
+# they chose until the posted limit changes.
+PROFILE_COAST_DECEL = 0.3   # m/s^2
+
+
+class ProfileSpeedCap:
+  """The driverSpeed target: the profile's cap for the posted limit, coming down at most PROFILE_COAST_DECEL and
+  raised to the speed the driver chose with the gas above it (until the limit changes)."""
+
+  def __init__(self):
+    self.v = None         # the current (ramped) target, m/s
+    self.floor = 0.0      # the driver's chosen speed above the cap, m/s
+    self.limit = 0.0      # the posted limit the floor belongs to, m/s
+
+  def update(self, v_cap: float | None, limit_ms: float, v_ego: float, gas: bool, dt: float) -> float | None:
+    if v_cap is None:
+      self.v, self.floor, self.limit = None, 0.0, 0.0
+      return None
+    if abs(limit_ms - self.limit) > 0.5:
+      self.floor, self.limit = 0.0, limit_ms
+    if gas and v_ego > v_cap:
+      self.floor = max(self.floor, v_ego)
+    want = max(v_cap, self.floor)
+    if self.v is None or want >= self.v:
+      self.v = want
+    else:
+      self.v = max(want, min(self.v, v_ego + 0.5) - PROFILE_COAST_DECEL * dt)
+    return self.v
+
 # A gentle pull-away with openpilot speed control, whatever the profile: the most acceleration openpilot asks for, by
 # speed. Route 00000103 (2026-11-16): after every turn and stop openpilot asked for its +1.0 m/s^2 maximum (the stock
 # planner wanted 1.3-1.45) and the Ocean delivered up to +1.44: "accelerated fast". The car overshoots a request by

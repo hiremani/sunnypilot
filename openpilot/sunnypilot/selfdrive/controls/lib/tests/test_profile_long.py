@@ -85,3 +85,37 @@ class TestJunctionApproach(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestProfileSpeedCap(unittest.TestCase):
+  """Route 0000010d (Warm Springs Blvd): a lower limit read at 38 mph braked at -1.2 m/s^2, and every gas release
+  braked again. The cap now coasts down and keeps the driver's chosen speed until the limit changes."""
+  DT = 0.05
+
+  def test_coasts_down_to_a_lower_cap(self):
+    cap = pl.ProfileSpeedCap()
+    v = 17.0
+    cap.update(17.9, 17.9, v, False, self.DT)                 # 40 mph limit, cruising
+    vs = [cap.update(11.2, 11.2, v, False, self.DT) for _ in range(40)]   # the limit drops to 25 mph
+    assert vs[0] > 16.0                                       # no step down to the new cap
+    for a, b in zip(vs, vs[1:], strict=False):
+      assert a - b <= pl.PROFILE_COAST_DECEL * self.DT + 1e-9  # comes down no faster than coasting
+    cap2 = pl.ProfileSpeedCap()
+    cap2.update(11.2, 11.2, 11.0, False, self.DT)
+    assert cap2.update(11.2, 11.2, 11.0, False, self.DT) == 11.2   # at or below the cap: the cap itself
+
+  def test_driver_choice_above_the_cap_sticks_until_the_limit_changes(self):
+    cap = pl.ProfileSpeedCap()
+    cap.update(15.0, 15.6, 15.0, False, self.DT)
+    cap.update(15.0, 15.6, 18.5, True, self.DT)               # gas: driving 41 mph above the 34 mph cap
+    for _ in range(200):
+      v = cap.update(15.0, 15.6, 18.5, False, self.DT)        # foot off the gas
+    assert v >= 18.5 - 1e-9                                   # no pull back
+    v = cap.update(13.0, 13.4, 18.5, False, self.DT)          # a new posted limit: the choice is dropped (coasting)
+    assert v < 18.5 + 0.5
+
+  def test_rises_at_once_and_resets_without_a_limit(self):
+    cap = pl.ProfileSpeedCap()
+    cap.update(11.2, 11.2, 11.0, False, self.DT)
+    assert cap.update(17.9, 17.9, 11.0, False, self.DT) == 17.9
+    assert cap.update(None, 0.0, 11.0, False, self.DT) is None
