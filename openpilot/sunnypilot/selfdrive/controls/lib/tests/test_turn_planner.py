@@ -8,6 +8,8 @@ import math
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
+
 from openpilot.sunnypilot.selfdrive.controls.lib import turn_planner as tp
 
 LAT0, LON0 = 37.5, -121.95
@@ -617,3 +619,49 @@ class TestUnwindSpeed(unittest.TestCase):
     self.assertGreater(untuned, 96.0)          # holding on too long: the slow wheel carries the car past the road
     self.assertLess(abs(tuned - 90.0), abs(untuned - 90.0) - 4.0)
     self.assertAlmostEqual(tuned, 90.0, delta=6.0)
+
+
+class TestDoorwayPath(unittest.TestCase):
+  """The driver's way of planning a turn (2026-11-20): the lines along the lane the car is in and back along the target
+  lane meet at the corner; a smooth curve between the two, straight at both ends. Shape fitted to 118 of the driver's
+  own turns (in 0.85 / out 0.40: 0.23 m median from the driven path)."""
+
+  def test_ends_straight_in_the_target_lane(self):
+    p = tp.doorway_path(0.0, -15.0, 0.0, 8.0, -1.75, 90.0, 0.85, 0.40)
+    self.assertAlmostEqual(p.heading[-1], 90.0, delta=1.0)
+    self.assertLess(abs(p.curvature[0]), 0.01)            # leaves the lane straight...
+    self.assertLess(abs(p.curvature[-1]), 0.03)           # ...and joins the target lane nearly straight
+    self.assertGreater(p.k_max, 0.05)
+    left = tp.doorway_path(0.0, -15.0, 0.0, -8.0, 1.75, -90.0, 0.85, 0.40)
+    self.assertAlmostEqual(left.heading[-1], -90.0, delta=1.0)
+    self.assertLess(float(np.min(left.curvature)), 0.0)
+
+  def test_no_corner_no_path(self):
+    self.assertIsNone(tp.doorway_path(0.0, 0.0, 0.0, 0.0, 30.0, 5.0, 0.8, 0.4))       # nearly straight on
+    self.assertIsNone(tp.doorway_path(0.0, 0.0, 0.0, 8.0, -20.0, 90.0, 0.8, 0.4))     # the corner is behind the car
+
+  def _drive(self, side: str, path: bool) -> tuple[tp.TurnPlanner, SlowUnwindCar, bool]:
+    p = planner(t_junction(right=True, left=True))
+    if path:
+      t = p.tuning
+      t.path_in, t.path_out = 0.85, 0.40
+      t.path_start_left_m = t.path_start_right_m = 13.0
+      t.path_exit_left_m = t.path_exit_right_m = 20.0
+    car = SlowUnwindCar(p, 120.0)
+    used = False
+    for _ in range(int(30.0 / DT)):
+      car.step(right=side == "right", left=side == "left")
+      used = used or p.path is not None
+    return p, car, used
+
+  def test_path_turns_follow_it_and_finish_lined_up(self):
+    for side, want in (("right", 90.0), ("left", -90.0)):
+      p, car, used = self._drive(side, True)
+      self.assertTrue(used)
+      self.assertEqual(p.log.reason, "done")
+      self.assertAlmostEqual(car.h, want, delta=8.0)
+
+  def test_off_by_default(self):
+    _, _, used = self._drive("right", False)
+    self.assertFalse(used)
+

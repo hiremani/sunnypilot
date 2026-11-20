@@ -158,6 +158,20 @@ class TurnTuning:
                                    # ~25 m before the junction node in a ~20 m arc, the planner's own start is ~10 m
                                    # (4 turns, routes f0 f3 f5 f6; f6 is the Doane St turn the driver led by 2 s)
   v_turn: float = V_TURN_DEFAULT   # m/s: the driver's junction speed (driver profile junction_turn_mph)
+  # The driver's own way of planning a turn (2026-11-20): from the end of the lane the car is in, the straight lines
+  # along it and back along the target lane meet at the corner; the path is a smooth curve between the two lanes'
+  # midpoints, bent toward that corner, and the steering follows it gradually (straight -> build -> ease -> straight).
+  # A quintic Bezier with its guide points on those two lines: zero curvature at both ends. All from the driver
+  # profile (turn_path_*): personal. path_in = 0: off, the fixed-radius arc.
+  path_in: float = 0.0          # guide points this fraction of the way from the car to the corner (0..1; bigger = later,
+                                # tighter turn-in)
+  path_out: float = 0.0         # ...and from the target lane's start back toward the corner (bigger = later straightening)
+  path_start_left_m: float = 0.0   # m before the junction node where the driver starts bending a left turn (moving)
+  path_start_right_m: float = 0.0
+  path_exit_left_m: float = 0.0    # m past the junction node, along the target road, where the turn is finished
+  path_exit_right_m: float = 0.0
+  path_radius_m: float = 0.0       # > 0: start instead when the path from here is this tight at its sharpest (the
+                                   # driver's usual), so the start fits each junction's size; 0: path_start_*_m
   unwind_wheel_deg_s: float = 0.0  # deg/s: how fast the wheel comes back at the end of a turn (driver profile
                                    # turn_unwind_deg_s); 0 = the car's own rate limit. The release point allows for the
                                    # heading the car still turns while the wheel comes back at this speed.
@@ -234,6 +248,55 @@ def exit_shift(branch, side: str) -> float:
   sign = 1.0 if side == "right" else -1.0
   shift = sign * d / max(math.sin(math.radians(abs(branch.change))), 0.5)
   return min(max(shift, -EXIT_SHIFT_MAX_M), EXIT_SHIFT_MAX_M)
+
+
+# ---- the driver's path between the two lanes (TurnTuning.path_*) ----
+
+PATH_SAMPLES = 120
+PATH_LOOK_M = 40.0              # path_radius_m: the start is looked for this close to the junction node
+PATH_HEADING_GAIN = 0.25        # 1/m of curvature per rad of heading behind the path: the heading is caught up over ~4 m
+
+
+@dataclass
+class DoorwayPath:
+  s: np.ndarray                 # m along the path
+  heading: np.ndarray           # deg turned since the start (positive = right)
+  curvature: np.ndarray         # 1/m (positive = right)
+  length: float
+  k_max: float                  # 1/m, the sharpest point
+
+
+def doorway_path(x0: float, y0: float, bearing0: float, x1: float, y1: float, bearing1: float,
+                 f_in: float, f_out: float) -> DoorwayPath | None:
+  """The path from the car (x0, y0, heading bearing0) to the target lane's start (x1, y1, heading bearing1): the two
+  lanes' straight lines meet at the corner C; guide points sit f_in of the way from the car toward C and f_out of the
+  way from the lane start back toward C (two on each line, so the path leaves and joins both lanes straight). None
+  when the lines don't meet ahead of the car and behind the lane start (no corner to cut)."""
+  d0 = np.array([math.sin(math.radians(bearing0)), math.cos(math.radians(bearing0))])
+  d1 = np.array([math.sin(math.radians(bearing1)), math.cos(math.radians(bearing1))])
+  p0, p1 = np.array([x0, y0]), np.array([x1, y1])
+  den = d0[0] * d1[1] - d0[1] * d1[0]
+  if abs(den) < 0.2:             # under ~12 deg apart: not a junction turn
+    return None
+  r = p1 - p0                    # a d0 + b d1 = r: p0 + a d0 = p1 - b d1 = C, the corner
+  a = (r[0] * d1[1] - r[1] * d1[0]) / den
+  b = (d0[0] * r[1] - d0[1] * r[0]) / den
+  if a <= 0.5 or b <= 0.5:
+    return None
+  f_in, f_out = min(max(f_in, 0.05), 0.95), min(max(f_out, 0.05), 0.95)
+  ctrl = np.array([p0, p0 + 0.5 * f_in * a * d0, p0 + f_in * a * d0,
+                   p1 - f_out * b * d1, p1 - 0.5 * f_out * b * d1, p1])
+  t = np.linspace(0.0, 1.0, PATH_SAMPLES)[:, None]
+  coef = [1, 5, 10, 10, 5, 1]
+  pts = sum(coef[i] * (1 - t) ** (5 - i) * t ** i * ctrl[i] for i in range(6))
+  seg = np.diff(pts, axis=0)
+  ds = np.hypot(seg[:, 0], seg[:, 1])
+  bearing = np.degrees(np.unwrap(np.arctan2(seg[:, 0], seg[:, 1])))
+  heading = np.concatenate([[0.0], bearing - math.degrees(math.atan2(d0[0], d0[1]))])
+  heading = heading[1:]
+  s_mid = np.cumsum(ds) - ds / 2.0
+  k = np.gradient(np.radians(heading), s_mid)
+  return DoorwayPath(s=s_mid, heading=heading, curvature=k, length=float(np.sum(ds)), k_max=float(np.max(np.abs(k))))
 
 
 # ---- local road network ----
@@ -577,6 +640,7 @@ class StaticRoads:
 # ---- the planner ----
 
 IDLE, ARMED, TURNING, DONE = "idle", "armed", "turning", "done"
+_WAIT = object()   # TurnPlanner._path_start: armed, not yet
 
 
 @dataclass
@@ -638,6 +702,10 @@ class TurnPlanner:
     self.no_match_t = 0.0
     self.waited_stopped = False   # armed and stopped (at the stop line) at some point
     self.blinker_off_t = 0.0      # s the blinker has been off while turning
+    self.path: DoorwayPath | None = None   # turning along the driver's path (TurnTuning.path_*), else the arc
+    self.path_s = 0.0             # m driven along it
+    self.path_head = 0.0          # deg the car has turned since it started (positive = right)
+    self.arrival_way: LocalWay | None = None
 
   def _end(self, reason: str) -> None:
     if self.state in (ARMED, TURNING):
@@ -771,6 +839,7 @@ class TurnPlanner:
     if j is None:
       return
     self.state, self.side, self.roads, self.junction = ARMED, side, roads, j
+    self.arrival_way = roads.ways[m.way]
     self.junction_xy = (j.x, j.y)
     self.planned = j.branch.change
     self.exit_shift = exit_shift(j.branch, side)
@@ -813,6 +882,9 @@ class TurnPlanner:
       return None   # wait: the turn only starts at a turn speed
     if v < V_START_MIN:
       self.waited_stopped = True
+    path_start = self._path_start(v)
+    if path_start is not None:
+      return path_start if path_start is not _WAIT else None
     r = self.radius_for(self.side, v)
     start = self.start_distance(r, self.planned, v)
     stop_start = self.tuning.stop_start_left_m if self.side == "left" else self.tuning.stop_start_right_m
@@ -842,6 +914,87 @@ class TurnPlanner:
     self.curvature = sign * max(0.0, sign * self._k_meas)
     self.log.start_dist = self.dist
     return self._turning(0.0, v, 0.0, side, lat_active, False, 0.0, None)
+
+  def _path_on(self) -> tuple[float, float] | None:
+    """(start m before the node, finish m past it) of the driver's path for this side, or None: path turns off."""
+    t = self.tuning
+    start, finish = ((t.path_start_left_m, t.path_exit_left_m) if self.side == "left" else
+                     (t.path_start_right_m, t.path_exit_right_m))
+    if t.path_in <= 0.0 or t.path_out <= 0.0 or start <= 0.0 or finish <= 0.0 or self.arrival_way is None:
+      return None
+    return start, finish
+
+  def build_path(self) -> DoorwayPath | None:
+    """The driver's path from where the car is now (in its lane: the rightmost on a right turn, the inner one on a left)
+    to the target lane, path_exit_*_m past the junction node in the lane the turn ends in (exit_lane_offset)."""
+    on = self._path_on()
+    if on is None or self.junction is None:
+      return None
+    j = self.junction
+    hb, eb = math.radians(j.arrival_bearing), math.radians(j.branch.bearing)
+    lane0 = exit_lane_offset(self.arrival_way, self.side)
+    x0 = j.x - math.sin(hb) * self.dist + math.cos(hb) * lane0
+    y0 = j.y - math.cos(hb) * self.dist - math.sin(hb) * lane0
+    lane1 = exit_lane_offset(j.branch, self.side)
+    x1 = j.x + math.sin(eb) * on[1] + math.cos(eb) * lane1
+    y1 = j.y + math.cos(eb) * on[1] - math.sin(eb) * lane1
+    return doorway_path(x0, y0, j.arrival_bearing, x1, y1, j.branch.bearing, self.tuning.path_in, self.tuning.path_out)
+
+  def _path_start(self, v: float):
+    """Armed, with the driver's path on: start it where the driver starts (path_start_*_m before the node, or moving
+    off from the stop line within stop_start_*_m). None: path turns off or this path can't be driven from here (the
+    arc logic decides); _WAIT: not yet; else the first curvature."""
+    on = self._path_on()
+    if on is None:
+      return None
+    stop_start = self.tuning.stop_start_left_m if self.side == "left" else self.tuning.stop_start_right_m
+    early = self.waited_stopped and self.dist <= stop_start
+    if self.tuning.path_radius_m > 0.0 and not early:
+      if self.dist > PATH_LOOK_M:
+        return _WAIT
+      ahead = self.dist
+      self.dist -= v * ACTUATOR_DELAY_S          # where the car will be when the command takes effect
+      path = self.build_path()
+      self.dist = ahead
+      if path is not None and path.k_max < 1.0 / self.tuning.path_radius_m:
+        return _WAIT                             # still gentler than the driver's usual: not yet
+    elif self.dist > on[0] + v * ACTUATOR_DELAY_S and not early:
+      return _WAIT
+    if v < V_START_MIN:
+      return _WAIT   # stopped at the line: wait for the car to move off
+    path = self.build_path()   # the car slows to the driver's junction speed (v_turn) through the turn
+    if path is None or path.k_max > min(1.0 / R_MIN, A_LAT_MAX / max(min(v, self.tuning.v_turn), 0.1) ** 2):
+      return None    # no corner to cut from here, or too tight: the arc logic (late start, "too late")
+    self.state, self.radius, self.progress, self.t_turn = TURNING, 1.0 / max(path.k_max, 1e-3), 0.0, 0.0
+    self.stall_t, self.stall_ref, self.override_t = 0.0, 0.0, 0.0
+    self.path, self.path_s, self.path_head = path, 0.0, 0.0
+    sign = 1.0 if self.side == "right" else -1.0
+    self.curvature = sign * max(0.0, sign * self._k_meas)
+    self.log.start_dist = self.dist
+    return self._follow_path(0.0, v, 0.0, None)
+
+  def _follow_path(self, dt, v, yaw_rate, model_curvature) -> float | None:
+    """The curvature along the driver's path at the distance driven (looking ahead by the actuator delay), plus a pull
+    toward the path's heading there; done at its end, where it is straight again in the target lane."""
+    p = self.path
+    self.path_s += v * dt
+    self.path_head -= math.degrees(yaw_rate) * dt
+    if self.path_s >= p.length:
+      self._end("done")
+      return None
+    k_ff = float(np.interp(min(self.path_s + v * ACTUATOR_DELAY_S, p.length), p.s, p.curvature))
+    h_des = float(np.interp(self.path_s, p.s, p.heading))
+    target = k_ff + PATH_HEADING_GAIN * math.radians(h_des - self.path_head)
+    k_lim = min(A_LAT_MAX / max(v, 0.1) ** 2, MAX_CURVATURE)
+    target = min(max(target, -k_lim), k_lim)
+    if model_curvature is not None:
+      # the last BLEND_DEG of the path's heading: into the model's lane centering, as the arc does
+      w = min(1.0, max(0.0, (abs(p.heading[-1]) - abs(h_des)) / BLEND_DEG))
+      target = w * target + (1.0 - w) * model_curvature
+    unwind = abs(target) < abs(self.curvature) or target * self.curvature < 0.0
+    step = comfort_curvature_rate(v, unwind) * max(dt, 0.01)
+    self.curvature = min(max(target, self.curvature - step), self.curvature + step)
+    return self.curvature
 
   def _turning(self, dt, v, yaw_rate, side, lat_active, pressed, torque, model_curvature) -> float | None:
     sign = 1.0 if self.side == "right" else -1.0
@@ -877,13 +1030,16 @@ class TurnPlanner:
     release_at = self.tuning.release_deg + unwind_heading_deg(v, max(0.0, sign * k_meas), self.tuning.unwind_wheel_deg_s)
     if model_curvature is not None:
       release_at += BLEND_HANDOVER_DEG   # the model is steering by then: its lane centering finishes the turn
-    if remaining <= release_at:
+    if self.path is None and remaining <= release_at:
       self._end("done")
       return None
     if self.t_turn > TURN_TIMEOUT_S:
       self._end("timeout")
       return None
-    if v > STALL_MIN_V:
+    # the driver's path starts nearly straight: only a car that falls behind the path's own heading is stalling
+    on_plan = self.path is not None and (abs(float(np.interp(self.path_s, self.path.s, self.path.heading))) -
+                                         abs(self.path_head)) < STALL_DEG
+    if v > STALL_MIN_V and not on_plan:
       self.stall_t += dt
     if self.progress - self.stall_ref >= STALL_DEG:
       self.stall_ref, self.stall_t = self.progress, 0.0
@@ -896,6 +1052,8 @@ class TurnPlanner:
     if self.override_t > OVERRIDE_S:
       self._end("driver override")
       return None
+    if self.path is not None:
+      return self._follow_path(dt, v, yaw_rate, model_curvature)
     kappa = min(1.0 / self.radius, A_LAT_MAX / max(v, 0.1) ** 2, MAX_CURVATURE)
     taper = 1.0 if self.tuning.taper_deg <= 0 else min(1.0, max(self.tuning.taper_min, remaining / self.tuning.taper_deg))
     target = sign * kappa * taper
