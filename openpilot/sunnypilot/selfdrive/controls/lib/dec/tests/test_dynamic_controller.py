@@ -1,5 +1,8 @@
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
+from openpilot.sunnypilot.selfdrive.controls.lib.dec.constants import WMACConstants
+
+STOP_CUE_FRAMES = WMACConstants.STOP_CUE_FRAMES
 
 class MockLeadOne:
   def __init__(self, present=0.0):
@@ -16,10 +19,11 @@ class MockCarState:
     self.standstill = standstill
 
 class MockModelData:
-  def __init__(self, valid=True):
+  def __init__(self, valid=True, plan_v=0.0, endpoint=0.0):
     size = 33 if valid else 10  # incomplete if invalid
-    self.position = type("Pos", (), {"x": [0.0] * size})()
+    self.position = type("Pos", (), {"x": [endpoint * i / (size - 1) for i in range(size)]})()
     self.orientation = type("Ori", (), {"x": [0.0] * size})()
+    self.velocity = type("Vel", (), {"x": [plan_v] * size})()   # plan_v 0: the plan stops (the stop cue)
 
 class MockSelfDriveState:
   def __init__(self, experimentalMode=False):
@@ -65,7 +69,7 @@ class TestDynamicExperimentalController(OpenpilotTestCase):
   def test_standstill_triggers_blended(self, mock_cp, mock_mpc, default_sm):
     controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
     default_sm['carState'].standstill = True
-    for _ in range(10):
+    for _ in range(STOP_CUE_FRAMES + 10):
       controller.update(default_sm)
     assert controller.mode() == "blended"
 
@@ -85,7 +89,31 @@ class TestDynamicExperimentalController(OpenpilotTestCase):
     controller._v_ego_kph = 35.0
     default_sm['modelV2'] = MockModelData(valid=False)  # Incomplete trajectory
 
-    for _ in range(3):
+    for _ in range(STOP_CUE_FRAMES + 3):
       controller.update(default_sm)
 
+    assert controller.mode() == "blended"
+
+  def _drive(self, controller, sm, plan_v, n, endpoint=20.0):
+    sm['modelV2'] = MockModelData(valid=True, plan_v=plan_v, endpoint=endpoint)
+    for _ in range(n):
+      controller.update(sm)
+
+  def test_a_plan_that_only_slows_is_no_stop(self, mock_cp, mock_mpc, default_sm):
+    # Warm Springs Blvd (route 0000010d, 2026-11-17): the plan slowed from 40 to 16 mph with no lead; no hand-over
+    controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+    default_sm['radarState'] = MockRadarState(present=0.0)
+    default_sm['carState'] = MockCarState(vEgo=18.0, vCruise=72.0)
+    self._drive(controller, default_sm, plan_v=7.0, n=100, endpoint=60.0)   # short plan, but 7 m/s at its slowest
+    assert controller.mode() == "acc"
+
+  def test_a_sustained_stop_plan_hands_over_a_blip_does_not(self, mock_cp, mock_mpc, default_sm):
+    default_sm['radarState'] = MockRadarState(present=0.0)
+    default_sm['carState'] = MockCarState(vEgo=15.0, vCruise=72.0)
+    controller = DynamicExperimentalController(mock_cp, mock_mpc, params=MockParams())
+    for _ in range(5):     # half-second stop blips between steady plans
+      self._drive(controller, default_sm, plan_v=0.0, n=STOP_CUE_FRAMES // 2)
+      self._drive(controller, default_sm, plan_v=15.0, n=5, endpoint=120.0)
+    assert controller.mode() == "acc"
+    self._drive(controller, default_sm, plan_v=0.0, n=STOP_CUE_FRAMES + 5)   # a red light: the plan stops and stays
     assert controller.mode() == "blended"

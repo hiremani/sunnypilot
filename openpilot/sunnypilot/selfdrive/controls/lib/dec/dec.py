@@ -171,6 +171,7 @@ class DynamicExperimentalController:
       smoothing_factor=0.5
     )
     self._has_lead_filtered = False
+    self._stop_cue_frames = 0
     self._has_slow_down = False
     self._has_slowness = False
     self._has_mpc_fcw = False
@@ -240,6 +241,16 @@ class DynamicExperimentalController:
       self._has_slowness = slowness_value > threshold
 
   def _calculate_slow_down(self, md):
+    """Calculate urgency based on trajectory endpoint vs expected distance, once the plan shows a stop (stop cue)."""
+    vx = list(md.velocity.x) if hasattr(md, "velocity") else []
+    cue = bool(vx) and min(vx) < max(WMACConstants.STOP_CUE_RATIO * self._v_ego_kph / 3.6, WMACConstants.STOP_CUE_FLOOR)
+    self._stop_cue_frames = self._stop_cue_frames + 1 if cue else 0
+    self._calculate_slow_down_urgency(md)
+    if self._stop_cue_frames < WMACConstants.STOP_CUE_FRAMES:
+      self._urgency = 0.0
+      self._has_slow_down = False
+
+  def _calculate_slow_down_urgency(self, md):
     """Calculate urgency based on trajectory endpoint vs expected distance."""
 
     # Reset to safe defaults
