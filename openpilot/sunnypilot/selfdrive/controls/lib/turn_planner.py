@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from openpilot.sunnypilot.selfdrive.controls.lib.junction_memory import key as junction_key
+
 EARTH_R = 6371000.0
 
 # ---- arming ----
@@ -170,6 +172,9 @@ class TurnTuning:
   path_start_right_m: float = 0.0
   path_exit_left_m: float = 0.0    # m past the junction node, along the target road, where the turn is finished
   path_exit_right_m: float = 0.0
+  junctions: dict = field(default_factory=dict)   # junction memory (junction_memory.load): at a junction the driver
+                                   # has turned at before, the path starts and finishes where they did (d_on, d_out)
+                                   # and in the lane they used (lat_on, lat_out); needs path_in / path_out
   path_radius_m: float = 0.0       # > 0: start instead when the path from here is this tight at its sharpest (the
                                    # driver's usual), so the start fits each junction's size; 0: path_start_*_m
   unwind_wheel_deg_s: float = 0.0  # deg/s: how fast the wheel comes back at the end of a turn (driver profile
@@ -378,6 +383,9 @@ class LocalRoads:
 
   def to_xy(self, lat: float, lon: float) -> tuple[float, float]:
     return math.radians(lon - self.lon0) * self._cos * EARTH_R, math.radians(lat - self.lat0) * EARTH_R
+
+  def to_latlon(self, x: float, y: float) -> tuple[float, float]:
+    return self.lat0 + math.degrees(y / EARTH_R), self.lon0 + math.degrees(x / (self._cos * EARTH_R))
 
   def match(self, x: float, y: float, bearing: float, prefer_way_id: int | None = None) -> Match | None:
     """The way segment the car is on: near its position and running along its heading (either way unless oneway)."""
@@ -706,6 +714,7 @@ class TurnPlanner:
     self.path_s = 0.0             # m driven along it
     self.path_head = 0.0          # deg the car has turned since it started (positive = right)
     self.arrival_way: LocalWay | None = None
+    self.memory: dict | None = None   # this junction's entry in the junction memory
 
   def _end(self, reason: str) -> None:
     if self.state in (ARMED, TURNING):
@@ -840,6 +849,9 @@ class TurnPlanner:
       return
     self.state, self.side, self.roads, self.junction = ARMED, side, roads, j
     self.arrival_way = roads.ways[m.way]
+    if self.tuning.junctions:
+      lat, lon = roads.to_latlon(j.x, j.y)
+      self.memory = self.tuning.junctions.get(junction_key(self.arrival_way.way_id, j.branch.way_id, lat, lon))
     self.junction_xy = (j.x, j.y)
     self.planned = j.branch.change
     self.exit_shift = exit_shift(j.branch, side)
@@ -918,8 +930,11 @@ class TurnPlanner:
   def _path_on(self) -> tuple[float, float] | None:
     """(start m before the node, finish m past it) of the driver's path for this side, or None: path turns off."""
     t = self.tuning
-    start, finish = ((t.path_start_left_m, t.path_exit_left_m) if self.side == "left" else
-                     (t.path_start_right_m, t.path_exit_right_m))
+    if self.memory is not None:
+      start, finish = self.memory["d_on"], self.memory["d_out"]
+    else:
+      start, finish = ((t.path_start_left_m, t.path_exit_left_m) if self.side == "left" else
+                       (t.path_start_right_m, t.path_exit_right_m))
     if t.path_in <= 0.0 or t.path_out <= 0.0 or start <= 0.0 or finish <= 0.0 or self.arrival_way is None:
       return None
     return start, finish
@@ -932,10 +947,10 @@ class TurnPlanner:
       return None
     j = self.junction
     hb, eb = math.radians(j.arrival_bearing), math.radians(j.branch.bearing)
-    lane0 = exit_lane_offset(self.arrival_way, self.side)
+    lane0 = self.memory["lat_on"] if self.memory is not None else exit_lane_offset(self.arrival_way, self.side)
     x0 = j.x - math.sin(hb) * self.dist + math.cos(hb) * lane0
     y0 = j.y - math.cos(hb) * self.dist - math.sin(hb) * lane0
-    lane1 = exit_lane_offset(j.branch, self.side)
+    lane1 = self.memory["lat_out"] if self.memory is not None else exit_lane_offset(j.branch, self.side)
     x1 = j.x + math.sin(eb) * on[1] + math.cos(eb) * lane1
     y1 = j.y + math.cos(eb) * on[1] - math.sin(eb) * lane1
     return doorway_path(x0, y0, j.arrival_bearing, x1, y1, j.branch.bearing, self.tuning.path_in, self.tuning.path_out)
@@ -949,7 +964,7 @@ class TurnPlanner:
       return None
     stop_start = self.tuning.stop_start_left_m if self.side == "left" else self.tuning.stop_start_right_m
     early = self.waited_stopped and self.dist <= stop_start
-    if self.tuning.path_radius_m > 0.0 and not early:
+    if self.tuning.path_radius_m > 0.0 and self.memory is None and not early:
       if self.dist > PATH_LOOK_M:
         return _WAIT
       ahead = self.dist

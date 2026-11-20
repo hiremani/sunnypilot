@@ -24,6 +24,7 @@ from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile
+from openpilot.sunnypilot.selfdrive.controls.lib import junction_memory
 from openpilot.sunnypilot.selfdrive.controls.lib import stop_test
 from openpilot.sunnypilot.selfdrive.controls.lib.turn_planner import TurnPlanner
 from openpilot.sunnypilot.selfdrive.controls.lib import wet_road
@@ -121,6 +122,12 @@ class Controls(ControlsExt):
           self.turn_planner.tuning.stop_start_right_m = profile.turn_stop_start_right_m
           self.turn_planner.tuning.v_turn = profile.junction_turn_mph * CV.MPH_TO_MS
           self.turn_planner.tuning.unwind_wheel_deg_s = profile.turn_unwind_deg_s
+          self.turn_planner.tuning.path_in = profile.turn_path_in
+          self.turn_planner.tuning.path_out = profile.turn_path_out
+          if profile.turn_path_in > 0.0 and profile.turn_path_out > 0.0:
+            self.turn_planner.tuning.junctions = junction_memory.load(driver_profile.active_name(self.params))
+          else:
+            self.turn_planner.tuning.junctions = {}
         except Exception:
           cloudlog.exception("driver profile turn starts failed")
     self._turn_param_frame += 1

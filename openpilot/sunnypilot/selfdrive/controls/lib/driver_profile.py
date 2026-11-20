@@ -101,6 +101,10 @@ class DriverProfile:
   # how fast the driver's wheel comes back at the end of a junction turn (deg/s); the turn assist starts straightening
   # early enough for it. 0 = off (the car's own rate limit)
   turn_unwind_deg_s: float = 0.0
+  # the driver's own path shape between the lane they are in and the target lane (turn_planner doorway_path), used at
+  # junctions in the junction memory (junction_memory.py); 0 = off
+  turn_path_in: float = 0.0
+  turn_path_out: float = 0.0
   # following
   follow_gap_s: float = 1.45     # openpilot's "standard"
   # narrow streets
@@ -131,6 +135,8 @@ BOUNDS = {
   "turn_exit_accel": (0.3, 1.0),       # up to the car's openpilot ACCEL_MAX
   "turn_stop_start_left_m": (0.0, 30.0),   # turn_planner.R_FROM_STOP_MAX: no wider arc than that
   "turn_stop_start_right_m": (0.0, 30.0),
+  "turn_path_in": (0.0, 0.95),
+  "turn_path_out": (0.0, 0.95),
   "turn_unwind_deg_s": (0.0, 120.0),   # fisker values.SMOOTH_UNWIND_RATE: the controller returns the wheel no faster
   "follow_gap_s": (1.25, 2.5),
   "narrow_speed_mph": (10.0, 25.0),
