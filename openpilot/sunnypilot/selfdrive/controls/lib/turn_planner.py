@@ -122,6 +122,10 @@ STEER_RATIO_X_WHEELBASE = 42.0  # rad of wheel per 1/m of curvature (fit of stee
 ANGLE_RATE_BP = (0.0, 5.0, 25.0)        # m/s ...
 ANGLE_RATE_DEG_S = (250.0, 150.0, 20.0)       # ... wheel-angle rate limit winding up (ANGLE_RATE_LIMIT_UP x 100 Hz)
 ANGLE_RATE_DOWN_DEG_S = (500.0, 200.0, 30.0)  # ... and unwinding (ANGLE_RATE_LIMIT_DOWN x 100 Hz)
+# The driver's own turns (no blinker, 22 turns, routes dd..119): the wheel comes back at ~85-117 deg/s and the
+# straightening starts with ~20-24 deg of the turn still to go. The car's limit (200-500 deg/s) put the release point
+# only 7-13 deg before the end, so the commanded turn held on longer than the driver does.
+UNWIND_WHEEL_MIN_DEG_S = 30.0   # deg/s: below this a TurnTuning.unwind_wheel_deg_s is off (the car's limit applies)
 MAX_LATERAL_JERK = 5.0          # m/s^3 (drive_helpers.clip_curvature)
 MAX_CURVATURE = 0.2             # 1/m (drive_helpers)
 
@@ -154,6 +158,9 @@ class TurnTuning:
                                    # ~25 m before the junction node in a ~20 m arc, the planner's own start is ~10 m
                                    # (4 turns, routes f0 f3 f5 f6; f6 is the Doane St turn the driver led by 2 s)
   v_turn: float = V_TURN_DEFAULT   # m/s: the driver's junction speed (driver profile junction_turn_mph)
+  unwind_wheel_deg_s: float = 0.0  # deg/s: how fast the wheel comes back at the end of a turn (driver profile
+                                   # turn_unwind_deg_s); 0 = the car's own rate limit. The release point allows for the
+                                   # heading the car still turns while the wheel comes back at this speed.
 
 
 def _wrap(a: float) -> float:
@@ -189,11 +196,20 @@ def comfort_curvature_rate(v: float, unwind: bool = False) -> float:
   return max(min(rate, curvature_rate(v, unwind)), CURV_RATE_MIN)
 
 
-def unwind_heading_deg(v: float, curvature: float) -> float:
+def unwind_curvature_rate(v: float, wheel_deg_s: float = 0.0) -> float:
+  """1/m/s: how fast the curvature falls while the wheel comes back: the car's limit, or slower at wheel_deg_s."""
+  rate = curvature_rate(v, unwind=True)
+  if wheel_deg_s > UNWIND_WHEEL_MIN_DEG_S:
+    rate = min(rate, math.radians(wheel_deg_s) / STEER_RATIO_X_WHEELBASE)
+  return rate
+
+
+def unwind_heading_deg(v: float, curvature: float, wheel_deg_s: float = 0.0) -> float:
   """deg the car still turns after the command drops to zero while it drives at v on |curvature|: through the
-  actuator delay, then while the wheel unwinds at its rate limit (the curvature falls linearly)."""
+  actuator delay, then while the wheel unwinds at its rate limit, or at wheel_deg_s when that is slower (the
+  curvature falls linearly)."""
   k = abs(curvature)
-  return math.degrees(v * k * (ACTUATOR_DELAY_S + 0.5 * k / curvature_rate(v, unwind=True)))
+  return math.degrees(v * k * (ACTUATOR_DELAY_S + 0.5 * k / unwind_curvature_rate(v, wheel_deg_s)))
 
 
 def exit_lane_offset(branch, side: str) -> float:
@@ -858,7 +874,7 @@ class TurnPlanner:
       self._end("blinker off")
       return None
     k_meas = -yaw_rate / max(v, 0.5)   # the car's own curvature now (positive = right)
-    release_at = self.tuning.release_deg + unwind_heading_deg(v, max(0.0, sign * k_meas))
+    release_at = self.tuning.release_deg + unwind_heading_deg(v, max(0.0, sign * k_meas), self.tuning.unwind_wheel_deg_s)
     if model_curvature is not None:
       release_at += BLEND_HANDOVER_DEG   # the model is steering by then: its lane centering finishes the turn
     if remaining <= release_at:

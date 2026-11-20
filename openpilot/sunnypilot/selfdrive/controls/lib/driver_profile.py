@@ -98,6 +98,9 @@ class DriverProfile:
   # from a stop the turn assist starts a signaled turn as the car moves off when the junction is this close (m); 0 = off
   turn_stop_start_left_m: float = 0.0
   turn_stop_start_right_m: float = 0.0
+  # how fast the driver's wheel comes back at the end of a junction turn (deg/s); the turn assist starts straightening
+  # early enough for it. 0 = off (the car's own rate limit)
+  turn_unwind_deg_s: float = 0.0
   # following
   follow_gap_s: float = 1.45     # openpilot's "standard"
   # narrow streets
@@ -128,6 +131,7 @@ BOUNDS = {
   "turn_exit_accel": (0.3, 1.0),       # up to the car's openpilot ACCEL_MAX
   "turn_stop_start_left_m": (0.0, 30.0),   # turn_planner.R_FROM_STOP_MAX: no wider arc than that
   "turn_stop_start_right_m": (0.0, 30.0),
+  "turn_unwind_deg_s": (0.0, 120.0),   # fisker values.SMOOTH_UNWIND_RATE: the controller returns the wheel no faster
   "follow_gap_s": (1.25, 2.5),
   "narrow_speed_mph": (10.0, 25.0),
   "lead_coast_s": (0.0, 5.0),

@@ -474,7 +474,7 @@ def _dist_to_polyline(p, line) -> float:
   return best
 
 
-def evaluate_turns(data: dict, tuning=None, osm_root: str | None = None) -> dict:
+def evaluate_turns(data: dict, tuning=None, osm_root: str | None = None, ghost_unwind_deg_s: float = 0.0) -> dict:
   """Run the turn planner over the recording, and from each point where it starts a turn roll a kinematic "ghost" car
   (heading += v * curvature * dt at the recorded speed) through the curvature it commands, after the car's actuator
   (delay, then the curvature build-up rate of the wheel-rate and jerk limits). While the ghost turns, the planner is fed
@@ -525,7 +525,9 @@ def evaluate_turns(data: dict, tuning=None, osm_root: str | None = None) -> dict
       ghost["queue"].append(k_cmd)
       k_target = ghost["queue"].pop(0)
       unwind = abs(k_target) < abs(ghost["k_act"])
-      rate = tp.curvature_rate(v, unwind=unwind) * DT_MDL
+      # ghost_unwind_deg_s: the car controller's own wheel-return speed (fisker values.SMOOTH_UNWIND_RATE), slower
+      # than the car's limit; 0 = the car's limit
+      rate = (tp.unwind_curvature_rate(v, ghost_unwind_deg_s) if unwind else tp.curvature_rate(v)) * DT_MDL
       ghost["k_act"] += max(-rate, min(rate, k_target - ghost["k_act"]))
       ghost["h"] += math.degrees(v * ghost["k_act"] * DT_MDL)
       ghost["x"] += v * math.sin(math.radians(ghost["h"])) * DT_MDL

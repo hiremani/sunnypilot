@@ -562,3 +562,58 @@ class TestSameStreet(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class SlowUnwindCar(Car):
+  """A car whose wheel comes back at wheel_deg_s at the end of a turn (the driver's speed, which the Fisker controller
+  follows), slower than the car's own rate limit."""
+
+  def __init__(self, planner_, wheel_deg_s: float, **kw):
+    super().__init__(planner_, **kw)
+    self.wheel_deg_s = wheel_deg_s
+
+  def step(self, left=False, right=False, lat_active=True, pressed=False, torque=0.0, model=None) -> float | None:
+    lat, lon = _ll(self.x, self.y)
+    gps = SimpleNamespace(latitude=lat, longitude=lon, bearingDeg=self.h % 360.0, speed=self.v, hasFix=True,
+                          horizontalAccuracy=1.0, unixTimestampMillis=int(self.t * 1000))
+    out = self.p.update(DT, self.v, -self.v * self.k, left, right, lat_active, pressed, gps, torque, model_curvature=model)
+    self.queue.append(out if out is not None else 0.0)
+    target = self.queue.pop(0)
+    unwind = abs(target) < abs(self.k)
+    rate = (min(tp.curvature_rate(self.v, True), math.radians(self.wheel_deg_s) / tp.STEER_RATIO_X_WHEELBASE) if unwind
+            else tp.curvature_rate(self.v)) * DT
+    self.k += max(-rate, min(rate, target - self.k))
+    self.h += math.degrees(self.v * self.k * DT)
+    self.x += self.v * math.sin(math.radians(self.h)) * DT
+    self.y += self.v * math.cos(math.radians(self.h)) * DT
+    self.t += DT
+    self.outputs.append(out)
+    self.states.append(self.p.state)
+    return out
+
+
+class TestUnwindSpeed(unittest.TestCase):
+  """The driver's own turns (2026-11-20, 27 turns without the blinker): the wheel comes back at ~81 deg/s and the
+  straightening starts ~20-24 deg before the end. The release point must allow for that, not the car's 200-500 deg/s."""
+
+  def test_slower_wheel_turns_more_after_release(self):
+    fast = tp.unwind_heading_deg(4.0, 0.1)
+    slow = tp.unwind_heading_deg(4.0, 0.1, 81.0)
+    self.assertGreater(slow, fast + 8.0)
+    self.assertAlmostEqual(tp.unwind_heading_deg(4.0, 0.1, 0.0), fast)          # 0 = off
+    self.assertAlmostEqual(tp.unwind_heading_deg(4.0, 0.1, 1000.0), fast)       # never faster than the car
+
+  def _turn(self, tuned: bool) -> float:
+    p = planner(t_junction(right=True))
+    if tuned:
+      p.tuning.unwind_wheel_deg_s = 81.0
+    car = SlowUnwindCar(p, 81.0)
+    car.drive(30.0, right=True)
+    self.assertEqual(p.log.reason, "done")
+    return car.h
+
+  def test_release_allows_for_the_drivers_unwind(self):
+    untuned, tuned = self._turn(False), self._turn(True)
+    self.assertGreater(untuned, 96.0)          # holding on too long: the slow wheel carries the car past the road
+    self.assertLess(abs(tuned - 90.0), abs(untuned - 90.0) - 4.0)
+    self.assertAlmostEqual(tuned, 90.0, delta=6.0)

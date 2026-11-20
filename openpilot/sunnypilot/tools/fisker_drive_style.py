@@ -52,6 +52,7 @@ class Sample:
   lat_deg: float
   lon_deg: float
   route: str
+  steer_deg: float = 0.0   # steering wheel angle, + = left
 
 
 def seg_logs(root: str, route: str) -> list[str]:
@@ -96,7 +97,7 @@ def load(root: str, route: str) -> list[Sample]:
         cs = m.carState
         out.append(Sample((m.logMonoTime - t0) / 1e9, cs.vEgo, cs.aEgo, cs.yawRate, cs.leftBlinker, cs.rightBlinker,
                           cs.gasPressed, cs.brakePressed, cs.steeringPressed, cs.cruiseState.enabled, lat,
-                          lead[0], lead[1], limit, gps[0], gps[1], route))
+                          lead[0], lead[1], limit, gps[0], gps[1], route, cs.steeringAngleDeg))
   return out
 
 
@@ -213,6 +214,30 @@ def exit_accel(S: list[Sample], j: int) -> float | None:
   return (win[-1].v - win[0].v) / (win[-1].t - win[0].t)
 
 
+UNWIND_FROM, UNWIND_TO = 0.9, 0.1   # the wheel's return: from 90% of its peak toward the turn to 10%
+UNWIND_MIN_PEAK_DEG = 90.0          # a junction turn the wheel really wound up for
+UNWIND_MAX_S = 10.0
+
+
+def unwind_rate(S: list[Sample], i: int, j: int, sign: int) -> float | None:
+  """deg/s: the wheel's average speed coming back at the end of the turn S[i..j] (sign + = left): 80% of its peak
+  over the time from UNWIND_FROM to UNWIND_TO of the peak. None when the wheel never wound up or never came back."""
+  lo = max(0, i - 30)
+  k = max(range(lo, j + 1), key=lambda n: S[n].steer_deg * sign)
+  peak = S[k].steer_deg * sign
+  if peak < UNWIND_MIN_PEAK_DEG:
+    return None
+  a = k
+  while a < len(S) - 1 and S[a + 1].steer_deg * sign >= UNWIND_FROM * peak and S[a].t - S[k].t < UNWIND_MAX_S:
+    a += 1
+  b = a
+  while b < len(S) - 1 and S[b].steer_deg * sign > UNWIND_TO * peak and S[b].t - S[a].t < UNWIND_MAX_S:
+    b += 1
+  if S[b].steer_deg * sign > UNWIND_TO * peak or S[b].t <= S[a].t:
+    return None
+  return (UNWIND_FROM - UNWIND_TO) * peak / (S[b].t - S[a].t)
+
+
 def turns(S: list[Sample]) -> list[dict]:
   out = []
   i = 0
@@ -243,7 +268,8 @@ def turns(S: list[Sample]) -> list[dict]:
                   "peak_lat_accel": max(abs(s.v * s.yaw) for s in seg),
                   "blinker_lead_s": lead_s, "blinker_lead_m": lead_m,
                   "lat_engaged_at_entry": S[i].lat, "lat_engaged_pct": 100 * sum(s.lat for s in seg) / len(seg),
-                  "driver_steered_pct": 100 * sum(s.steer_pressed for s in seg) / len(seg)})
+                  "driver_steered_pct": 100 * sum(s.steer_pressed for s in seg) / len(seg),
+                  "unwind_deg_s": unwind_rate(S, i, j, sign)})
     i = j + 1
   return out
 

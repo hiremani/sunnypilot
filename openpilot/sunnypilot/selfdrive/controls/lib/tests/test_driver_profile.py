@@ -94,3 +94,11 @@ class TestDriverProfile(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestTurnUnwind(unittest.TestCase):
+  def test_off_by_default_and_bounded_by_the_controller(self):
+    self.assertEqual(dp.DriverProfile().turn_unwind_deg_s, 0.0)
+    self.assertEqual(dp.clamp("turn_unwind_deg_s", 81.0), 81.0)
+    self.assertEqual(dp.clamp("turn_unwind_deg_s", 400.0), 120.0)   # fisker values.SMOOTH_UNWIND_RATE
+    self.assertEqual(dp.from_dict({"values": {"turn_unwind_deg_s": 81.0}}).turn_unwind_deg_s, 81.0)

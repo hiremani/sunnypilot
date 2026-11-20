@@ -127,6 +127,7 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
   base = dp.DriverProfile()
   offsets: dict[int, list[float]] = defaultdict(list)
   stops, coasts, lat_acc, turns, gaps, lead_coasts, narrow_v = [], [], [], [], [], [], []
+  unwind_turns: list[dict] = []
   stop_starts: dict[str, list[float]] = {"left": [], "right": []}
   used, miles = [], 0.0
   for r in routes:
@@ -146,7 +147,10 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
         stops.append(st)
     coasts += coast_times(S)
     lat_acc += [abs(s.v * s.yaw) for s in S if not s.lat and s.v > 9 and abs(s.yaw) > LAT_CURVE_YAW]
-    turns += [t for t in fds.turns(S) if t["kind"] == "junction" and t["driver_steered_pct"] > 50]
+    junctions = [t for t in fds.turns(S) if t["kind"] == "junction"]
+    turns += [t for t in junctions if t["driver_steered_pct"] > 50]
+    # the wheel's return: every junction turn the driver steered, also with openpilot's steering off and a light grip
+    unwind_turns += [t for t in junctions if t["driver_steered_pct"] > 50 or t["lat_engaged_pct"] < 50]
     gaps += [s.lead_d / s.v for s in S if s.v > 8 and 0 < s.lead_d < 100 and not s.cruise and abs(s.lead_v - s.v) < 3]
     lead_coasts += lead_coast_gaps(S)
     if narrow:
@@ -203,6 +207,14 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
     put(f"turn_stop_start_{side}_m", statistics.median(ds) if ds else None, len(ds), MIN_SAMPLES["stop_start"],
         f"median distance before the junction node where the driver's wheel passed 30 deg, signaled {side} turns"
         + " moving off from a stop" + ("" if turns_from_stop else " (skipped)"))
+  # The wheel's return at the end of a turn, from the turns the driver made without the blinker (the turn assist never
+  # had the wheel there); with too few of those, from every junction turn the driver steered.
+  unwinds = [t["unwind_deg_s"] for t in unwind_turns if t.get("unwind_deg_s") and t["blinker_lead_s"] is None]
+  which = "without the blinker"
+  if len(unwinds) < MIN_SAMPLES["turns"]:
+    unwinds, which = [t["unwind_deg_s"] for t in unwind_turns if t.get("unwind_deg_s")], "driver steered"
+  put("turn_unwind_deg_s", statistics.median(unwinds) if unwinds else None, len(unwinds), MIN_SAMPLES["turns"],
+      f"median speed the wheel came back at the end of junction turns ({which}), 90% to 10% of its peak")
   put("follow_gap_s", statistics.median(gaps) if gaps else None, len(gaps), MIN_SAMPLES["gap"],
       "median time gap behind a steady lead, ACC off")
   put("lead_coast_s", statistics.median(lead_coasts) if lead_coasts else None, len(lead_coasts), MIN_SAMPLES["coast"],
