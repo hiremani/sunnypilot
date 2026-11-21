@@ -314,6 +314,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     speedBump @8;      # Speed Bump Assist: easing off to a mapped bump's crossing speed
     crosswalk @9;      # map caution: a marked crosswalk ahead on a narrow street
     wetRoad @10;       # wet road: at most the posted limit (+0 wet, -5 mph heavy rain)
+    leadBrake @11;     # driver profile: slowing evenly toward a slower car closing fast, from the driver's lead_brake_a
   }
 
   struct WetRoad {

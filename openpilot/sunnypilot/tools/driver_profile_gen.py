@@ -35,11 +35,13 @@ from collections import defaultdict
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
 from openpilot.sunnypilot.selfdrive.controls.lib import narrow_street as ns
+from openpilot.sunnypilot.selfdrive.controls.lib import profile_long
 from openpilot.sunnypilot.tools import fisker_drive_style as fds
 from openpilot.sunnypilot.tools import turn_habits
 
 MPH = fds.MPH
 MIN_SAMPLES = {"speed": 300, "stops": 5, "curve": 100, "turns": 5, "gap": 200, "limit": 1200, "coast": 8,
+               "lead_brake": 10,
                "narrow": 200,
                "stop_start": 3}   # 10 Hz samples (narrow: 20 Hz), or events
 OPEN_ROAD_GAP_S = 3.0
@@ -75,6 +77,29 @@ def lead_coast_gaps(S: list) -> list[float]:
       continue
     if 0 < s.lead_d < 120 and s.lead_v < s.v - LEAD_COAST_CLOSING and s.lead_d / s.v < LEAD_COAST_MAX_GAP_S:
       out.append(s.lead_d / s.v)
+  return out
+
+
+LEAD_BRAKE_CLOSING = profile_long.LEAD_BRAKE_MIN_CLOSING   # only slowdowns closing this fast measure lead_brake_a
+LEAD_BRAKE_ON = -0.3       # m/s^2 (0.5 s mean): the driver is slowing
+
+
+def lead_brake_events(S: list) -> list[tuple[float, float, float]]:
+  """(v, gap, v_rel) at each slowdown the driver started (ACC off) toward a slower car closing fast. measure() turns
+  them into the even braking each would need to reach the following gap behind the car (profile_long.lead_brake_need,
+  the planner's own measure), once the driver's following gap is known."""
+  out: list[tuple[float, float, float]] = []
+  last = -1e9
+  for i in range(5, len(S)):
+    s = S[i]
+    a_now = sum(S[k].a for k in range(i - 4, i + 1)) / 5.0
+    a_before = sum(S[k].a for k in range(i - 5, i)) / 5.0
+    if not (a_now < LEAD_BRAKE_ON <= a_before) or s.cruise or s.v < 3.0 or s.t - last < 10.0:
+      continue
+    if not (5.5 < s.lead_d < profile_long.LEAD_BRAKE_MAX_D) or s.v - s.lead_v < LEAD_BRAKE_CLOSING:
+      continue
+    out.append((s.v, s.lead_d, s.lead_v - s.v))
+    last = s.t
   return out
 
 
@@ -127,6 +152,7 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
   base = dp.DriverProfile()
   offsets: dict[int, list[float]] = defaultdict(list)
   stops, coasts, lat_acc, turns, gaps, lead_coasts, narrow_v = [], [], [], [], [], [], []
+  lead_brakes: list[tuple[float, float, float]] = []
   unwind_turns: list[dict] = []
   stop_starts: dict[str, list[float]] = {"left": [], "right": []}
   used, miles = [], 0.0
@@ -153,6 +179,7 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
     unwind_turns += [t for t in junctions if t["driver_steered_pct"] > 50 or t["lat_engaged_pct"] < 50]
     gaps += [s.lead_d / s.v for s in S if s.v > 8 and 0 < s.lead_d < 100 and not s.cruise and abs(s.lead_v - s.v) < 3]
     lead_coasts += lead_coast_gaps(S)
+    lead_brakes += lead_brake_events(S)
     if narrow:
       narrow_v += narrow_speeds(root, r)
     if turns_from_stop:
@@ -219,6 +246,11 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
       "median time gap behind a steady lead, ACC off")
   put("lead_coast_s", statistics.median(lead_coasts) if lead_coasts else None, len(lead_coasts), MIN_SAMPLES["coast"],
       "median time gap at which the driver lifted off closing on a slower lead, ACC off")
+  gap_used = values.get("follow_gap_s", base.follow_gap_s)
+  needs = [n for n in (profile_long.lead_brake_need(gap_used, v, d, vr) for v, d, vr in lead_brakes) if math.isfinite(n)]
+  put("lead_brake_a", statistics.median(needs) if needs else None, len(needs), MIN_SAMPLES["lead_brake"],
+      f"median braking need when the driver started slowing toward a car closing >= {LEAD_BRAKE_CLOSING:.0f} m/s, ACC off"
+      + f" (to the {gap_used:.2f} s following gap)")
   put("narrow_speed_mph", statistics.median(narrow_v) * MPH if narrow_v else None, len(narrow_v), MIN_SAMPLES["narrow"],
       "median speed on streets the narrow-street detector flagged, ACC off" + ("" if narrow else " (skipped)"))
   limit_offsets = {str(lim): round(statistics.median(d), 1) for lim, d in sorted(offsets.items())

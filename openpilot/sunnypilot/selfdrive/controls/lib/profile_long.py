@@ -10,6 +10,12 @@ How the longitudinal planner drives by the driver profile (driver_profile.py), a
                             what was measured, distance / speed behind a steady lead; the MPC keeps
                             t_follow * v + STOP_DISTANCE behind one, so t_follow = gap - STOP_DISTANCE / v, never below
                             openpilot's "aggressive" 1.25 s (and the profile's own bounds cap it at 2.5 s).
+  LeadBrake                 closing fast on a slower car: once an even slowdown to the driver's following gap behind it
+                            needs the driver's lead_brake_a, a speed target that slows that evenly (it only ever lowers
+                            the speed; the MPC's own lead braking stays underneath). Route 00000129 (2026-11-20, 3.8 min):
+                            closing at 11 m/s, openpilot was still at -1.0 m/s^2 with the car 52 m ahead, reached -2.3,
+                            and the driver braked at 8 m; the driver starts slowing at a median 0.64 m/s^2 of need when
+                            closing that fast (30 slowdowns), openpilot at 0.8-1.2 (4).
   lead_coast(...)           True when the lead is slower and inside the driver's lead_coast_s time gap: the planner then
                             stops accelerating (the cap is 0 m/s^2: coasting; braking stays the MPC's). Route
                             000000f5 (2026-11-15): openpilot still accelerated +0.6 at 42 mph toward a lead 79 m ahead
@@ -19,6 +25,8 @@ How the longitudinal planner drives by the driver profile (driver_profile.py), a
   turn_exit_cap(...)        for TURN_EXIT_S after a junction turn, pull away no harder than the driver does out of one.
   comfort_accel_cap(v)      the gentlest of all: openpilot never asks for more than this (0.6 m/s^2 in town).
 """
+import math
+
 import numpy as np
 
 from openpilot.common.constants import CV
@@ -30,6 +38,17 @@ V_FOLLOW_MIN = 5.0          # m/s: below, the stop distance term is not divided 
 LEAD_COAST_CLOSING = 0.5    # m/s: the lead is this much slower (closing) before coasting
 LEAD_COAST_MAX_D = 120.0    # m: radar leads further than this are ignored
 LEAD_COAST_ACCEL = 0.0      # m/s^2 cap while coasting
+
+LEAD_BRAKE_MIN_CLOSING = 4.0    # m/s: slower than this, closing is left to the MPC (the driver and openpilot start alike);
+                                # also the closing speed lead_brake_a is measured from (driver_profile_gen)
+LEAD_BRAKE_MIN_ROOM_M = 10.0    # m outside the following gap still left when it starts: inside, it is following (MPC)
+LEAD_BRAKE_START_MAX = 1.2      # m/s^2: needing more than this already is not an early, gentle slowdown (MPC)
+LEAD_BRAKE_ON_S = 0.5           # s the start condition must hold (radar flicker)
+LEAD_BRAKE_HOLD_CLOSING = 1.5   # m/s: once slowing, keep going until the closing speed is down to this
+LEAD_BRAKE_MAX_D = 150.0        # m
+LEAD_BRAKE_A_MAX = 1.5          # m/s^2: the cap never asks for more (harder is the MPC's job)
+LEAD_BRAKE_LAG_S = 1.0          # s: lead the profile by the planner's ~1 s speed-loop lag
+LEAD_BRAKE_HOLD = 0.5           # once slowing, keep it while the need is at least this fraction of lead_brake_a
 
 JUNCTION_V_MAX = 9.0        # m/s (20 mph, the turn planner's abort speed): above, not a junction turn
 JUNCTION_CURVATURE = 1 / 25.0   # 1/m (R < 25 m)
@@ -102,6 +121,61 @@ TURN_EXIT_S = 3.0           # s after a junction turn (fisker_drive_style.TURN_E
 
 def follow_t(gap_s: float, v_ego: float) -> float:
   return max(T_FOLLOW_MIN, gap_s - STOP_DISTANCE / max(v_ego, V_FOLLOW_MIN))
+
+
+def lead_brake_need(follow_gap_s: float, v_ego: float, d_rel: float, v_rel: float, lag_s: float = 0.0) -> float:
+  """The even braking (m/s^2) that brings the closing speed to zero at the following gap behind the lead
+  (STOP_DISTANCE + follow_gap_s * lead speed), starting lag_s from now; inf with no room left, 0 when not closing."""
+  closing = -v_rel
+  if closing <= 0.0:
+    return 0.0
+  v_lead = max(v_ego + v_rel, 0.0)
+  room = d_rel - (STOP_DISTANCE + follow_gap_s * v_lead) - closing * lag_s
+  return closing * closing / (2.0 * room) if room > 0.5 else float("inf")
+
+
+class LeadBrake:
+  """Closing fast on a slower car: once an even slowdown to the driver's following gap behind it needs the driver's
+  lead_brake_a, a speed target that slows that evenly. It only ever lowers the speed; the MPC's own lead braking stays
+  underneath, and everything outside the start window below is the MPC's.
+
+  Starts only where the driver starts (closing >= LEAD_BRAKE_MIN_CLOSING, still LEAD_BRAKE_MIN_ROOM_M outside the
+  following gap, the need between lead_brake_a and LEAD_BRAKE_START_MAX) for LEAD_BRAKE_ON_S: a first cut without that
+  window, replayed over 72 drives, fired 1417 times for ~0.3 s each, almost all freeway following inside the gap with
+  radar noise. Once slowing it holds while the closing speed and the need stay up."""
+
+  def __init__(self, dt: float):
+    self.dt = dt
+    self.active = False
+    self.pending_s = 0.0
+
+  def reset(self) -> None:
+    self.active = False
+    self.pending_s = 0.0
+
+  def update(self, lead_brake_a: float, follow_gap_s: float, v_ego: float, lead_present: bool, d_rel: float,
+             v_rel: float) -> tuple[float, float] | None:
+    """(v_target, a_target) or None."""
+    if lead_brake_a < 0.1 or not lead_present or v_ego < 1.0 or not (0.0 < d_rel < LEAD_BRAKE_MAX_D):
+      self.reset()
+      return None
+    closing = -v_rel
+    v_lead = max(v_ego + v_rel, 0.0)
+    room = d_rel - (STOP_DISTANCE + follow_gap_s * v_lead) - closing * LEAD_BRAKE_LAG_S
+    need = lead_brake_need(follow_gap_s, v_ego, d_rel, v_rel, LEAD_BRAKE_LAG_S)
+    if self.active:
+      self.active = closing >= LEAD_BRAKE_HOLD_CLOSING and need >= LEAD_BRAKE_HOLD * lead_brake_a
+    else:
+      starting = (closing >= LEAD_BRAKE_MIN_CLOSING and room >= LEAD_BRAKE_MIN_ROOM_M
+                  and lead_brake_a <= need <= LEAD_BRAKE_START_MAX)
+      self.pending_s = self.pending_s + self.dt if starting else 0.0
+      self.active = self.pending_s >= LEAD_BRAKE_ON_S - 1e-6
+    if not self.active:
+      return None
+    self.pending_s = 0.0
+    a = min(need, LEAD_BRAKE_A_MAX)
+    v_target = v_lead + math.sqrt(2.0 * a * max(room, 0.0))
+    return min(v_target, v_ego), -a
 
 
 def lead_coast(lead_coast_s: float, v_ego: float, lead_present: bool, d_rel: float, v_rel: float) -> bool:

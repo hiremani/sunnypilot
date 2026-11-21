@@ -111,6 +111,9 @@ class DriverProfile:
   narrow_speed_mph: float = 18.0
   # slower lead ahead: no accelerating toward it inside this time gap (s); 0 = off
   lead_coast_s: float = 0.0
+  # closing fast on a slower car: start slowing once an even slowdown to the following gap behind it needs this much
+  # braking (m/s^2), as the driver does (profile_long.lead_brake_need); 0 = off (only the MPC's own lead braking)
+  lead_brake_a: float = 0.0
   # per posted limit (mph, multiple of 5, as a string key): the driver's own offset (mph); where a limit has no entry,
   # town_offset_mph / fast_offset_mph. Clamped like those.
   limit_offsets_mph: dict = field(default_factory=dict)
@@ -141,6 +144,7 @@ BOUNDS = {
   "follow_gap_s": (1.25, 2.5),
   "narrow_speed_mph": (10.0, 25.0),
   "lead_coast_s": (0.0, 5.0),
+  "lead_brake_a": (0.0, 1.2),          # never later than needing 1.2 m/s^2 (the cap brakes at most LEAD_BRAKE_A_MAX)
 }
 
 

@@ -119,3 +119,75 @@ class TestProfileSpeedCap(unittest.TestCase):
     cap.update(11.2, 11.2, 11.0, False, self.DT)
     assert cap.update(17.9, 17.9, 11.0, False, self.DT) == 17.9
     assert cap.update(None, 0.0, 11.0, False, self.DT) is None
+
+
+class TestLeadBrake(unittest.TestCase):
+  GAP = 1.78   # the driver's following gap (s)
+  DT = 0.05
+
+  def _run(self, a, v, d, vr, n=20, lb=None):
+    lb = lb or pl.LeadBrake(self.DT)
+    out = None
+    for _ in range(n):
+      out = lb.update(a, self.GAP, v, True, d, vr)
+    return out, lb
+
+  def test_need(self):
+    # stopped car 60 m ahead, closing at 10 m/s: room = 60 - 6 = 54 m -> 100 / 108
+    self.assertAlmostEqual(pl.lead_brake_need(self.GAP, 10.0, 60.0, -10.0), 100.0 / 108.0, places=3)
+    self.assertEqual(pl.lead_brake_need(self.GAP, 10.0, 60.0, +1.0), 0.0)            # pulling away
+    self.assertEqual(pl.lead_brake_need(self.GAP, 10.0, 5.0, -10.0), float("inf"))   # no room left
+
+  def test_route_00000129_closing_fast_starts_slowing_early(self):
+    # 2026-11-20, 3.8 min: 32 mph, a car 70 m ahead closing at 10 m/s. openpilot slowed only gently (-1.0 at 52 m) and
+    # needed -2.3 at the end, the driver braking at 8 m. With the driver's 0.59 it slows evenly from here.
+    v, d, vr = 32.0 * CV.MPH_TO_MS, 70.4, -10.0
+    off, _ = self._run(0.0, v, d, vr)
+    self.assertIsNone(off)                                                         # profile without the value: off
+    tgt, _ = self._run(0.59, v, d, vr)
+    self.assertIsNotNone(tgt)
+    v_t, a_t = tgt
+    self.assertLessEqual(v_t, v)                                                   # only ever slows
+    self.assertLess(a_t, -0.59)
+    self.assertGreaterEqual(a_t, -pl.LEAD_BRAKE_A_MAX)
+    far, _ = self._run(0.59, v, 145.0, vr)
+    self.assertIsNone(far)                                                         # further out: not yet
+
+  def test_needs_to_hold_half_a_second(self):
+    v, d, vr = 14.0, 70.0, -10.0
+    lb = pl.LeadBrake(self.DT)
+    for _ in range(round(pl.LEAD_BRAKE_ON_S / self.DT) - 1):
+      self.assertIsNone(lb.update(0.59, self.GAP, v, True, d, vr))                 # radar flicker: nothing
+    self.assertIsNotNone(lb.update(0.59, self.GAP, v, True, d, vr))
+
+  def test_following_inside_the_gap_is_left_to_the_mpc(self):
+    # route 000000ea: 72 mph, a car 40 m ahead closing at 3.5 m/s, inside the driver's 1.69 s gap: no early slowdown
+    out, _ = self._run(0.59, 72 * CV.MPH_TO_MS, 40.0, -3.5)
+    self.assertIsNone(out)
+    out, _ = self._run(0.59, 32 * CV.MPH_TO_MS, 22.0, -10.0)                       # already needs > START_MAX: MPC's
+    self.assertIsNone(out)
+
+  def test_gentle_closing_no_lead_or_far(self):
+    self.assertIsNone(self._run(0.59, 12.0, 40.0, -3.0)[0])                        # < 4 m/s closing
+    lb = pl.LeadBrake(self.DT)
+    for _ in range(20):
+      self.assertIsNone(lb.update(0.59, self.GAP, 12.0, False, 40.0, -8.0))        # no lead
+    self.assertIsNone(self._run(0.59, 30.0, 200.0, -15.0)[0])                      # beyond the radar range used
+
+  def test_holds_once_slowing_and_releases_when_closed_up(self):
+    on, lb = self._run(0.59, 14.0, 70.0, -10.0)
+    self.assertIsNotNone(on)
+    # closing down to 2 m/s: a fresh start would not, but it keeps slowing
+    self.assertIsNotNone(lb.update(0.59, self.GAP, 8.0, True, 16.0, -2.0))
+    self.assertIsNone(pl.LeadBrake(self.DT).update(0.59, self.GAP, 8.0, True, 16.0, -2.0))
+    # closed up (closing < 1.5 m/s): the MPC follows
+    self.assertIsNone(lb.update(0.59, self.GAP, 7.0, True, 18.0, -1.0))
+    self.assertFalse(lb.active)
+
+  def test_never_asks_more_than_the_cap_and_never_speeds_up(self):
+    for d in (20.0, 40.0, 80.0, 120.0):
+      for vr in (-4.5, -6.0, -10.0, -15.0):
+        tgt, _ = self._run(0.3, 16.0, d, vr)
+        if tgt is not None:
+          self.assertLessEqual(tgt[0], 16.0)
+          self.assertGreaterEqual(tgt[1], -pl.LEAD_BRAKE_A_MAX)

@@ -90,6 +90,8 @@ class LongitudinalPlannerSP:
     self.turn_exit_left = 0.0     # s left of the pull-away window after a junction turn
     self.narrow_speed = narrow_street.NARROW_SPEED
     self.lead_coasting = False
+    self.lead_brake = profile_long.LeadBrake(DT_MDL)   # driver profile lead_brake_a: slowing toward a slower car closing fast
+    self.lead_braking = False
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
 
@@ -213,6 +215,15 @@ class LongitudinalPlannerSP:
           targets[LongitudinalPlanSource.driverSpeed] = (v_cap, -profile_long.PROFILE_COAST_DECEL if v_ego > v_cap + 0.5 else a_ego)
       else:
         self.speed_cap.update(None, 0.0, v_ego, False, DT_MDL)
+      lead = sm['radarState'].leadOne
+      lb = self.lead_brake.update(self.profile.lead_brake_a, self.profile.follow_gap_s, v_ego, lead.present, lead.dRel,
+                                  lead.vRel)
+      self.lead_braking = lb is not None
+      if lb is not None:
+        targets[LongitudinalPlanSource.leadBrake] = lb
+    else:
+      self.lead_brake.reset()
+      self.lead_braking = False
 
     # map turn assist armed for a signaled turn ahead (or turning): slow to the junction speed before it
     if self.openpilot_long:
