@@ -5,8 +5,8 @@ from openpilot.sunnypilot.tools import habits_extra as hx
 
 
 def S(t, v, **kw):
-  d = dict(a=0.0, yaw=0.0, lb=False, rb=False, gas=False, brake=False, steer_pressed=False, cruise=False, lat=False,
-           lead_d=0.0, lead_v=0.0, limit=0.0, lat_deg=0.0, lon_deg=0.0, route="r", steer_deg=0.0)
+  d = {"a": 0.0, "yaw": 0.0, "lb": False, "rb": False, "gas": False, "brake": False, "steer_pressed": False, "cruise": False,
+       "lat": False, "lead_d": 0.0, "lead_v": 0.0, "limit": 0.0, "lat_deg": 0.0, "lon_deg": 0.0, "route": "r", "steer_deg": 0.0}
   d.update(kw)
   return fds.Sample(t=t, v=v, **d)
 

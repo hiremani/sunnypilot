@@ -171,6 +171,13 @@ class LongitudinalPlannerSP:
       for sb in (self.speed_bump, self.speed_bump_shadow):
         if sb is not None and hasattr(sb, "set_profile"):
           sb.set_profile(self.profile.bump_cross_mph if self.profile_on else 0.0)
+      dflt = driver_profile.DriverProfile()
+      on = self.profile_on
+      self.scc.vision.set_entry_decel(self.profile.curve_entry_decel if on else dflt.curve_entry_decel)
+      if self.map_caution is not None:
+        self.map_caution.set_profile(self.profile.signal_coast_s if on else dflt.signal_coast_s)
+      self.wet.set_profile(self.profile.wet_offset_mph if on and self.profile.wet_offset_mph != dflt.wet_offset_mph else None,
+                           self.profile.wet_gap_factor if on and self.profile.wet_gap_factor != dflt.wet_gap_factor else None)
     self._narrow_param_frame += 1
     try:
       self.narrow_street = self.narrow.update(sm['modelV2'], v_ego)
@@ -289,7 +296,9 @@ class LongitudinalPlannerSP:
     cap = self.map_caution.accel_cap() if self.map_caution is not None else float('inf')
     if not self.openpilot_long:
       return cap
-    return min(cap, self.wet.accel_max(), profile_long.comfort_accel_cap(v_ego, self.profile if self.profile_on else None))
+    merge = self.resolver.speed_limit_valid and profile_long.merging(self.resolver.speed_limit, v_ego)
+    return min(cap, self.wet.accel_max(), profile_long.comfort_accel_cap(v_ego, self.profile if self.profile_on else None,
+                                                                          merge))
 
   def lead_coast_cap(self, sm: messaging.SubMaster, v_ego: float) -> float:
     """The most acceleration the driver profile allows: none toward a slower lead inside the coasting gap, and the

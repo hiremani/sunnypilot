@@ -177,6 +177,7 @@ class TurnTuning:
                                    # and in the lane they used (lat_on, lat_out); needs path_in / path_out
   path_radius_m: float = 0.0       # > 0: start instead when the path from here is this tight at its sharpest (the
                                    # driver's usual), so the start fits each junction's size; 0: path_start_*_m
+  v_arm_max: float = V_ARM_MAX      # m/s: start a turn at or below this (driver profile turn_arm_mph)
   turn_in_wheel_deg_s: float = 0.0  # deg/s: how fast the driver winds the wheel in (driver profile turn_in_deg_s);
                                     # 0 = TURN_WHEEL_RATE_DEG_S. Also moves the start: a slower build starts earlier.
   unwind_wheel_deg_s: float = 0.0  # deg/s: how fast the wheel comes back at the end of a turn (driver profile
@@ -893,7 +894,7 @@ class TurnPlanner:
     if self.dist < -PASSED_M:
       self._end("passed the junction")
       return None
-    if v > V_ARM_MAX:
+    if v > min(self.tuning.v_arm_max, V_ARM_APPROACH):
       return None   # wait: the turn only starts at a turn speed
     if v < V_START_MIN:
       self.waited_stopped = True

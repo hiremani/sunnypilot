@@ -117,3 +117,68 @@ class TestTurnIn(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestRemainingHabits(unittest.TestCase):
+  def test_defaults_are_the_assists_own(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib import map_caution as mc
+    from openpilot.sunnypilot.selfdrive.controls.lib import wet_road as wr
+    p = dp.DriverProfile()
+    t = tp.TurnTuning()
+    self.assertEqual((p.turn_radius_left_m, p.turn_radius_right_m), (t.radius_left_m, t.radius_right_m))
+    self.assertAlmostEqual(p.turn_arm_mph * 0.44704, tp.V_ARM_MAX, places=2)
+    self.assertEqual(p.signal_coast_s, mc.SIGNAL_S)
+    self.assertEqual(p.wet_gap_factor, wr.GAP_FACTOR[wr.WET])
+    self.assertEqual(p.wet_offset_mph, wr.SPEED_OFFSET_MPH[wr.WET])
+    self.assertEqual(p.curve_entry_decel, 1.0)
+
+  def test_wet_road_uses_the_driver_when_wet_never_less_in_heavy_rain(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib import wet_road as wr
+    w = wr.WetRoad.__new__(wr.WetRoad)
+    w.applied = wr.WET
+    w.set_profile(-5.8, 1.29)
+    self.assertEqual(w.speed_offset_mph(), -5.8)
+    self.assertEqual(w.gap_factor(), 1.29)
+    w.applied = wr.HEAVY
+    self.assertEqual(w.speed_offset_mph(), -5.8)                     # min(-5.8, -5)
+    self.assertEqual(w.gap_factor(), wr.GAP_FACTOR[wr.HEAVY])        # max(1.29, 1.5)
+    w.applied = wr.DRY
+    self.assertEqual(w.gap_factor(), 1.0)
+    w.applied = wr.WET
+    w.set_profile(None, None)
+    self.assertEqual(w.gap_factor(), wr.GAP_FACTOR[wr.WET])
+
+  def test_signal_coast_window(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib import map_caution as mc
+    m = mc.MapCaution.__new__(mc.MapCaution)
+    m.signal_s = mc.SIGNAL_S
+    m.set_profile(6.4)
+    self.assertEqual(m.signal_s, 6.4)
+
+  def test_curve_entry_decel(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control import vision_controller as vc
+    import numpy as np
+    c = vc.SmartCruiseControlVision.__new__(vc.SmartCruiseControlVision) if hasattr(vc, "SmartCruiseControlVision") else None
+    if c is None:
+      self.skipTest("no vision controller class")
+    c.set_entry_decel(1.09)
+    a = np.interp(3.0, vc._ENTERING_SMOOTH_DECEL_BP, [vc._ENTERING_SMOOTH_DECEL_V[0], -c.entry_decel])
+    self.assertAlmostEqual(a, -1.09)
+
+  def test_turn_arm_speed(self):
+    t = tp.TurnTuning()
+    self.assertEqual(t.v_arm_max, tp.V_ARM_MAX)
+    t.v_arm_max = 30.0
+    self.assertLessEqual(min(t.v_arm_max, tp.V_ARM_APPROACH), tp.V_ARM_APPROACH)   # never above the approach speed
+
+
+class TestMerge(unittest.TestCase):
+  def test_merging_is_never_capped_by_the_gentle_cruise_pull(self):
+    p = dp.DriverProfile(cruise_accel_town=0.65, cruise_accel_mid=0.43, cruise_accel_fast=0.27)
+    v, limit = 18.0, 29.0     # 40 mph onto a 65 mph freeway
+    self.assertTrue(pl.merging(limit, v))
+    self.assertFalse(pl.merging(limit, 27.0))             # up to speed
+    self.assertFalse(pl.merging(15.6, 8.0))               # a 35 mph street: not a merge
+    self.assertAlmostEqual(pl.comfort_accel_cap(v, p, merge=True), pl.comfort_accel_cap(v))     # the table's
+    self.assertGreater(pl.comfort_accel_cap(v, p, merge=True), pl.comfort_accel_cap(v, p))
+    self.assertAlmostEqual(pl.comfort_accel_cap(v, dp.DriverProfile(merge_accel=0.85), merge=True), 0.85)

@@ -167,7 +167,16 @@ class WetRoad:
 
   # -- what the planner applies --
 
+  def set_profile(self, wet_offset_mph: float | None, wet_gap_factor: float | None) -> None:
+    """The driver's own wet-road speed (mph over the limit) and following gap factor, measured with the wipers on (driver
+    profile wet_offset_mph / wet_gap_factor); None = the defaults. Heavy rain is never less cautious than the default."""
+    self.profile_offset = wet_offset_mph
+    self.profile_gap = wet_gap_factor
+
   def gap_factor(self) -> float:
+    g = getattr(self, "profile_gap", None)
+    if g is not None and self.applied >= WET:
+      return max(g, GAP_FACTOR[self.applied]) if self.applied == HEAVY else g
     return GAP_FACTOR[self.applied]
 
   def curve_factor(self) -> float:
@@ -177,6 +186,9 @@ class WetRoad:
     return STOP_DECEL[self.applied]
 
   def speed_offset_mph(self) -> float | None:
+    o = getattr(self, "profile_offset", None)
+    if o is not None and self.applied >= WET:
+      return min(o, SPEED_OFFSET_MPH[self.applied]) if self.applied == HEAVY else o
     return SPEED_OFFSET_MPH[self.applied]
 
   def accel_max(self) -> float:

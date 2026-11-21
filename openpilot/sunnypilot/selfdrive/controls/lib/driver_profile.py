@@ -121,6 +121,9 @@ class DriverProfile:
   cruise_accel_town: float = 0.0
   cruise_accel_mid: float = 0.0
   cruise_accel_fast: float = 0.0
+  # merging: well below a fast road's limit (onto a freeway), the driver's pull (m/s^2, p75 of their merges); 0 = the
+  # comfort table's (1.0 at speed). Never the open-road cruise_accel_*: that would merge too gently.
+  merge_accel: float = 0.0
   # blinker on -> the driver starts the lane change (s); 0 = off (the AutoLaneChangeTimer setting)
   lane_change_delay_s: float = 0.0
   # mapped speed bumps: the driver's crossing speed for a plain bump (mph; the other kinds scale with it); 0 = off
@@ -129,6 +132,19 @@ class DriverProfile:
   turn_in_deg_s: float = 0.0
   # junction turns while moving: the start lead (s) that puts the turn planner's 30 deg wheel point where the driver's is
   turn_start_lead_s: float = -0.45
+  # junction turns: the arc radius per side (m), fitted to the driver's own turns by the ghost-path check
+  # (tools/turn_tuning_fit.py); the defaults are the turn planner's
+  turn_radius_left_m: float = 10.0
+  turn_radius_right_m: float = 10.0
+  # junction turns: the speed the driver still starts a turn at (p90, mph); the turn planner starts no faster
+  turn_arm_mph: float = 16.1
+  # curves ahead: the most the curve-speed controller slows by while entering one (m/s^2, the driver's p75)
+  curve_entry_decel: float = 1.0
+  # mapped traffic lights: stop accelerating this many seconds before one (the driver lifts off at reds)
+  signal_coast_s: float = 4.0
+  # wet road (wipers running): cruise this far over the posted limit (mph) and follow this much further back
+  wet_offset_mph: float = 0.0
+  wet_gap_factor: float = 1.25
   # per posted limit (mph, multiple of 5, as a string key): the driver's own offset (mph); where a limit has no entry,
   # town_offset_mph / fast_offset_mph. Clamped like those.
   limit_offsets_mph: dict = field(default_factory=dict)
@@ -164,10 +180,18 @@ BOUNDS = {
   "cruise_accel_town": (0.0, 1.0),     # up to the car's openpilot ACCEL_MAX
   "cruise_accel_mid": (0.0, 1.0),
   "cruise_accel_fast": (0.0, 1.0),
+  "merge_accel": (0.0, 1.0),
   "lane_change_delay_s": (0.0, 3.0),
   "bump_cross_mph": (0.0, 15.0),       # never faster over a plain bump than 15 mph
   "turn_in_deg_s": (0.0, 120.0),       # never faster than the turn planner's own 120 deg/s
-  "turn_start_lead_s": (-1.5, 1.5),          # never later than needing 1.2 m/s^2 (the cap brakes at most LEAD_BRAKE_A_MAX)
+  "turn_start_lead_s": (-1.5, 1.5),
+  "turn_radius_left_m": (7.0, 15.0),
+  "turn_radius_right_m": (7.0, 15.0),
+  "turn_arm_mph": (12.0, 18.0),        # the turn planner aborts at 20 mph
+  "curve_entry_decel": (0.5, 1.5),
+  "signal_coast_s": (2.0, 8.0),
+  "wet_offset_mph": (-10.0, 0.0),      # never over the limit when wet
+  "wet_gap_factor": (1.0, 1.75),          # never later than needing 1.2 m/s^2 (the cap brakes at most LEAD_BRAKE_A_MAX)
 }
 
 

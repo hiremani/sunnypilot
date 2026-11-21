@@ -241,3 +241,196 @@ def turn_start_leads(onsets: list[dict], turn_in_deg_s: float = 0.0) -> tuple[li
     leads.append((o["dist_m"] + v * to30 - s0) / v)
   return leads, speeds
 
+
+
+# ---- the remaining habits (2026-11-20) ----
+
+PULL_AWAY_GAP_M = 1.0        # the car ahead has moved off: its gap grew this much from where both stopped
+CUT_IN_DROP_M = 5.0          # a new car ahead: the gap shrank this much within 0.3 s...
+CUT_IN_GAP_S = 2.0           # ...to a time gap under this
+
+
+def pull_away_gaps(S: list) -> list[tuple[float, float]]:
+  """Stopped behind a car (driver in control): when the driver pulled away, (seconds since the car ahead's gap started
+  to grow, metres it had grown by). From the gap, not the radar's lead speed: that lags (pull_away read ~0 s)."""
+  out = []
+  i = 0
+  while i < len(S):
+    s = S[i]
+    if s.v < fds.V_STOP and 0 < s.lead_d < STOP_GAP_MAX_M and not s.cruise:
+      d0, j = s.lead_d, i
+      t_move = None
+      while j < len(S) and S[j].v < fds.V_STOP and S[j].lead_d > 0:
+        if t_move is None and S[j].lead_d - d0 > 0.2:
+          t_move = S[j].t
+        j += 1
+      if j < len(S) and t_move is not None and not S[j].cruise and S[j].lead_d > 0:
+        grown = S[j].lead_d - d0
+        if grown >= 0.0 and S[j].t - t_move <= RESUME_MAX_S:
+          out.append((S[j].t - t_move, grown))
+      i = j + 1
+      continue
+    i += 1
+  return out
+
+
+def cut_in_reactions(S: list) -> list[tuple[float, float]]:
+  """A car cutting in close (driver in control, on the gas): (seconds to lift off or brake, firmest deceleration in the
+  3 s after). Measured only: the MPC brakes for a cut-in by itself."""
+  out = []
+  for i in range(3, len(S)):
+    s, p = S[i], S[i - 3]
+    if s.cruise or s.v < 8.0 or not (0 < s.lead_d < CUT_IN_GAP_S * s.v):
+      continue
+    if not (p.lead_d == 0 or p.lead_d - s.lead_d > CUT_IN_DROP_M) or not p.gas:
+      continue
+    win = S[i:i + 30]
+    lift = next((x.t - s.t for x in win if not x.gas or x.brake), None)
+    if lift is not None:
+      out.append((lift, max(0.0, -min(x.a for x in win))))
+  return out
+
+
+def lane_offsets_both(root: str, route: str) -> tuple[list[float], list[float]]:
+  """lane_offsets for the driver steering and for openpilot steering (lat active, hands off), m right of centre."""
+  from openpilot.tools.lib.logreader import LogReader
+  drv, op = [], []
+  lat, pressed, v, last = True, False, 0.0, -1.0
+  for seg in sorted(glob.glob(os.path.join(root, route + "--*")), key=lambda p: int(p.rsplit("--", 1)[1])):
+    f = os.path.join(seg, "rlog.zst")
+    if not os.path.exists(f):
+      continue
+    try:
+      for m in LogReader(f):
+        w = m.which()
+        t = m.logMonoTime * 1e-9
+        if w == "carControl":
+          lat = m.carControl.latActive
+        elif w == "carState":
+          pressed, v = m.carState.steeringPressed, m.carState.vEgo
+        elif w == "modelV2" and t - last >= 1.0 and v > LC_MIN_V:
+          ll, probs = m.modelV2.laneLines, m.modelV2.laneLineProbs
+          if len(ll) < 3 or len(probs) < 3 or probs[1] < 0.7 or probs[2] < 0.7:
+            continue
+          ys = []
+          for line in (ll[1], ll[2]):
+            xs = list(line.x)
+            k = next((i for i, xx in enumerate(xs) if xx >= 10.0), None)
+            ys.append(list(line.y)[k] if k is not None else None)
+          if None in ys or not 2.5 < ys[1] - ys[0] < 5.0:
+            continue
+          off = -(ys[0] + ys[1]) / 2.0
+          (op if lat and not pressed else drv).append(off)
+          last = t
+    except Exception:
+      continue
+  return drv, op
+
+
+def wet_samples(root: str, route: str) -> dict:
+  """With the wipers running (carStateSP.wiperSpeed > 0 in the last 15 s) vs not, the driver's open-road speed minus
+  the posted limit (mph) and time gap behind a steady lead (s), cruise off, 1 Hz."""
+  from openpilot.tools.lib.logreader import LogReader
+  out = {"wet_offset": [], "dry_offset": [], "wet_gap": [], "dry_gap": []}
+  last_wipe, limit, lead, cs, last = -1e9, 0.0, (False, 0.0, 0.0), None, -1.0
+  for seg in sorted(glob.glob(os.path.join(root, route + "--*")), key=lambda p: int(p.rsplit("--", 1)[1])):
+    f = os.path.join(seg, "rlog.zst")
+    if not os.path.exists(f):
+      continue
+    try:
+      for m in LogReader(f):
+        w = m.which()
+        t = m.logMonoTime * 1e-9
+        if w == "carStateSP":
+          if getattr(m.carStateSP, "wiperSpeed", 0) > 0:
+            last_wipe = t
+        elif w == "liveMapDataSP":
+          limit = m.liveMapDataSP.speedLimit if m.liveMapDataSP.speedLimitValid else 0.0
+        elif w == "radarState":
+          l1 = m.radarState.leadOne
+          lead = (bool(l1.present), float(l1.dRel), float(l1.vRel))
+        elif w == "carState":
+          cs = m.carState
+          if t - last < 1.0 or cs.cruiseState.enabled or cs.vEgo < 4.5:
+            continue
+          last = t
+          wet = t - last_wipe < 15.0
+          if lead[0] and 0 < lead[1] < 100 and abs(lead[2]) < 3 and cs.vEgo > 8:
+            out["wet_gap" if wet else "dry_gap"].append(lead[1] / cs.vEgo)
+          elif limit > 0 and not (lead[0] and lead[1] < 3 * cs.vEgo) and not cs.brakePressed and abs(cs.aEgo) < 0.6:
+            out["wet_offset" if wet else "dry_offset"].append((cs.vEgo - limit) * MPH)
+    except Exception:
+      continue
+  return out
+
+
+def signal_lift_offs(root: str, route: str) -> dict:
+  """Approaches to mapped traffic lights (map_caution's map, on the recorded GPS) with the driver on the gas: for the
+  lights the driver then stopped at (within 40 m before the light), the time to the light (s) when they lifted off;
+  also how many lights they drove through without stopping."""
+  from openpilot.tools.lib.logreader import LogReader
+  from openpilot.sunnypilot.selfdrive.controls.lib import map_caution as mc
+  try:
+    pm = mc.PointMap(mc.MapFeatures(download=False))   # the map files on disk only: no network
+  except Exception:
+    return {"ttl": [], "through": 0, "stopped": 0}
+  ttl, through, stopped = [], 0, 0
+  cur = None            # {"id", "lift_ttl", "min_d", "stopped"}
+  cs, gas_prev = None, False
+  for seg in sorted(glob.glob(os.path.join(root, route + "--*")), key=lambda p: int(p.rsplit("--", 1)[1])):
+    f = os.path.join(seg, "rlog.zst")
+    if not os.path.exists(f):
+      continue
+    try:
+      for m in LogReader(f):
+        w = m.which()
+        if w == "carState":
+          cs = m.carState
+        elif w == "gpsLocationExternal" and cs is not None:
+          g = m.gpsLocationExternal
+          if not g.hasFix or g.horizontalAccuracy > 15 or cs.cruiseState.enabled:
+            gas_prev = bool(cs.gasPressed)
+            continue
+          ahead = mc.find_point_ahead(g.latitude, g.longitude, g.bearingDeg, pm.points_near(g.latitude, g.longitude),
+                                      "signal", mc.SIGNAL_MAX_M) if g.speed >= 1.0 or cur is not None else None
+          if ahead is not None and (cur is None or cur["id"] != ahead[0]):
+            if cur is not None:
+              stopped += cur["stopped"]
+              through += not cur["stopped"]
+              if cur["stopped"] and cur["lift_ttl"] is not None:
+                ttl.append(cur["lift_ttl"])
+            cur = {"id": ahead[0], "lift_ttl": None, "stopped": False}
+          if cur is not None and ahead is not None and ahead[0] == cur["id"]:
+            d = ahead[1]
+            if gas_prev and not cs.gasPressed and cs.vEgo > 3.0:
+              cur["lift_ttl"] = d / cs.vEgo          # the last lift-off before the light counts
+            if cs.vEgo < fds.V_STOP and d < 40.0:
+              cur["stopped"] = True
+          gas_prev = bool(cs.gasPressed)
+    except Exception:
+      continue
+  if cur is not None:
+    stopped += cur["stopped"]
+    through += not cur["stopped"]
+    if cur["stopped"] and cur["lift_ttl"] is not None:
+      ttl.append(cur["lift_ttl"])
+  return {"ttl": [x for x in ttl if 0.5 < x < 20.0], "through": through, "stopped": stopped}
+
+
+def freeway_merges(S: list) -> list[float]:
+  """m/s^2: speeding up from 40 to 55 mph onto a road posted 55+, the driver on the gas (cruise off), no car within 2 s
+  ahead: the mean acceleration over it."""
+  out = []
+  i = 1
+  while i < len(S):
+    if S[i].v * MPH >= 40 > S[i - 1].v * MPH and not S[i].cruise:
+      j = i
+      while j < len(S) and S[j].v * MPH < 55 and S[j].t - S[i].t < 30 and not S[j].cruise and S[j].v * MPH >= 35:
+        j += 1
+      if (j < len(S) and S[j].v * MPH >= 55 and S[j].limit * MPH >= 54 and S[j].t > S[i].t
+          and not any(0 < x.lead_d < 2.0 * x.v for x in S[i:j])):
+        out.append((S[j].v - S[i].v) / (S[j].t - S[i].t))
+      i = j + 1
+      continue
+    i += 1
+  return out

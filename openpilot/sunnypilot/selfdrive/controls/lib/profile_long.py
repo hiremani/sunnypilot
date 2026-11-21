@@ -117,14 +117,28 @@ CRUISE_ACCEL_MIN = 0.2                 # m/s^2: never a slower pull than this fr
 STOP_GAP_MIN = 4.0                     # m: never stop closer behind a car than this (the MPC's own is 6)
 
 
-def comfort_accel_cap(v_ego: float, profile=None) -> float:
+MERGE_LIMIT_MIN = 24.6                 # m/s (55 mph): a fast road...
+MERGE_BELOW = 4.5                      # ...with the car this far (10 mph) under its limit: getting up to speed (merging)
+
+
+def merging(limit_ms: float, v_ego: float) -> bool:
+  return limit_ms >= MERGE_LIMIT_MIN and v_ego < limit_ms - MERGE_BELOW
+
+
+def comfort_accel_cap(v_ego: float, profile=None, merge: bool = False) -> float:
   """The most acceleration openpilot asks for at v_ego: the driver's own open-road pull (profile cruise_accel_*) when
-  the profile has it, else the comfort table."""
+  the profile has it, else the comfort table. Merging (well under a fast road's limit) never below the table's: the
+  driver's open-road median at 45+ mph (0.27) would get onto a freeway far too slowly (their merges: 0.39 median,
+  0.85 p75, 4 clean ones on 2026-11-20); profile merge_accel once there are enough merges."""
+  table = float(np.interp(v_ego, COMFORT_ACCEL_BP, COMFORT_ACCEL_V))
+  if merge:
+    m = profile.merge_accel if profile is not None and profile.merge_accel > 0.0 else table
+    return max(m, CRUISE_ACCEL_MIN)
   if profile is not None:
     vals = (profile.cruise_accel_town, profile.cruise_accel_mid, profile.cruise_accel_fast)
     if all(a > 0.0 for a in vals):
       return max(float(np.interp(v_ego, CRUISE_ACCEL_BP, vals)), CRUISE_ACCEL_MIN)
-  return float(np.interp(v_ego, COMFORT_ACCEL_BP, COMFORT_ACCEL_V))
+  return table
 
 
 def stop_gap(stop_gap_m: float) -> float | None:

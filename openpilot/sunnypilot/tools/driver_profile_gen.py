@@ -43,7 +43,7 @@ from openpilot.sunnypilot.tools import turn_habits
 MPH = fds.MPH
 MIN_SAMPLES = {"speed": 300, "stops": 5, "curve": 100, "turns": 5, "gap": 200, "limit": 1200, "coast": 8,
                "lead_brake": 10, "stop_gap": 20, "lane_change": 20, "cruise_accel": 1000, "turn_in": 20,
-               "bump": 10,
+               "bump": 10, "turn_arm": 20, "merge": 10, "curve_entry": 20, "signal": 20, "wet_s": 300,
                "narrow": 200,
                "stop_start": 3}   # 10 Hz samples (narrow: 20 Hz), or events
 OPEN_ROAD_GAP_S = 3.0
@@ -157,8 +157,11 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
   lead_brakes: list[tuple[float, float, float]] = []
   unwind_turns: list[dict] = []
   stop_starts: dict[str, list[float]] = {"left": [], "right": []}
-  stop_gaps, resumes, curve_decels, lc_delays, accels, turn_ins, bumps, lane_offs, onsets_moving = [], [], [], [], [], [], [], [], []
+  stop_gaps, curve_decels, lc_delays, accels, turn_ins, bumps, onsets_moving = [], [], [], [], [], [], []
   rolls = [0, 0]
+  pulls, cut_ins, lane_drv, lane_op, signal_ttl, merges = [], [], [], [], [], []
+  wet = {"wet_offset": [], "dry_offset": [], "wet_gap": [], "dry_gap": []}
+  lights = [0, 0]
   used, miles = [], 0.0
   for r in routes:
     S = fds.load(root, r)
@@ -185,18 +188,28 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
     lead_coasts += lead_coast_gaps(S)
     lead_brakes += lead_brake_events(S)
     stop_gaps += hx.stop_gaps(S)
-    resumes += hx.resume_delays(S)
     curve_decels += hx.curve_entry_decels(S)
     lc_delays += hx.lane_change_delays(S)
     accels += hx.cruise_accels(S)
     turn_ins += hx.turn_in_rates(S)
+    pulls += hx.pull_away_gaps(S)
+    merges += hx.freeway_merges(S)
+    cut_ins += hx.cut_in_reactions(S)
     r_, f_ = hx.rolling_share(S)
     rolls[0] += r_
     rolls[1] += f_
     if narrow:
       narrow_v += narrow_speeds(root, r)
       bumps += hx.bump_crossings(root, r)
-      lane_offs += hx.lane_offsets(root, r)
+      d_, o_ = hx.lane_offsets_both(root, r)
+      lane_drv += d_
+      lane_op += o_
+      for k, v in hx.wet_samples(root, r).items():
+        wet[k] += v
+      sg = hx.signal_lift_offs(root, r)
+      signal_ttl += sg["ttl"]
+      lights[0] += sg["stopped"]
+      lights[1] += sg["through"]
     if turns_from_stop:
       try:
         for o in turn_habits.turn_onsets(root, r):
@@ -283,18 +296,42 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
       "median slowest speed within 5 m of mapped speed bumps, ACC off" + ("" if narrow else " (skipped)"))
   leads, onset_mph = hx.turn_start_leads(onsets_moving, values.get("turn_in_deg_s", 0.0))
 
+  def pct(xs, q):
+    return sorted(xs)[min(len(xs) - 1, int(len(xs) * q))] if xs else None
+
+  put("turn_arm_mph", pct(onset_mph, 0.9), len(onset_mph), MIN_SAMPLES["turn_arm"],
+      "p90 speed the driver starts a moving junction turn at (the turn planner starts no faster)")
+  put("curve_entry_decel", pct(curve_decels, 0.75), len(curve_decels), MIN_SAMPLES["curve_entry"],
+      "p75 slowing in the 4 s before a curve, the driver steering")
+  put("signal_coast_s", statistics.median(signal_ttl) if signal_ttl else None, len(signal_ttl), MIN_SAMPLES["signal"],
+      f"median time to a mapped light when the driver lifted off before stopping at it ({lights[0]} stopped at, "
+      + f"{lights[1]} driven through)" + ("" if narrow else " (skipped)"))
+  put("merge_accel", pct(merges, 0.75), len(merges), MIN_SAMPLES["merge"],
+      "p75 acceleration merging, 40 to 55 mph onto a road posted 55+, no car close ahead, ACC off")
+  n_wet = len(wet["wet_offset"])
+  put("wet_offset_mph", statistics.median(wet["wet_offset"]) if wet["wet_offset"] else None, n_wet, MIN_SAMPLES["wet_s"],
+      "median speed - limit on open road with the wipers running, ACC off (1 Hz)")
+  wg = (statistics.median(wet["wet_gap"]) / statistics.median(wet["dry_gap"])
+        if wet["wet_gap"] and wet["dry_gap"] else None)
+  put("wet_gap_factor", wg, len(wet["wet_gap"]), MIN_SAMPLES["wet_s"],
+      "median following gap with the wipers running over the dry one, ACC off (1 Hz)")
+
   def info(name, xs, note):   # measured only: no assist uses it (yet)
     meta[name] = {"measured": round(statistics.median(xs), 3) if xs else None, "samples": len(xs), "note": note}
-  info("resume_delay_s", resumes, "measured only: car ahead moving off -> the driver pulling away (radar lag: reads ~0)")
-  info("curve_entry_decel", curve_decels, "measured only: slowing in the 4 s before a curve (openpilot's curve speed "
-       + "already brakes up to 1.0 m/s^2)")
+  info("pull_away_s", [p for p, _ in pulls], "measured only: stopped behind a car, s from its gap starting to grow to the "
+       + "driver pulling away (the MPC resumes by distance; stop_gap_m moves that)")
+  info("pull_away_gap_m", [g for _, g in pulls], "measured only: m the car ahead had moved off by when the driver pulled away")
+  info("cut_in_lift_s", [c for c, _ in cut_ins], "measured only: a car cutting in close -> lifting off / braking (MPC's)")
+  info("cut_in_decel", [d for _, d in cut_ins], "measured only: firmest braking in the 3 s after a cut-in")
   # Measured, not used: the ghost-path check (drive_sim evaluate_turns, 275 recorded turns, 2026-11-20) is best at the
   # planner's own -0.45 s with the driver's turn-in rate (off-path median 2.16 m); this lead (+0.35 s) gave 3.62 m. The
   # slower turn-in already starts the arc earlier, the way the driver does. turn_start_lead_s stays the default.
   info("turn_start_lead_s", leads, "measured only: the start lead putting the planner's 30 deg wheel point where the "
        + "driver's was (moving junction turns); the ghost-path check is best at the planner's -0.45 s")
   info("turn_onset_mph", onset_mph, "measured only: speed starting a moving junction turn (the turn planner arms at 16 mph)")
-  info("lane_offset_m", lane_offs, "measured only: + right of the lane centre while the driver steers, > 25 mph")
+  info("lane_offset_m", lane_drv, "measured only: + right of the lane centre while the driver steers, > 25 mph")
+  info("lane_offset_openpilot_m", lane_op, "measured only: the same while openpilot steers (driver - openpilot is what "
+       + "a CameraOffset would correct; 2 cm on 2026-11-20: nothing to correct)")
   meta["rolling_stops"] = {"rolling": rolls[0], "full_stops": rolls[1],
                            "note": "measured only: slow-downs to a crawl without stopping vs full stops"}
   put("narrow_speed_mph", statistics.median(narrow_v) * MPH if narrow_v else None, len(narrow_v), MIN_SAMPLES["narrow"],

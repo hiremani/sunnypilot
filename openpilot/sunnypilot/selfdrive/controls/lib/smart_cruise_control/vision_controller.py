@@ -67,6 +67,10 @@ class SmartCruiseControlVision:
     self.current_lat_acc = 0.
     self.max_pred_lat_acc = 0.
 
+  def set_entry_decel(self, a: float) -> None:
+    """The most the controller slows by entering a curve (m/s^2): the driver profile's curve_entry_decel."""
+    self.entry_decel = float(a)
+
   def set_lat_accel_max(self, a_lat: float) -> None:
     """The curve speed's lateral acceleration (m/s^2): the driver profile's curve_lat_accel (clamped there)."""
     self.a_lat_max = float(a_lat)
@@ -174,7 +178,8 @@ class SmartCruiseControlVision:
     # ENTERING
     elif self.state == VisionState.entering:
       # when not overshooting, target a smooth deceleration in preparation for a sharp turn to come.
-      a_target = np.interp(self.max_pred_lat_acc, _ENTERING_SMOOTH_DECEL_BP, _ENTERING_SMOOTH_DECEL_V)
+      a_target = np.interp(self.max_pred_lat_acc, _ENTERING_SMOOTH_DECEL_BP,
+                           [_ENTERING_SMOOTH_DECEL_V[0], -getattr(self, "entry_decel", -_ENTERING_SMOOTH_DECEL_V[-1])])
     # TURNING
     elif self.state == VisionState.turning:
       # When turning, we provide a target acceleration that is comfortable for the lateral acceleration felt.

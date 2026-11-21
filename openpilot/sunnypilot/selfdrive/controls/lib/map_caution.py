@@ -133,6 +133,7 @@ class MapCaution:
     self.signal_id: int | None = None
     self.signal_dist = 0.0
     self.signal_coast = False         # not accelerating toward a mapped light
+    self.signal_s = SIGNAL_S          # the coast window (s of travel; driver profile signal_coast_s)
     self.crosswalk_id: int | None = None
     self.crosswalk_dist = 0.0
     self.crosswalk_caution = False    # capped for a crosswalk on a narrow street
@@ -142,6 +143,10 @@ class MapCaution:
   def _read_params(self) -> None:
     self.signal_on = self.params.get_bool(SIGNAL_PARAM)
     self.crosswalk_on = self.params.get_bool(CROSSWALK_PARAM)
+
+  def set_profile(self, signal_coast_s: float) -> None:
+    """The driver profile's lift-off time before a mapped light (s; SIGNAL_S by default)."""
+    self.signal_s = float(signal_coast_s)
 
   def accel_cap(self) -> float:
     return 0.0 if self.signal_coast else float("inf")
@@ -167,7 +172,7 @@ class MapCaution:
     if self.signal_on and v_ego >= SIGNAL_MIN_V:
       ahead = find_point_ahead(gps.latitude, gps.longitude, gps.bearingDeg, points, "signal", SIGNAL_MAX_M)
       self.signal_id, self.signal_dist = ahead if ahead else (None, 0.0)
-      self.signal_coast = ahead is not None and SIGNAL_MIN_M <= ahead[1] <= max(SIGNAL_MIN_M, v_ego * SIGNAL_S)
+      self.signal_coast = ahead is not None and SIGNAL_MIN_M <= ahead[1] <= max(SIGNAL_MIN_M, v_ego * self.signal_s)
     if self.crosswalk_on and narrow_street:
       ahead = find_point_ahead(gps.latitude, gps.longitude, gps.bearingDeg, points, "crosswalk", CROSSWALK_M)
       self.crosswalk_id, self.crosswalk_dist = ahead if ahead else (None, 0.0)
