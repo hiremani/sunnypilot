@@ -454,6 +454,31 @@ class TestComfort(unittest.TestCase):
     self.assertEqual(p.log.reason, "done")
     self.assertAlmostEqual(car.h, 90.0, delta=10.0)
 
+  def test_blinker_already_inside_the_first_turns_start_means_the_next_one(self):
+    # 00000104 at 6:10: northbound on Gatewood St, the left blinker on 12 m before Chetwood Ave at 9 mph, for Blacow Rd
+    # 74 m on. The planner armed for Chetwood and started at once (a tightened 8.8 m arc), toward the wrong street.
+    ways = [(1, "residential", False, [_ll(0, y) for y in (-200, -100, 0, 62, 200)]),
+            (2, "residential", False, [_ll(-x, 0) for x in (0, 30, 150)]),       # the near left (Chetwood)
+            (3, "secondary", False, [_ll(-x, 62) for x in (0, 30, 150)])]        # the next left (Blacow)
+    p = planner(tp.LocalRoads(LAT0, LON0, ways))
+    car = Car(p, v=4.2, y0=-12.0, x0=2.0)
+    car.drive(4.0, left=True)                 # past the near junction, still signaling
+    self.assertTrue(all(o is None for o in car.outputs), "turned into the first street")
+    self.assertGreater(car.y, 0.0)
+    while car.y < 30.0:                       # the next one comes into the lookahead (~38 m at this speed)
+      car.step(left=True)
+    self.assertEqual(p.state, tp.ARMED)
+    self.assertAlmostEqual(p.roads.to_latlon(p.junction.x, p.junction.y)[0], _ll(0, 62)[0], delta=1e-5)   # Blacow
+
+  def test_a_late_blinker_from_the_stop_line_still_takes_the_near_turn(self):
+    p = planner(t_junction(right=True))
+    car = Car(p, v=0.0, y0=-8.0)              # stopped 8 m before the junction, blinker on, then moving off
+    car.drive(1.0, right=True)
+    car.v = 3.0
+    car.drive(20.0, right=True)
+    self.assertEqual(p.log.reason, "done")
+    self.assertAlmostEqual(car.h, 90.0, delta=15.0)
+
   def test_speeding_up_out_of_a_finished_turn_counts_as_done(self):
     p = planner(t_junction(right=True))
     car = Car(p)

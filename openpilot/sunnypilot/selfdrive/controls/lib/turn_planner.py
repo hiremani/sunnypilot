@@ -105,6 +105,7 @@ R_FROM_STOP_MAX = 30.0          # m: widest arc a turn started early from a stop
 LATE_SLACK_M = 2.0              # a start so late the arc would need to be this much tighter than R_MIN is abandoned;
                                 # within the slack the R_MIN arc is flown and ends a little past the planned exit
 V_START_MIN = 0.5               # m/s: armed and stopped (at the stop line), the turn waits for the car to move off
+STOP_RECENT_S = 3.0             # s: stopped this recently, a blinker for the junction just ahead is a turn from the stop line
 CURV_RATE_MIN = 0.03            # 1/m/s: floor for the expected curvature build-up rate (lead time estimate)
 STALL_S = 2.0                   # turning, but the heading hasn't progressed STALL_DEG in this long while moving: release
 STALL_DEG = 3.0
@@ -702,6 +703,7 @@ class TurnPlanner:
     self._ended = (0.0, 0.0)
     self._reset()
     self._k_meas = 0.0
+    self._since_stop = STOP_RECENT_S   # s since the car was last stopped (capped use: only compared with STOP_RECENT_S)
     self.heading: float | None = None    # deg, the car's heading (GPS course, carried on by the yaw rate)
     self._last_fix = None
     self._done_side: str | None = None   # a turn on this side ended: no new one until that blinker goes off
@@ -788,6 +790,7 @@ class TurnPlanner:
     Returns the curvature to command (1/m, positive = RIGHT) while turning, None otherwise.
     """
     self._k_meas = -yaw_rate / max(v_ego, 0.5)   # the car's own curvature now (positive = right)
+    self._since_stop = 0.0 if v_ego < V_START_MIN else min(self._since_stop + dt, 60.0)
     side = "left" if left_blinker and not right_blinker else "right" if right_blinker and not left_blinker else ""
     if side != self._done_side:
       self._done_side = None
@@ -868,7 +871,15 @@ class TurnPlanner:
     self._prefer_way = roads.ways[m.way].way_id
     self.log.way_id, self.log.lateral = self._prefer_way, m.lateral
     lookahead = min(max(JUNCTION_LOOKAHEAD_M, v * JUNCTION_LOOKAHEAD_S), JUNCTION_LOOKAHEAD_MAX_M)
-    j = roads.junction_ahead(m, x, y, side, lookahead, min_junction_distance(v, self.tuning.v_turn))
+    min_dist = min_junction_distance(v, self.tuning.v_turn)
+    if v >= V_START_MIN and self._since_stop >= STOP_RECENT_S:
+      # moving (not just pulled away from the stop line): a junction already inside where a turn there would start isn't the one the blinker is for (the driver
+      # signals for a later one while passing it): 00000104, the left blinker on 12 m before Chetwood Ave for Blacow
+      # Rd 74 m on, and the planner turned toward Chetwood. Stopped at the line, the near turn stays (turn from a stop).
+      r = self.radius_for(side, v)
+      build = (1.0 / r) / comfort_curvature_rate(v, turn_in_deg_s=self.tuning.turn_in_wheel_deg_s)
+      min_dist = max(min_dist, r + v * (ACTUATOR_DELAY_S + 0.5 * build + self.tuning.lead_s))   # start_distance at 90 deg
+    j = roads.junction_ahead(m, x, y, side, lookahead, min_dist)
     if j is None:
       return
     self.state, self.side, self.roads, self.junction = ARMED, side, roads, j
