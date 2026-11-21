@@ -37,11 +37,13 @@ from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
 from openpilot.sunnypilot.selfdrive.controls.lib import narrow_street as ns
 from openpilot.sunnypilot.selfdrive.controls.lib import profile_long
 from openpilot.sunnypilot.tools import fisker_drive_style as fds
+from openpilot.sunnypilot.tools import habits_extra as hx
 from openpilot.sunnypilot.tools import turn_habits
 
 MPH = fds.MPH
 MIN_SAMPLES = {"speed": 300, "stops": 5, "curve": 100, "turns": 5, "gap": 200, "limit": 1200, "coast": 8,
-               "lead_brake": 10,
+               "lead_brake": 10, "stop_gap": 20, "lane_change": 20, "cruise_accel": 1000, "turn_in": 20,
+               "bump": 10,
                "narrow": 200,
                "stop_start": 3}   # 10 Hz samples (narrow: 20 Hz), or events
 OPEN_ROAD_GAP_S = 3.0
@@ -155,6 +157,8 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
   lead_brakes: list[tuple[float, float, float]] = []
   unwind_turns: list[dict] = []
   stop_starts: dict[str, list[float]] = {"left": [], "right": []}
+  stop_gaps, resumes, curve_decels, lc_delays, accels, turn_ins, bumps, lane_offs, onsets_moving = [], [], [], [], [], [], [], [], []
+  rolls = [0, 0]
   used, miles = [], 0.0
   for r in routes:
     S = fds.load(root, r)
@@ -180,13 +184,26 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
     gaps += [s.lead_d / s.v for s in S if s.v > 8 and 0 < s.lead_d < 100 and not s.cruise and abs(s.lead_v - s.v) < 3]
     lead_coasts += lead_coast_gaps(S)
     lead_brakes += lead_brake_events(S)
+    stop_gaps += hx.stop_gaps(S)
+    resumes += hx.resume_delays(S)
+    curve_decels += hx.curve_entry_decels(S)
+    lc_delays += hx.lane_change_delays(S)
+    accels += hx.cruise_accels(S)
+    turn_ins += hx.turn_in_rates(S)
+    r_, f_ = hx.rolling_share(S)
+    rolls[0] += r_
+    rolls[1] += f_
     if narrow:
       narrow_v += narrow_speeds(root, r)
+      bumps += hx.bump_crossings(root, r)
+      lane_offs += hx.lane_offsets(root, r)
     if turns_from_stop:
       try:
         for o in turn_habits.turn_onsets(root, r):
           if o["from_stop"] and o["dist_m"] > 0.0:
             stop_starts[o["side"]].append(o["dist_m"])
+          elif not o["from_stop"]:
+            onsets_moving.append(o)
       except Exception as e:   # no road tiles here, or a bad log: the value keeps its default
         print(f"turn starts skipped for {r}: {e}", file=sys.stderr)
 
@@ -251,6 +268,35 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
   put("lead_brake_a", statistics.median(needs) if needs else None, len(needs), MIN_SAMPLES["lead_brake"],
       f"median braking need when the driver started slowing toward a car closing >= {LEAD_BRAKE_CLOSING:.0f} m/s, ACC off"
       + f" (to the {gap_used:.2f} s following gap)")
+  put("stop_gap_m", statistics.median(stop_gaps) if stop_gaps else None, len(stop_gaps), MIN_SAMPLES["stop_gap"],
+      "median gap behind a stopped car where the driver stopped, ACC off")
+  put("lane_change_delay_s", statistics.median(lc_delays) if lc_delays else None, len(lc_delays),
+      MIN_SAMPLES["lane_change"], "median blinker-on to the driver starting the lane change (wheel 1.5 deg), > 25 mph")
+  for key, lo, hi in (("cruise_accel_town", 15, 30), ("cruise_accel_mid", 30, 45), ("cruise_accel_fast", 45, 90)):
+    band = [a for v, a in accels if lo <= v * MPH < hi]
+    put(key, statistics.median(band) if band else None, len(band), MIN_SAMPLES["cruise_accel"],
+        f"median acceleration speeding up on open road {lo}-{hi} mph, no car within 3 s, ACC off (10 Hz samples)")
+  tin = [r for _, r in turn_ins]
+  put("turn_in_deg_s", statistics.median(tin) if tin else None, len(tin), MIN_SAMPLES["turn_in"],
+      "median wheel speed winding into junction turns the driver steered (20% to 80% of the peak)")
+  put("bump_cross_mph", statistics.median(bumps) if bumps else None, len(bumps), MIN_SAMPLES["bump"],
+      "median slowest speed within 5 m of mapped speed bumps, ACC off" + ("" if narrow else " (skipped)"))
+  leads, onset_mph = hx.turn_start_leads(onsets_moving, values.get("turn_in_deg_s", 0.0))
+
+  def info(name, xs, note):   # measured only: no assist uses it (yet)
+    meta[name] = {"measured": round(statistics.median(xs), 3) if xs else None, "samples": len(xs), "note": note}
+  info("resume_delay_s", resumes, "measured only: car ahead moving off -> the driver pulling away (radar lag: reads ~0)")
+  info("curve_entry_decel", curve_decels, "measured only: slowing in the 4 s before a curve (openpilot's curve speed "
+       + "already brakes up to 1.0 m/s^2)")
+  # Measured, not used: the ghost-path check (drive_sim evaluate_turns, 275 recorded turns, 2026-11-20) is best at the
+  # planner's own -0.45 s with the driver's turn-in rate (off-path median 2.16 m); this lead (+0.35 s) gave 3.62 m. The
+  # slower turn-in already starts the arc earlier, the way the driver does. turn_start_lead_s stays the default.
+  info("turn_start_lead_s", leads, "measured only: the start lead putting the planner's 30 deg wheel point where the "
+       + "driver's was (moving junction turns); the ghost-path check is best at the planner's -0.45 s")
+  info("turn_onset_mph", onset_mph, "measured only: speed starting a moving junction turn (the turn planner arms at 16 mph)")
+  info("lane_offset_m", lane_offs, "measured only: + right of the lane centre while the driver steers, > 25 mph")
+  meta["rolling_stops"] = {"rolling": rolls[0], "full_stops": rolls[1],
+                           "note": "measured only: slow-downs to a crawl without stopping vs full stops"}
   put("narrow_speed_mph", statistics.median(narrow_v) * MPH if narrow_v else None, len(narrow_v), MIN_SAMPLES["narrow"],
       "median speed on streets the narrow-street detector flagged, ACC off" + ("" if narrow else " (skipped)"))
   limit_offsets = {str(lim): round(statistics.median(d), 1) for lim, d in sorted(offsets.items())

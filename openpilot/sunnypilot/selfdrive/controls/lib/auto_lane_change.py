@@ -46,6 +46,7 @@ class AutoLaneChangeController:
     self.lane_change_set_timer = self.params.get("AutoLaneChangeTimer", return_default=True)
     self.lane_change_bsm_delay = False
     self.wet_road_ok = True
+    self.profile_delay = 0.0           # driver profile lane_change_delay_s (read_params)
 
     self.prev_brake_pressed = False
     self.auto_lane_change_allowed = False
@@ -65,6 +66,12 @@ class AutoLaneChangeController:
     self.lane_change_bsm_delay = self.params.get_bool("AutoLaneChangeBsmDelay")
     self.wet_road_ok = wet_road.lane_changes_and_turns_ok(self.params)   # no auto lane change in heavy rain
     self.lane_change_set_timer = self.params.get("AutoLaneChangeTimer", return_default=True)
+    # the driver profile's own blinker-to-lane-change time replaces a timed delay (not nudge or off)
+    try:
+      from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile
+      self.profile_delay = driver_profile.active(self.params).lane_change_delay_s
+    except Exception:
+      self.profile_delay = 0.0
 
   def update_params(self) -> None:
     if self.param_read_counter % 50 == 0:
@@ -74,6 +81,8 @@ class AutoLaneChangeController:
   def update_lane_change_timers(self, blindspot_detected: bool) -> None:
     self.lane_change_delay = AUTO_LANE_CHANGE_TIMER.get(self.lane_change_set_timer,
                                                         AUTO_LANE_CHANGE_TIMER[AutoLaneChangeMode.NUDGE])
+    if self.profile_delay > 0.0 and self.lane_change_delay >= AUTO_LANE_CHANGE_TIMER[AutoLaneChangeMode.HALF_SECOND]:
+      self.lane_change_delay = self.profile_delay
 
     self.lane_change_wait_timer += DT_MDL
 

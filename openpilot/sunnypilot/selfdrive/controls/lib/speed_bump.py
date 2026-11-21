@@ -54,6 +54,8 @@ SHADOW_PARAM = "SpeedBumpAssistShadow"
 ALERT_PARAM = "SpeedBumpAlert"
 LOCAL_FILE = "local_speed_bumps.json"
 
+BASE_CROSS_MPH = 10.0      # the plain bump's crossing speed: the driver profile's bump_cross_mph scales all kinds by it
+CROSS_MAX_MPH = 25.0       # never faster over any mapped bump, whatever the profile
 CROSSING_MPH = {"bump": 10.0, "mini_bumps": 10.0, "hump": 15.0, "cushion": 20.0, "table": 20.0}
 
 EARTH_R = 6371000.0
@@ -223,11 +225,16 @@ class SpeedBumpAssist:
     self.distance = 0.0
     self.v_cross = V_CRUISE_UNSET
     self.a_plan = A_EASE           # the deceleration this bump is planned at (A_EASE, or A_MAX when taken on late)
+    self.cross_factor = 1.0        # the driver's crossing speed over the default's (set_profile)
     self.done_ids: set[int] = set()
     self.warned_ids: set[int] = set()
     self.warn = False              # a "Speed bump ahead" warning is due this frame (rising once per bump)
     self.output_v_target = V_CRUISE_UNSET
     self.output_a_target = 0.0
+
+  def set_profile(self, bump_cross_mph: float) -> None:
+    """The driver profile's crossing speed for a plain bump (mph; 0 = the defaults): every kind scales by it."""
+    self.cross_factor = bump_cross_mph / BASE_CROSS_MPH if bump_cross_mph >= 5.0 else 1.0
 
   def _read_enabled(self) -> bool:
     """The live copy runs with SpeedBumpAssist; the shadow copy (log only, and the source of the warning whatever drives
@@ -271,7 +278,8 @@ class SpeedBumpAssist:
       if ahead.node_id != self.node_id:
         self._reset()
         self.node_id = ahead.node_id
-      self.distance, self.v_cross = ahead.distance, ahead.v_cross
+      self.distance = ahead.distance
+      self.v_cross = min(ahead.v_cross * self.cross_factor, CROSS_MAX_MPH * CV.MPH_TO_MS)
       return True
     if self.node_id is not None:
       self.distance -= v_ego * DT_MDL

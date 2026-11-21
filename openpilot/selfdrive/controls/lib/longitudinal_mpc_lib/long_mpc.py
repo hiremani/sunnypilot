@@ -307,8 +307,11 @@ class LongitudinalMpc:
     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
     return lead_xv
 
-  def update(self, radarstate, personality=log.LongitudinalPersonality.standard, t_follow=None):
-    # t_follow: the driver profile's following gap (sunnypilot driver_profile.py), else the personality's
+  def update(self, radarstate, personality=log.LongitudinalPersonality.standard, t_follow=None, stop_distance=None):
+    # t_follow: the driver profile's following gap (sunnypilot driver_profile.py), else the personality's.
+    # stop_distance: the driver profile's stop gap behind a car (m, sunnypilot profile_long.stop_gap, >= 4), else
+    # STOP_DISTANCE. The solver's STOP_DISTANCE is compiled in, so the leads are moved instead: a lead obstacle
+    # (STOP_DISTANCE - stop_distance) further away stops the car stop_distance behind the real one.
     if t_follow is None:
       t_follow = get_T_FOLLOW(personality)
 
@@ -320,6 +323,10 @@ class LongitudinalMpc:
     # and then treat that as a stopped car/obstacle at this new distance.
     lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
+    if stop_distance is not None:
+      shift = STOP_DISTANCE - min(max(float(stop_distance), 4.0), STOP_DISTANCE)
+      lead_0_obstacle = lead_0_obstacle + shift
+      lead_1_obstacle = lead_1_obstacle + shift
 
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
     self.source = MPC_SOURCES[np.argmin(x_obstacles[0])]

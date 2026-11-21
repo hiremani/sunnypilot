@@ -1,0 +1,119 @@
+"""The driver-profile habits added 2026-11-20 and the assists that read them: the stop gap behind a car (MPC), the
+open-road pull (comfort cap), the lane-change delay (auto lane change), the bump crossing speed (Speed Bump Assist), the
+turn-in wheel rate and the moving turn start (turn planner). Every one is off at the profile's default."""
+import math
+import unittest
+from types import SimpleNamespace as N
+
+from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
+from openpilot.sunnypilot.selfdrive.controls.lib import profile_long as pl
+from openpilot.sunnypilot.selfdrive.controls.lib import speed_bump as sb
+from openpilot.sunnypilot.selfdrive.controls.lib import turn_planner as tp
+
+
+class TestDefaultsAreOff(unittest.TestCase):
+  def test_defaults_change_nothing(self):
+    p = dp.DriverProfile()
+    self.assertIsNone(pl.stop_gap(p.stop_gap_m))
+    self.assertEqual(pl.comfort_accel_cap(15.0, p), pl.comfort_accel_cap(15.0))
+    self.assertEqual(p.lane_change_delay_s, 0.0)
+    self.assertEqual(p.bump_cross_mph, 0.0)
+    self.assertEqual(p.turn_in_deg_s, 0.0)
+    self.assertEqual(p.turn_start_lead_s, tp.TurnTuning().lead_s)   # the planner's own tuned lead
+
+  def test_bounds(self):
+    self.assertEqual(dp.clamp("bump_cross_mph", 30.0), 15.0)
+    self.assertEqual(dp.clamp("turn_in_deg_s", 500.0), 120.0)
+    self.assertEqual(dp.clamp("turn_start_lead_s", 5.0), 1.5)
+
+
+class TestStopGap(unittest.TestCase):
+  def test_floor(self):
+    self.assertEqual(pl.stop_gap(4.0), 4.0)
+    self.assertEqual(pl.stop_gap(2.5), pl.STOP_GAP_MIN)             # never closer than 4 m
+    self.assertIsNone(pl.stop_gap(0.0))
+
+  def test_mpc_stops_that_far_behind(self):
+    from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, STOP_DISTANCE
+    mpc = LongitudinalMpc()
+    lead = N(present=True, status=True, dRel=20.0, vLead=0.0, aLeadK=0.0, aLeadTau=1.5, prob=1.0, modelProb=1.0)
+    none = N(present=False, status=False, dRel=0.0, vLead=0.0, aLeadK=0.0, aLeadTau=1.5, prob=0.0, modelProb=0.0)
+    rs = N(leadOne=lead, leadTwo=none)
+    mpc.set_cur_state(5.0, 0.0)
+    mpc.update(rs)
+    base = mpc.params[0, 2]
+    mpc.update(rs, stop_distance=4.0)
+    self.assertAlmostEqual(mpc.params[0, 2] - base, STOP_DISTANCE - 4.0)
+    mpc.update(rs, stop_distance=1.0)                                # clamped inside the MPC too
+    self.assertAlmostEqual(mpc.params[0, 2] - base, STOP_DISTANCE - 4.0)
+
+
+class TestCruiseAccel(unittest.TestCase):
+  def test_driver_pull_by_speed(self):
+    p = dp.DriverProfile(cruise_accel_town=0.65, cruise_accel_mid=0.43, cruise_accel_fast=0.27)
+    self.assertAlmostEqual(pl.comfort_accel_cap(10.0, p), 0.65)
+    self.assertAlmostEqual(pl.comfort_accel_cap(24.6, p), 0.27)
+    self.assertLess(pl.comfort_accel_cap(24.6, p), pl.comfort_accel_cap(24.6))   # gentler than the table at speed
+    partial = dp.DriverProfile(cruise_accel_town=0.65)
+    self.assertEqual(pl.comfort_accel_cap(24.6, partial), pl.comfort_accel_cap(24.6))   # all three, or the table
+    self.assertGreaterEqual(pl.comfort_accel_cap(24.6, dp.DriverProfile(cruise_accel_town=0.1, cruise_accel_mid=0.1,
+                                                                       cruise_accel_fast=0.1)), pl.CRUISE_ACCEL_MIN)
+
+
+class TestBumpCrossing(unittest.TestCase):
+  def test_scales_every_kind_with_a_cap(self):
+    a = sb.SpeedBumpAssist.__new__(sb.SpeedBumpAssist)
+    a.cross_factor = 1.0
+    a.set_profile(16.0)
+    self.assertAlmostEqual(a.cross_factor, 1.6)
+    a.set_profile(0.0)
+    self.assertEqual(a.cross_factor, 1.0)
+    # what update() does with a bump ahead
+    a.set_profile(15.0)
+    hump = sb.SpeedBump(1, 0.0, 0.0, "hump").v_cross
+    self.assertAlmostEqual(min(hump * a.cross_factor, sb.CROSS_MAX_MPH * 0.44704), 15.0 * 1.5 * 0.44704, places=3)
+    cushion = sb.SpeedBump(2, 0.0, 0.0, "cushion").v_cross
+    self.assertAlmostEqual(min(cushion * a.cross_factor, sb.CROSS_MAX_MPH * 0.44704), sb.CROSS_MAX_MPH * 0.44704)
+
+
+class TestLaneChangeDelay(unittest.TestCase):
+  def _alc(self, mode, profile_delay):
+    from openpilot.sunnypilot.selfdrive.controls.lib import auto_lane_change as alc
+    c = alc.AutoLaneChangeController.__new__(alc.AutoLaneChangeController)
+    c.lane_change_set_timer = mode
+    c.profile_delay = profile_delay
+    c.lane_change_wait_timer = 0.0
+    c.lane_change_bsm_delay = False
+    c.update_lane_change_timers(False)
+    return c.lane_change_delay, alc
+
+  def test_replaces_a_timed_delay_only(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AutoLaneChangeMode as M
+    self.assertEqual(self._alc(M.TWO_SECONDS, 0.4)[0], 0.4)
+    self.assertEqual(self._alc(M.TWO_SECONDS, 0.0)[0], 2.0)
+    self.assertEqual(self._alc(M.NUDGE, 0.4)[0], 0.0)               # nudge stays nudge
+    self.assertEqual(self._alc(M.NUDGELESS, 0.4)[0], 0.05)          # and nudgeless stays nudgeless
+
+
+class TestTurnIn(unittest.TestCase):
+  def test_slower_turn_in_builds_slower_and_starts_earlier(self):
+    v = 4.0
+    fast = tp.comfort_curvature_rate(v)
+    slow = tp.comfort_curvature_rate(v, turn_in_deg_s=66.0)
+    self.assertLess(slow, fast)
+    self.assertEqual(tp.comfort_curvature_rate(v, unwind=True, turn_in_deg_s=66.0), tp.comfort_curvature_rate(v, unwind=True))
+    a = tp.TurnPlanner(road_source=object())
+    b = tp.TurnPlanner(road_source=object())
+    b.tuning.turn_in_wheel_deg_s = 66.0
+    self.assertGreater(b.start_distance(10.0, 90.0, v), a.start_distance(10.0, 90.0, v))
+
+  def test_start_lead_moves_the_start(self):
+    a = tp.TurnPlanner(road_source=object())
+    b = tp.TurnPlanner(road_source=object())
+    b.tuning.lead_s = a.tuning.lead_s + 1.0
+    self.assertAlmostEqual(b.start_distance(10.0, 90.0, 4.0) - a.start_distance(10.0, 90.0, 4.0), 4.0, places=6)
+    self.assertTrue(math.isfinite(b.start_distance(10.0, 90.0, 4.0)))
+
+
+if __name__ == "__main__":
+  unittest.main()

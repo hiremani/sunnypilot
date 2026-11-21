@@ -112,8 +112,24 @@ COMFORT_ACCEL_BP = [0.0, 11.2, 20.0]   # m/s (0, 25 mph, 45 mph)
 COMFORT_ACCEL_V = [0.6, 0.6, 1.0]      # m/s^2
 
 
-def comfort_accel_cap(v_ego: float) -> float:
+CRUISE_ACCEL_BP = [10.0, 16.5, 24.6]   # m/s: the middle of the 15-30, 30-45 and 45+ mph bands the profile measures
+CRUISE_ACCEL_MIN = 0.2                 # m/s^2: never a slower pull than this from a profile
+STOP_GAP_MIN = 4.0                     # m: never stop closer behind a car than this (the MPC's own is 6)
+
+
+def comfort_accel_cap(v_ego: float, profile=None) -> float:
+  """The most acceleration openpilot asks for at v_ego: the driver's own open-road pull (profile cruise_accel_*) when
+  the profile has it, else the comfort table."""
+  if profile is not None:
+    vals = (profile.cruise_accel_town, profile.cruise_accel_mid, profile.cruise_accel_fast)
+    if all(a > 0.0 for a in vals):
+      return max(float(np.interp(v_ego, CRUISE_ACCEL_BP, vals)), CRUISE_ACCEL_MIN)
   return float(np.interp(v_ego, COMFORT_ACCEL_BP, COMFORT_ACCEL_V))
+
+
+def stop_gap(stop_gap_m: float) -> float | None:
+  """The MPC's stop distance from the profile (m), or None for the MPC's own."""
+  return max(stop_gap_m, STOP_GAP_MIN) if stop_gap_m > 0.0 else None
 
 
 TURN_EXIT_S = 3.0           # s after a junction turn (fisker_drive_style.TURN_EXIT_S, what the profile measures over)

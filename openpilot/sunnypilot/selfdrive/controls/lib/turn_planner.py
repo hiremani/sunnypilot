@@ -177,6 +177,8 @@ class TurnTuning:
                                    # and in the lane they used (lat_on, lat_out); needs path_in / path_out
   path_radius_m: float = 0.0       # > 0: start instead when the path from here is this tight at its sharpest (the
                                    # driver's usual), so the start fits each junction's size; 0: path_start_*_m
+  turn_in_wheel_deg_s: float = 0.0  # deg/s: how fast the driver winds the wheel in (driver profile turn_in_deg_s);
+                                    # 0 = TURN_WHEEL_RATE_DEG_S. Also moves the start: a slower build starts earlier.
   unwind_wheel_deg_s: float = 0.0  # deg/s: how fast the wheel comes back at the end of a turn (driver profile
                                    # turn_unwind_deg_s); 0 = the car's own rate limit. The release point allows for the
                                    # heading the car still turns while the wheel comes back at this speed.
@@ -205,11 +207,12 @@ def min_junction_distance(v: float, v_turn: float) -> float:
   return max(0.0, v * v - v_turn * v_turn) / (2.0 * APPROACH_SKIP_DECEL)
 
 
-def comfort_curvature_rate(v: float, unwind: bool = False) -> float:
-  """1/m/s: how fast the planner lets its commanded curvature change at speed v (TURN_LAT_JERK, TURN_WHEEL_RATE_DEG_S),
-  never faster than the car can follow (curvature_rate)."""
+def comfort_curvature_rate(v: float, unwind: bool = False, turn_in_deg_s: float = 0.0) -> float:
+  """1/m/s: how fast the planner lets its commanded curvature change at speed v (TURN_LAT_JERK, TURN_WHEEL_RATE_DEG_S,
+  or winding in, the driver profile's turn_in_deg_s when set), never faster than the car can follow (curvature_rate)."""
   v = max(v, 1.0)
-  rate = min(TURN_LAT_JERK / v ** 2, math.radians(TURN_WHEEL_RATE_DEG_S) / STEER_RATIO_X_WHEELBASE)
+  wheel = turn_in_deg_s if (turn_in_deg_s > 30.0 and not unwind) else TURN_WHEEL_RATE_DEG_S
+  rate = min(TURN_LAT_JERK / v ** 2, math.radians(wheel) / STEER_RATIO_X_WHEELBASE)
   if unwind:
     rate *= UNWIND_RATE_FACTOR
   return max(min(rate, curvature_rate(v, unwind)), CURV_RATE_MIN)
@@ -737,7 +740,7 @@ class TurnPlanner:
     distance covered while the actuator delay passes and the curvature builds up."""
     half = math.radians(abs(change_deg)) / 2.0
     corner = self.tuning.lane_offset_m * math.tan(math.radians(change_deg) / 2.0)
-    build = (1.0 / radius) / comfort_curvature_rate(v)
+    build = (1.0 / radius) / comfort_curvature_rate(v, turn_in_deg_s=self.tuning.turn_in_wheel_deg_s)
     return radius * math.tan(half) + corner + self.exit_shift + v * (ACTUATOR_DELAY_S + 0.5 * build + self.tuning.lead_s)
 
   def _new_fix(self, gps) -> bool:
@@ -1007,7 +1010,7 @@ class TurnPlanner:
       w = min(1.0, max(0.0, (abs(p.heading[-1]) - abs(h_des)) / BLEND_DEG))
       target = w * target + (1.0 - w) * model_curvature
     unwind = abs(target) < abs(self.curvature) or target * self.curvature < 0.0
-    step = comfort_curvature_rate(v, unwind) * max(dt, 0.01)
+    step = comfort_curvature_rate(v, unwind, self.tuning.turn_in_wheel_deg_s) * max(dt, 0.01)
     self.curvature = min(max(target, self.curvature - step), self.curvature + step)
     return self.curvature
 
@@ -1078,7 +1081,7 @@ class TurnPlanner:
       target = w * target + (1.0 - w) * model_curvature
     # build up and unwind at the comfort rate, never in a step
     unwind = abs(target) < abs(self.curvature) or target * self.curvature < 0.0
-    step = comfort_curvature_rate(v, unwind) * max(dt, 0.01)   # the start tick (dt 0) takes its first step too
+    step = comfort_curvature_rate(v, unwind, self.tuning.turn_in_wheel_deg_s) * max(dt, 0.01)   # the start tick (dt 0) takes its first step too
     self.curvature = min(max(target, self.curvature - step), self.curvature + step)
     return self.curvature
 

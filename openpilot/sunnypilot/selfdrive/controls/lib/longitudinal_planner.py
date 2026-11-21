@@ -168,6 +168,9 @@ class LongitudinalPlannerSP:
         if ss is not None:
           ss.set_profile(min(self.profile.stop_decel, self.wet.stop_decel()), self.profile.coast_s)
       self.scc.vision.set_lat_accel_max(self.profile.curve_lat_accel * self.wet.curve_factor())
+      for sb in (self.speed_bump, self.speed_bump_shadow):
+        if sb is not None and hasattr(sb, "set_profile"):
+          sb.set_profile(self.profile.bump_cross_mph if self.profile_on else 0.0)
     self._narrow_param_frame += 1
     try:
       self.narrow_street = self.narrow.update(sm['modelV2'], v_ego)
@@ -263,6 +266,12 @@ class LongitudinalPlannerSP:
       self.map_caution.signal_coast = self.map_caution.crosswalk_caution = False
       self.map_caution.v_target = float('inf')
 
+  def stop_distance(self) -> float | None:
+    """The MPC's stop distance behind a car from the driver profile (stop_gap_m), or None for the MPC's own 6 m."""
+    if not (self.profile_on and self.openpilot_long):
+      return None
+    return profile_long.stop_gap(self.profile.stop_gap_m)
+
   def t_follow(self, v_ego: float) -> float | None:
     """The MPC's following gap from the driver profile, or None for the personality's; longer on a wet road."""
     if not self.openpilot_long:
@@ -280,7 +289,7 @@ class LongitudinalPlannerSP:
     cap = self.map_caution.accel_cap() if self.map_caution is not None else float('inf')
     if not self.openpilot_long:
       return cap
-    return min(cap, self.wet.accel_max(), profile_long.comfort_accel_cap(v_ego))
+    return min(cap, self.wet.accel_max(), profile_long.comfort_accel_cap(v_ego, self.profile if self.profile_on else None))
 
   def lead_coast_cap(self, sm: messaging.SubMaster, v_ego: float) -> float:
     """The most acceleration the driver profile allows: none toward a slower lead inside the coasting gap, and the

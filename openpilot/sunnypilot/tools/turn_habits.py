@@ -24,7 +24,7 @@ MAX_ARMED_S = 30.0
 
 
 def turn_onsets(root: str, route: str, map_root: str | None = None) -> list[dict]:
-  """[{side, dist_m, v, from_stop, radius_m}] for each signaled junction turn the driver made in the route."""
+  """[{side, dist_m, v, from_stop, radius_m, planned, r_plan}] for each signaled junction turn the driver made in the route."""
   planner = tp.TurnPlanner(road_source=tp.RoadSource(root=map_root, sync=True))
   rows: list[dict] = []
   cs = gps = None
@@ -54,18 +54,20 @@ def turn_onsets(root: str, route: str, map_root: str | None = None) -> list[dict
           stopped_t = t
         planner.update(dt, cs.vEgo, cs.yawRate, cs.leftBlinker, cs.rightBlinker, True, False, gps, 0.0)
         if planner.state == tp.ARMED and cur is None:
-          cur = {"side": planner.side, "onset": None, "peak": 0.0, "radius_m": None, "t": t}
+          cur = {"side": planner.side, "onset": None, "peak": 0.0, "radius_m": None, "t": t, "planned": planner.planned}
         if cur is None:
           continue
         sign = 1.0 if cur["side"] == "left" else -1.0
         if cur["onset"] is None and cs.steeringAngleDeg * sign > ONSET_DEG and planner.state in (tp.ARMED, tp.TURNING):
           cur["onset"] = (planner.dist, cs.vEgo, t - stopped_t < FROM_STOP_S)
+          cur["r_plan"] = planner.radius_for(cur["side"], cs.vEgo)
         yaw = cs.yawRate * sign
         if yaw > cur["peak"] and cs.vEgo > 1.0:
           cur["peak"], cur["radius_m"] = yaw, cs.vEgo / yaw
         if planner.state in (tp.IDLE, tp.DONE) or t - cur["t"] > MAX_ARMED_S:
           if cur["onset"] is not None and cur["peak"] > MIN_PEAK_YAW:
             d, v, from_stop = cur["onset"]
-            rows.append({"side": cur["side"], "dist_m": d, "v": v, "from_stop": from_stop, "radius_m": cur["radius_m"]})
+            rows.append({"side": cur["side"], "dist_m": d, "v": v, "from_stop": from_stop, "radius_m": cur["radius_m"],
+                         "planned": cur.get("planned"), "r_plan": cur.get("r_plan")})
           cur = None
   return rows
