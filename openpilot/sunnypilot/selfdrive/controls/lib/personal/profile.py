@@ -66,7 +66,14 @@ HEADS: dict[str, HeadSpec] = {
   "turn_stop_start_left_m": HeadSpec("turn_stop_start_left_m", None, min_n=3, note="left turns from a stop: where the wheel passes 30 deg"),
   "turn_stop_start_right_m": HeadSpec("turn_stop_start_right_m", None, min_n=3, note="right turns from a stop"),
   "narrow_speed_mph": HeadSpec("narrow_speed_mph", None, min_n=200, note="speed on streets the narrow-street detector flags"),
+  "stop_gap_m": HeadSpec("stop_gap_m", None, min_n=20, note="gap behind a stopped car where the driver stops"),
+  "cruise_accel": HeadSpec("cruise_accel_town", "v", min_n=1000, min_bin=1500,
+                           note="speeding up on open road, by speed (gives cruise_accel_town / _mid / _fast)"),
+  "lane_change_delay_s": HeadSpec("lane_change_delay_s", None, min_n=20, note="blinker on -> starting the lane change"),
+  "bump_cross_mph": HeadSpec("bump_cross_mph", None, min_n=10, note="crossing speed at mapped speed bumps"),
+  "turn_in_deg_s": HeadSpec("turn_in_deg_s", "turn_deg", min_bin=40, note="winding the wheel into a junction turn, by its angle"),
 }
+CRUISE_ACCEL_FIELDS = (("cruise_accel_town", 10.0), ("cruise_accel_mid", 16.5), ("cruise_accel_fast", 24.6))
 
 
 class PersonalProfile:
@@ -93,11 +100,18 @@ class PersonalProfile:
     ctx = {"v": v, "closing": closing, "turn_deg": turn_deg}
     p = dp.DriverProfile()
     for name, spec in HEADS.items():
-      if name == "limit_offsets_mph":
+      if name in ("limit_offsets_mph", "cruise_accel"):
         continue
       val = self.value(name, ctx)
       if val is not None:
         setattr(p, spec.field, val)
+    if self.use.get("cruise_accel") and "cruise_accel" in self.heads:
+      # the open-road pull at each band's speed: profile_long.comfort_accel_cap interpolates between them
+      h = self.heads["cruise_accel"]
+      for field_name, v_band in CRUISE_ACCEL_FIELDS:
+        a = h.predict(v_band)
+        if math.isfinite(a):
+          setattr(p, field_name, dp.clamp(field_name, a))
     if self.use.get("limit_offsets_mph") and "limit_offsets_mph" in self.heads:
       h = self.heads["limit_offsets_mph"]
       if h.is_curve:

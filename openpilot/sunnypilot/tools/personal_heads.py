@@ -31,9 +31,10 @@ from openpilot.sunnypilot.selfdrive.controls.lib.personal import heads as hd
 from openpilot.sunnypilot.selfdrive.controls.lib.personal import profile as pprof
 from openpilot.sunnypilot.tools import driver_profile_gen as gen
 from openpilot.sunnypilot.tools import fisker_drive_style as fds
+from openpilot.sunnypilot.tools import habits_extra as hx
 from openpilot.sunnypilot.tools import personal_dataset as pdset
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 TEST_FRAC = 0.2
 CURVE_GAIN = 0.03         # a curve must beat the single number by 3% on the held-out drives
 MPH = fds.MPH
@@ -82,7 +83,8 @@ def route_events(args) -> tuple[str, dict]:
   except (OSError, ValueError):
     pass
   ev: dict[str, list] = {k: [] for k in ("offset", "follow", "lead_coast", "lead_brake", "stop", "coast", "launch",
-                                         "curve", "junction", "exit", "unwind", "start_left", "start_right", "narrow")}
+                                         "curve", "junction", "exit", "unwind", "start_left", "start_right", "narrow",
+                                         "stop_gap", "cruise_accel", "lane_change", "bump", "turn_in")}
   S = fds.load(root, route)
   if len(S) >= 100 and fds.overview(S)["moving_min"] >= gen.MIN_ROUTE_MOVING_MIN:
     for s in S:
@@ -113,6 +115,10 @@ def route_events(args) -> tuple[str, dict]:
           ev["exit"].append((t["deg"], t["exit_accel"]))
       if (t["driver_steered_pct"] > 50 or t["lat_engaged_pct"] < 50) and t.get("unwind_deg_s"):
         ev["unwind"].append((t["deg"], t["unwind_deg_s"], t["blinker_lead_s"] is None))
+    ev["stop_gap"] = [(0.0, g) for g in hx.stop_gaps(S)]
+    ev["cruise_accel"] = hx.cruise_accels(S)[::2]
+    ev["lane_change"] = [(0.0, d) for d in hx.lane_change_delays(S)]
+    ev["turn_in"] = hx.turn_in_rates(S)
     if turn_starts:
       try:
         for o in gen.turn_habits.turn_onsets(root, route):
@@ -122,6 +128,7 @@ def route_events(args) -> tuple[str, dict]:
         pass
     if narrow:
       ev["narrow"] = [(0.0, v * MPH) for v in gen.narrow_speeds(root, route)]
+      ev["bump"] = [(0.0, v) for v in hx.bump_crossings(root, route)]
   ev = {k: [[float(x) for x in e] for e in v] for k, v in ev.items()}
   os.makedirs(os.path.dirname(cache), exist_ok=True)
   with open(cache + ".tmp", "w") as f:
@@ -146,6 +153,8 @@ SOURCES = {
   "follow_gap_s": "follow", "lead_coast_s": "lead_coast", "stop_decel": "stop", "coast_s": "coast", "launch_accel": "launch",
   "curve_lat_accel": "curve", "junction_turn_mph": "junction", "turn_exit_accel": "exit",
   "turn_stop_start_left_m": "start_left", "turn_stop_start_right_m": "start_right", "narrow_speed_mph": "narrow",
+  "stop_gap_m": "stop_gap", "cruise_accel": "cruise_accel", "lane_change_delay_s": "lane_change", "bump_cross_mph": "bump",
+  "turn_in_deg_s": "turn_in",
 }
 
 

@@ -57,6 +57,17 @@ def _profile():
   return pprof.PersonalProfile(heads, use)
 
 
+class TestCruiseAccelHead(unittest.TestCase):
+  def test_fills_the_three_bands(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib import profile_long as pl
+    pp = pprof.PersonalProfile({"cruise_accel": hd.CurveHead([8.0, 24.0], [0.65, 0.27], 0.6, 19203, "v", "cruise_accel_town")},
+                               {"cruise_accel": True})
+    p = pp.at()
+    self.assertAlmostEqual(p.cruise_accel_town, float(np.interp(10.0, [8.0, 24.0], [0.65, 0.27])))
+    self.assertAlmostEqual(p.cruise_accel_fast, 0.27)
+    self.assertLess(pl.comfort_accel_cap(24.6, p), pl.comfort_accel_cap(24.6))
+
+
 class TestPersonalProfile(unittest.TestCase):
   def test_values_by_situation(self):
     pp = _profile()
