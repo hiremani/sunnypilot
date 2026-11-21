@@ -88,7 +88,8 @@ class TestModel(unittest.TestCase):
         np.testing.assert_allclose(pm.load().predict(X), m.predict(X))
         with open(p) as f:
           bad = json.load(f)
-        bad["features"] = bad["features"][:-1]
+        self.assertEqual(bad["version"], 2)                # the combined personal file
+        bad["speed_residual"]["features"] = bad["speed_residual"]["features"][:-1]
         with open(p, "w") as f:
           json.dump(bad, f)
         self.assertIsNone(pm.load())                      # other features: refuse it

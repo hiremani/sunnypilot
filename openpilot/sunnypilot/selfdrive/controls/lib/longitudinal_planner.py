@@ -90,6 +90,7 @@ class LongitudinalPlannerSP:
     self.turn_exit_left = 0.0     # s left of the pull-away window after a junction turn
     self.narrow_speed = narrow_street.NARROW_SPEED
     self.lead_coasting = False
+    self.personal = None                # personal/profile.PersonalProfile when PersonalModel is on
     self.lead_brake = profile_long.LeadBrake(DT_MDL)   # driver profile lead_brake_a: slowing toward a slower car closing fast
     self.lead_braking = False
     self.source = LongitudinalPlanSource.cruise
@@ -160,7 +161,8 @@ class LongitudinalPlannerSP:
       except Exception:
         self.narrow_enabled = False
     if self._narrow_param_frame % 100 == 0 or self.wet.changed:
-      self.profile = driver_profile.active()
+      self.personal = driver_profile.active_personal()
+      self.profile = driver_profile.active() if self.personal is None else self.personal.at(v=v_ego)
       self.profile_on = driver_profile.is_on()
       self.profile_speed_on = self.profile_on and driver_profile.is_on(param=driver_profile.SPEED_PARAM)
       self.narrow_speed = self.profile.narrow_speed_mph * CV.MPH_TO_MS
@@ -179,6 +181,19 @@ class LongitudinalPlannerSP:
       self.wet.set_profile(self.profile.wet_offset_mph if on and self.profile.wet_offset_mph != dflt.wet_offset_mph else None,
                            self.profile.wet_gap_factor if on and self.profile.wet_gap_factor != dflt.wet_gap_factor else None)
     self._narrow_param_frame += 1
+    if self.personal is not None:
+      # the personal model: the driver's values for this situation (speed, closing speed to the lead), every frame
+      try:
+        lead = sm['radarState'].leadOne
+        closing = max(-lead.vRel, 0.0) if lead.present else None
+        self.profile = self.personal.at(v=v_ego, closing=closing)
+        for ss in (self.stop_sign, self.stop_sign_shadow):
+          if ss is not None:
+            ss.set_profile(min(self.profile.stop_decel, self.wet.stop_decel()), self.profile.coast_s)
+        self.scc.vision.set_lat_accel_max(self.profile.curve_lat_accel * self.wet.curve_factor())
+      except Exception:
+        self.personal = None
+        cloudlog.exception("personal model failed: back to the JSON profile")
     try:
       self.narrow_street = self.narrow.update(sm['modelV2'], v_ego)
     except Exception:

@@ -68,19 +68,32 @@ def path(profile: str = dp.DEFAULT_NAME) -> str:
 
 
 def load(profile: str = dp.DEFAULT_NAME) -> PersonalModel | None:
-  """The model, or None when there is no file, it can't be read, or it doesn't match these features."""
+  """The speed-residual model from the personal file (v2: its "speed_residual"; v1: the whole file), or None when there
+  is none, it can't be read, or it doesn't match these features."""
   try:
     with open(path(profile)) as f:
-      return PersonalModel.from_dict(json.load(f))
-  except (OSError, ValueError, KeyError, TypeError):
+      d = json.load(f)
+    if isinstance(d, dict) and d.get("version") == 2:
+      d = d.get("speed_residual")
+    return PersonalModel.from_dict(d)
+  except (OSError, ValueError, KeyError, TypeError, AttributeError):
     return None
 
 
 def save(model: PersonalModel, profile: str = dp.DEFAULT_NAME, file: str | None = None) -> str:
+  """Into the personal file's "speed_residual", keeping its heads (a v1 or missing file becomes v2 with no heads)."""
   p = file or path(profile)
+  try:
+    with open(p) as f:
+      d = json.load(f)
+  except (OSError, ValueError):
+    d = None
+  if not isinstance(d, dict) or d.get("version") != 2:
+    d = {"version": 2, "heads": {}, "meta": {}}
+  d["speed_residual"] = model.to_dict()
   os.makedirs(os.path.dirname(p), exist_ok=True)
   with open(p + ".tmp", "w") as f:
-    json.dump(model.to_dict(), f)
+    json.dump(d, f)
   os.replace(p + ".tmp", p)
   return p
 

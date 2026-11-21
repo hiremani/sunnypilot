@@ -258,14 +258,36 @@ def active_name(params) -> str:
   return name if valid_name(name) else DEFAULT_NAME
 
 
-def active(params=None) -> DriverProfile:
-  """The active profile if the DriverProfile param is set, else the defaults. Never raises (e.g. code newer than the
-  built params): then the defaults."""
+PERSONAL_PARAM = "PersonalModel"
+
+
+def active_personal(params=None):
+  """The personal model (personal/profile.PersonalProfile) when DriverProfile and PersonalModel are set and the active
+  profile has a readable personal file; else None. Never raises."""
   try:
     if params is None:
       from openpilot.common.params import Params
       params = Params()
-    return load(active_name(params)) if params.get_bool(PARAM) else DriverProfile()
+    if not (params.get_bool(PARAM) and params.get_bool(PERSONAL_PARAM)):
+      return None
+    from openpilot.sunnypilot.selfdrive.controls.lib.personal import profile as personal_profile
+    return personal_profile.load(active_name(params))
+  except Exception:
+    return None
+
+
+def active(params=None) -> DriverProfile:
+  """The active profile if the DriverProfile param is set, else the defaults. With PersonalModel also set and a
+  personal file, the personal model's profile over all the driver's situations (callers with a situation at hand ask
+  active_personal().at(...) for that one). Never raises (e.g. code newer than the built params): then the defaults."""
+  try:
+    if params is None:
+      from openpilot.common.params import Params
+      params = Params()
+    if not params.get_bool(PARAM):
+      return DriverProfile()
+    personal = active_personal(params)
+    return personal.at() if personal is not None else load(active_name(params))
   except Exception:
     return DriverProfile()
 
