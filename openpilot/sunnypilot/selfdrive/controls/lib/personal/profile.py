@@ -72,7 +72,19 @@ HEADS: dict[str, HeadSpec] = {
   "lane_change_delay_s": HeadSpec("lane_change_delay_s", None, min_n=20, note="blinker on -> starting the lane change"),
   "bump_cross_mph": HeadSpec("bump_cross_mph", None, min_n=10, note="crossing speed at mapped speed bumps"),
   "turn_in_deg_s": HeadSpec("turn_in_deg_s", "turn_deg", min_bin=40, note="winding the wheel into a junction turn, by its angle"),
+  "turn_arm_mph": HeadSpec("turn_arm_mph", None, stat="p90", min_n=20, note="p90 speed starting a moving junction turn"),
+  "curve_entry_decel": HeadSpec("curve_entry_decel", None, stat="p75", min_n=20, note="p75 slowing before a curve"),
+  "signal_coast_s": HeadSpec("signal_coast_s", None, min_n=20, note="time to a mapped light when lifting off before stopping"),
+  "wet_offset_mph": HeadSpec("wet_offset_mph", None, min_n=300, note="speed - limit with the wipers running"),
+  "wet_gap_factor": HeadSpec("wet_gap_factor", None, min_n=300, note="following gap wet over dry (ratio of medians)"),
+  "merge_accel": HeadSpec("merge_accel", None, stat="p75", min_n=10, note="p75 pull merging onto a fast road"),
+  # fitted by simulation (tools/turn_tuning_fit.py, the ghost-path check over the driver's turns), copied from the
+  # driver profile JSON it wrote into: not events
+  "turn_start_lead_s": HeadSpec("turn_start_lead_s", None, min_n=1, note="turn start lead (ghost-path fit)"),
+  "turn_radius_left_m": HeadSpec("turn_radius_left_m", None, min_n=1, note="left turn arc radius (ghost-path fit)"),
+  "turn_radius_right_m": HeadSpec("turn_radius_right_m", None, min_n=1, note="right turn arc radius (ghost-path fit)"),
 }
+FITTED = ("turn_start_lead_s", "turn_radius_left_m", "turn_radius_right_m")
 CRUISE_ACCEL_FIELDS = (("cruise_accel_town", 10.0), ("cruise_accel_mid", 16.5), ("cruise_accel_fast", 24.6))
 
 

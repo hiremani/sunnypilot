@@ -129,6 +129,8 @@ class Controls(ControlsExt):
           self.turn_planner.tuning.v_arm_max = profile.turn_arm_mph * CV.MPH_TO_MS
           self.turn_planner.tuning.path_in = profile.turn_path_in
           self.turn_planner.tuning.path_out = profile.turn_path_out
+          self.turn_personal = driver_profile.active_personal(self.params)
+          self._turn_personal_deg = None
           if profile.turn_path_in > 0.0 and profile.turn_path_out > 0.0:
             self.turn_planner.tuning.junctions = junction_memory.load(driver_profile.active_name(self.params))
           else:
@@ -136,6 +138,20 @@ class Controls(ControlsExt):
         except Exception:
           cloudlog.exception("driver profile turn starts failed")
     self._turn_param_frame += 1
+    # the personal model (PersonalModel): this turn's values by its angle, once per turn as the planner arms
+    personal = getattr(self, "turn_personal", None)
+    if personal is not None and self.turn_planner.state != "idle":
+      deg = round(abs(float(self.turn_planner.planned)))
+      if deg and deg != getattr(self, "_turn_personal_deg", None):
+        try:
+          tp_ = personal.at(v=CS.vEgo, turn_deg=float(deg))
+          self.turn_planner.tuning.v_turn = tp_.junction_turn_mph * CV.MPH_TO_MS
+          self.turn_planner.tuning.unwind_wheel_deg_s = tp_.turn_unwind_deg_s
+          self.turn_planner.tuning.turn_in_wheel_deg_s = tp_.turn_in_deg_s
+          self._turn_personal_deg = deg
+        except Exception:
+          cloudlog.exception("personal model turn values failed")
+          self.turn_personal = None
     self.map_turn_curvature = None
     if not self.map_turn_assist:
       return None

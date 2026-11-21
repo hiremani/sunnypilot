@@ -186,7 +186,11 @@ class LongitudinalPlannerSP:
       try:
         lead = sm['radarState'].leadOne
         closing = max(-lead.vRel, 0.0) if lead.present else None
-        self.profile = self.personal.at(v=v_ego, closing=closing)
+        try:
+          deg = float(sm['carControlSP'].mapTurn.plannedDeg)
+        except Exception:
+          deg = 0.0
+        self.profile = self.personal.at(v=v_ego, closing=closing, turn_deg=deg if deg > 0.0 else None)
         for ss in (self.stop_sign, self.stop_sign_shadow):
           if ss is not None:
             ss.set_profile(min(self.profile.stop_decel, self.wet.stop_decel()), self.profile.coast_s)

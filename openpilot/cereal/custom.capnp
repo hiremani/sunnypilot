@@ -453,6 +453,8 @@ struct CarControlSP @0xa5cd762cd951a455 {
     # the map turn planner (controlsd) for the longitudinal planner (plannerd): slow down before a signaled turn
     state @0 :UInt8;               # 0 idle, 1 armed (a junction ahead on the blinker side), 2 turning
     junctionDistance @1 :Float32;  # m along the road to the junction while armed
+    plannedDeg @2 :Float32;        # abs heading change of the turn armed for / under way (deg; 0 when idle): the personal
+                                   # model's turn values (junction speed, turn-in, unwind) follow the turn's angle
   }
 
   struct Param {

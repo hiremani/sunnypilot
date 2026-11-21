@@ -109,6 +109,7 @@ class ControlsExt(ModelStateBase):
     if turn_planner is not None and getattr(self, "map_turn_assist", False):
       try:
         CC_SP.mapTurn.state, CC_SP.mapTurn.junctionDistance = turn_planner.approach()
+        CC_SP.mapTurn.plannedDeg = abs(float(turn_planner.planned)) if CC_SP.mapTurn.state else 0.0
       except Exception:
         pass
 

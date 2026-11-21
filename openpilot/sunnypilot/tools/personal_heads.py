@@ -34,7 +34,7 @@ from openpilot.sunnypilot.tools import fisker_drive_style as fds
 from openpilot.sunnypilot.tools import habits_extra as hx
 from openpilot.sunnypilot.tools import personal_dataset as pdset
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 TEST_FRAC = 0.2
 CURVE_GAIN = 0.03         # a curve must beat the single number by 3% on the held-out drives
 MPH = fds.MPH
@@ -84,7 +84,8 @@ def route_events(args) -> tuple[str, dict]:
     pass
   ev: dict[str, list] = {k: [] for k in ("offset", "follow", "lead_coast", "lead_brake", "stop", "coast", "launch",
                                          "curve", "junction", "exit", "unwind", "start_left", "start_right", "narrow",
-                                         "stop_gap", "cruise_accel", "lane_change", "bump", "turn_in")}
+                                         "stop_gap", "cruise_accel", "lane_change", "bump", "turn_in", "turn_arm",
+                                         "curve_entry", "signal", "wet_offset", "wet_gap", "dry_gap", "merge")}
   S = fds.load(root, route)
   if len(S) >= 100 and fds.overview(S)["moving_min"] >= gen.MIN_ROUTE_MOVING_MIN:
     for s in S:
@@ -119,16 +120,25 @@ def route_events(args) -> tuple[str, dict]:
     ev["cruise_accel"] = hx.cruise_accels(S)[::2]
     ev["lane_change"] = [(0.0, d) for d in hx.lane_change_delays(S)]
     ev["turn_in"] = hx.turn_in_rates(S)
+    ev["curve_entry"] = [(0.0, d) for d in hx.curve_entry_decels(S)]
+    ev["merge"] = [(0.0, a) for a in hx.freeway_merges(S)]
     if turn_starts:
       try:
         for o in gen.turn_habits.turn_onsets(root, route):
           if o["from_stop"] and o["dist_m"] > 0.0:
             ev["start_" + o["side"]].append((0.0, o["dist_m"]))
+          elif not o["from_stop"] and o.get("v", 0.0) >= 1.5:
+            ev["turn_arm"].append((0.0, o["v"] * MPH))
       except Exception:
         pass
     if narrow:
       ev["narrow"] = [(0.0, v * MPH) for v in gen.narrow_speeds(root, route)]
       ev["bump"] = [(0.0, v) for v in hx.bump_crossings(root, route)]
+      ev["signal"] = [(0.0, t) for t in hx.signal_lift_offs(root, route)["ttl"]]
+      w = hx.wet_samples(root, route)
+      ev["wet_offset"] = [(0.0, x) for x in w["wet_offset"]]
+      ev["wet_gap"] = [(0.0, x) for x in w["wet_gap"]]
+      ev["dry_gap"] = [(0.0, x) for x in w["dry_gap"]]
   ev = {k: [[float(x) for x in e] for e in v] for k, v in ev.items()}
   os.makedirs(os.path.dirname(cache), exist_ok=True)
   with open(cache + ".tmp", "w") as f:
@@ -154,7 +164,8 @@ SOURCES = {
   "curve_lat_accel": "curve", "junction_turn_mph": "junction", "turn_exit_accel": "exit",
   "turn_stop_start_left_m": "start_left", "turn_stop_start_right_m": "start_right", "narrow_speed_mph": "narrow",
   "stop_gap_m": "stop_gap", "cruise_accel": "cruise_accel", "lane_change_delay_s": "lane_change", "bump_cross_mph": "bump",
-  "turn_in_deg_s": "turn_in",
+  "turn_in_deg_s": "turn_in", "turn_arm_mph": "turn_arm", "curve_entry_decel": "curve_entry", "signal_coast_s": "signal",
+  "wet_offset_mph": "wet_offset", "merge_accel": "merge",
 }
 
 
@@ -172,6 +183,11 @@ def xy_for(name: str, evs: dict, routes: list[str], follow_gap: float) -> tuple[
     need = np.array([profile_long.lead_brake_need(follow_gap, v, d, vr) for v, d, vr in a]) if len(a) else np.zeros(0)
     ok = np.isfinite(need)
     return -a[ok, 2], need[ok]
+  if name == "wet_gap_factor":   # one ratio of medians, wet over dry
+    w, d = stack(evs, routes, "wet_gap"), stack(evs, routes, "dry_gap")
+    if len(w) == 0 or len(d) == 0:
+      return np.zeros(0), np.zeros(0)
+    return np.zeros(len(w)), w[:, 1] / float(np.median(d[:, 1]))
   if name == "turn_unwind_deg_s":
     a = stack(evs, routes, "unwind", 3)
     nb = a[a[:, 2] > 0.5] if len(a) else a
@@ -199,6 +215,8 @@ def build(evs: dict[str, dict]) -> tuple[dict, dict, dict]:
   follow_gap = dp.clamp("follow_gap_s", float(np.median(fy))) if len(fy) else dp.DriverProfile().follow_gap_s
   heads, use, report = {}, {}, {}
   for name, spec in pprof.HEADS.items():
+    if name in pprof.FITTED:
+      continue
     xa, ya = xy_for(name, evs, routes, follow_gap)
     xtr, ytr = xy_for(name, evs, train, follow_gap)
     xte, yte = xy_for(name, evs, test, follow_gap)
@@ -233,12 +251,28 @@ def main():
   ap.add_argument("--no-narrow", action="store_true")
   ap.add_argument("--no-turn-starts", action="store_true")
   ap.add_argument("--dry-run", action="store_true")
+  ap.add_argument("--profile-json", default=None, help="the JSON driver profile with the ghost-path turn fit (default: <name>.json)")
   ap.add_argument("--workers", type=int, default=8)
   a = ap.parse_args()
 
   evs = collect(a.root, not a.no_narrow, not a.no_turn_starts, a.workers)
   evs = {r: e for r, e in evs.items() if any(len(v) for v in e.values())}
   heads, use, info = build(evs)
+  # fitted by simulation (turn_tuning_fit.py into the JSON profile): copied as constants
+  try:
+    with open(a.profile_json or dp.profile_path(a.name)) as f:
+      jv = json.load(f).get("values", {})
+  except (OSError, ValueError):
+    jv = {}
+  for name in pprof.FITTED:
+    if name in jv:
+      heads[name] = hd.CurveHead(const=float(jv[name]), n=1, y_name=name)
+      use[name] = True
+      info["report"][name] = {"n": 1, "n_test": 0, "form": "const", "from": "turn_tuning_fit (JSON profile)"}
+    else:
+      heads[name] = hd.CurveHead(const=float("nan"), n=0, y_name=name)
+      use[name] = False
+      info["report"][name] = {"n": 0, "n_test": 0, "form": "const"}
   pp = pprof.PersonalProfile(heads, use)
   ref = pp.at()
   print(f"{len(evs)} drives with events; test drives: {len(info['test'])}")
