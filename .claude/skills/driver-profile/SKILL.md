@@ -24,7 +24,11 @@ Only what the driver chose counts: speed habits with ACC off and openpilot not i
 ## Install
 
 1. Show the user old vs new values as a table, with what each change will do on the road.
-2. Back up and install: `cp me.json .me.json.bak-<date>; cp /data/tmp/me_new.json me.json`, then check `driver_profile.active()` returns the new values.
+2. Install with versions (keeps what it replaces; the last 10 stay switchable from the HUD, Settings → Driving → Versions):
+   `/usr/local/venv/bin/python -m openpilot.sunnypilot.selfdrive.controls.lib.profile_versions install /data/tmp/me_new.json --label "<what changed>"`
+   (`list`, `restore ID`, `snapshot`, `import-backups` for the old `.me.json.bak-*`; `--kind personal` for the personal
+   model). Then check `driver_profile.active()` returns the new values. Never `cp` over me.json: that skips the version.
+   Compare candidates on the Mac first: `sunnypilot/tools/profile_compare.py me@0 new=/path/new.json --last 10 [--pull]`.
 3. Copy to the Mac for drive_sim.
 
 ## Adding a new profile value

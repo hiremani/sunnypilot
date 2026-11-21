@@ -34,6 +34,18 @@ LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
 
 
 class LongitudinalPlannerSP:
+  def _log_profile_version(self) -> None:
+    """One driver_profile event in the log whenever the live profile's name, content or on/off changes."""
+    try:
+      from openpilot.sunnypilot.selfdrive.controls.lib import profile_versions
+      name = driver_profile.active_name(Params())
+      ver = (name, profile_versions.live_sha("profile", name), self.profile_on)
+      if ver != self.profile_version:
+        self.profile_version = ver
+        cloudlog.event("driver_profile", name=name, sha=(ver[1] or "")[:12], on=self.profile_on)
+    except Exception:
+      cloudlog.exception("driver profile version log failed")
+
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, mpc):
     self.events_sp = EventsSP()
     self.resolver = SpeedLimitResolver()
@@ -85,6 +97,7 @@ class LongitudinalPlannerSP:
     # frames so a switch in the web HUD applies within seconds.
     self.profile = driver_profile.DriverProfile()
     self.profile_on = False
+    self.profile_version = None   # (name, sha) last logged: ties the rlog to the profile version that was live
     self.profile_speed_on = False
     self.speed_cap = profile_long.ProfileSpeedCap()   # the driverSpeed target: coasts down, keeps the driver's choice
     self.turn_exit_left = 0.0     # s left of the pull-away window after a junction turn
@@ -162,6 +175,7 @@ class LongitudinalPlannerSP:
     if self._narrow_param_frame % 100 == 0 or self.wet.changed:
       self.profile = driver_profile.active()
       self.profile_on = driver_profile.is_on()
+      self._log_profile_version()
       self.profile_speed_on = self.profile_on and driver_profile.is_on(param=driver_profile.SPEED_PARAM)
       self.narrow_speed = self.profile.narrow_speed_mph * CV.MPH_TO_MS
       for ss in (self.stop_sign, self.stop_sign_shadow):

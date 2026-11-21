@@ -60,7 +60,7 @@ Oceanfront View app (https://github.com/moistpope/oceanfront-view): on the car's
 PC run `python3 serve.py --bridge <this host>` from its checkout and open http://localhost:18088, or set
 WEBHUD_PAGE_DIR to that checkout and this process serves the page too.
 
-Endpoints: /api/status, /api/routes, /api/replay, /api/upload, /api/params, /api/profiles, /api/overrides, /api/ssh, /map/...,
+Endpoints: /api/status, /api/routes, /api/replay, /api/upload, /api/params, /api/profiles, /api/profiles/versions, /api/overrides, /api/ssh, /map/...,
 /dbc/fisker_ocean_adas_world.dbc, /dbc/fisker_ocean_mrr.dbc, the WebSocket at /ws and the camera view's at /video.
 """
 DEFAULT_PORT = int(os.getenv("WEBHUD_PORT", "8088"))
@@ -881,6 +881,78 @@ def api_profiles_put(h: HudHandler, q) -> None:
   api_profiles_get(h, q)
 
 
+# ---- profile versions (profile_versions.py): the last few driver profiles / personal models, and putting one back ----
+# GET  /api/profiles/versions?kind=profile|personal&name=me   newest first; for profiles each version's values too
+# PUT  /api/profiles/versions {"kind", "name", "id"}           make that version live (refused while moving)
+# POST /api/profiles/versions {"kind", "name", "label"}        keep the live file as a version
+
+def _versions_args(h: HudHandler, kind, name) -> tuple[str, str] | None:
+  from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
+  from openpilot.sunnypilot.selfdrive.controls.lib import profile_versions as pv
+  kind, name = kind or "profile", name or dp.DEFAULT_NAME
+  if kind not in pv.KINDS or not dp.valid_name(name):
+    h._error(400, f"bad kind or name: {kind!r} {name!r}")
+    return None
+  return kind, name
+
+
+def api_versions_get(h: HudHandler, q) -> None:
+  from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
+  from openpilot.sunnypilot.selfdrive.controls.lib import profile_versions as pv
+  args = _versions_args(h, q.get("kind", [None])[0], q.get("name", [None])[0])
+  if args is None:
+    return
+  kind, name = args
+  versions = pv.list_versions(kind, name)
+  if kind == "profile":
+    from dataclasses import asdict
+    for v in versions:
+      d = dp.read_file(os.path.join(pv.versions_dir(kind, name), v["id"] + ".json"))
+      v["values"] = asdict(dp.from_dict(d)) if d is not None else None
+      v["meta"] = {k: d.get("meta", {}).get(k) for k in ("generated", "routes", "miles")} if d is not None else None
+      if v["meta"] and isinstance(v["meta"].get("routes"), list):
+        v["meta"]["routes"] = len(v["meta"]["routes"])
+  h._json({"kind": kind, "name": name, "keep": pv.KEEP, "versions": versions,
+           "editable": not h.server.engine.monitor.moving})
+
+
+def api_versions_put(h: HudHandler, q) -> None:
+  from openpilot.sunnypilot.selfdrive.controls.lib import profile_versions as pv
+  if h.server.engine.monitor.moving:
+    return h._error(409, "profile versions can't be changed while the car is moving")
+  body = h._json_body()
+  if not isinstance(body, dict):
+    return h._error(400, "expected a JSON object")
+  args = _versions_args(h, body.get("kind"), body.get("name"))
+  if args is None:
+    return
+  try:
+    pv.restore(*args, body.get("id"))
+  except ValueError as e:
+    return h._error(400, str(e))
+  except OSError as e:
+    return h._error(500, f"could not restore: {e}")
+  api_versions_get(h, {"kind": [args[0]], "name": [args[1]]})
+
+
+def api_versions_post(h: HudHandler, q) -> None:
+  from openpilot.sunnypilot.selfdrive.controls.lib import profile_versions as pv
+  if h.server.engine.monitor.moving:
+    return h._error(409, "profile versions can't be changed while the car is moving")
+  body = h._json_body()
+  if not isinstance(body, dict):
+    return h._error(400, "expected a JSON object")
+  args = _versions_args(h, body.get("kind"), body.get("name"))
+  if args is None:
+    return
+  try:
+    if pv.snapshot(*args, str(body.get("label", "saved from the HUD"))[:80], "hud") is None:
+      return h._error(404, f"no live {args[0]} named {args[1]!r}")
+  except OSError as e:
+    return h._error(500, f"could not save: {e}")
+  api_versions_get(h, {"kind": [args[0]], "name": [args[1]]})
+
+
 # ---- SSH keys: the Oceanfront View app's key, for managing the comma over SSH -----------------------------
 # The app makes its own key pair (in the head unit's keystore) and asks for its public half to be let in. It goes
 # into GithubSshKeys beside whatever is there (the comma's sshd reads that param for `comma`), and SSH is turned on.
@@ -1074,6 +1146,9 @@ ROUTES = {
   ("GET", "/api/profiles"): api_profiles_get,
   ("GET", "/api/drives"): api_drives_get,
   ("PUT", "/api/profiles"): api_profiles_put,
+  ("GET", "/api/profiles/versions"): api_versions_get,
+  ("PUT", "/api/profiles/versions"): api_versions_put,
+  ("POST", "/api/profiles/versions"): api_versions_post,
   ("GET", "/api/ssh"): api_ssh_get,
   ("POST", "/api/ssh/authorize"): api_ssh_authorize,
   ("DELETE", "/api/ssh/authorize"): api_ssh_revoke,

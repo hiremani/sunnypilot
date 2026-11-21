@@ -26,7 +26,7 @@ from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile
 from openpilot.sunnypilot.selfdrive.controls.lib import junction_memory
 from openpilot.sunnypilot.selfdrive.controls.lib import stop_test
-from openpilot.sunnypilot.selfdrive.controls.lib.turn_planner import TurnPlanner
+from openpilot.sunnypilot.selfdrive.controls.lib.turn_planner import TurnPlanner, apply_profile as apply_turn_profile
 from openpilot.sunnypilot.selfdrive.controls.lib import wet_road
 from openpilot.sunnypilot.selfdrive.controls.lib.narrow_street import PARAM as NARROW_PARAM, CenterLineKeeper
 from openpilot.common.gps import get_gps_location_service
@@ -118,17 +118,7 @@ class Controls(ControlsExt):
       if self._turn_param_frame % 1000 == 0:   # the driver profile's turn starts from a stop (about every 10 s)
         try:   # a problem here keeps the planner's current tuning (default: off)
           profile = driver_profile.active(self.params)
-          self.turn_planner.tuning.stop_start_left_m = profile.turn_stop_start_left_m
-          self.turn_planner.tuning.stop_start_right_m = profile.turn_stop_start_right_m
-          self.turn_planner.tuning.v_turn = profile.junction_turn_mph * CV.MPH_TO_MS
-          self.turn_planner.tuning.unwind_wheel_deg_s = profile.turn_unwind_deg_s
-          self.turn_planner.tuning.turn_in_wheel_deg_s = profile.turn_in_deg_s
-          self.turn_planner.tuning.lead_s = profile.turn_start_lead_s
-          self.turn_planner.tuning.radius_left_m = profile.turn_radius_left_m
-          self.turn_planner.tuning.radius_right_m = profile.turn_radius_right_m
-          self.turn_planner.tuning.v_arm_max = profile.turn_arm_mph * CV.MPH_TO_MS
-          self.turn_planner.tuning.path_in = profile.turn_path_in
-          self.turn_planner.tuning.path_out = profile.turn_path_out
+          apply_turn_profile(self.turn_planner.tuning, profile)
           if profile.turn_path_in > 0.0 and profile.turn_path_out > 0.0:
             self.turn_planner.tuning.junctions = junction_memory.load(driver_profile.active_name(self.params))
           else:

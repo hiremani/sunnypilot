@@ -192,6 +192,31 @@ class TestServer(OpenpilotTestCase):
       assert self.request("PUT", "/api/profiles", {"active": "me"})[0] == 409
       assert json.loads(self.request("GET", "/api/profiles")[1])["editable"] is False
 
+  def test_profile_versions(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
+    from openpilot.sunnypilot.selfdrive.controls.lib import profile_versions as pv
+    with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"DRIVER_PROFILES_DIR": d}):
+      src = os.path.join(d, "new.tmp")
+      for decel in (0.9, 0.7):
+        with open(src, "w") as f:
+          json.dump(dp.to_dict(dp.DriverProfile(stop_decel=decel)), f)
+        pv.install("profile", "me", src, label=f"decel {decel}")
+      status, body, _ = self.request("GET", "/api/profiles/versions?name=me")
+      vs = json.loads(body)["versions"]
+      assert status == 200 and [v["label"] for v in vs] == ["decel 0.7", "decel 0.9"]
+      assert vs[0]["live"] and vs[0]["values"]["stop_decel"] == 0.7
+      status, body, _ = self.request("PUT", "/api/profiles/versions", {"name": "me", "id": vs[1]["id"]})
+      assert status == 200 and dp.load("me").stop_decel == 0.9
+      assert [v["live"] for v in json.loads(body)["versions"]] == [False, True]
+      assert self.request("PUT", "/api/profiles/versions", {"name": "me", "id": "20260101-000000-deadbeef"})[0] == 400
+      assert self.request("PUT", "/api/profiles/versions", {"name": "me", "id": "../me"})[0] == 400
+      assert self.request("GET", "/api/profiles/versions?name=../x")[0] == 400
+      assert self.request("GET", "/api/profiles/versions?kind=other")[0] == 400
+      assert self.request("POST", "/api/profiles/versions", {"name": "nobody"})[0] == 404
+      self.server.engine.monitor.moving = True
+      assert self.request("PUT", "/api/profiles/versions", {"name": "me", "id": vs[0]["id"]})[0] == 409
+      assert dp.load("me").stop_decel == 0.9
+
   def test_drive_summaries(self):
     with tempfile.TemporaryDirectory() as d, mock.patch.object(webhud_server, "drive_summaries_dir", lambda: d):
       assert json.loads(self.request("GET", "/api/drives")[1]) == {"drives": []}

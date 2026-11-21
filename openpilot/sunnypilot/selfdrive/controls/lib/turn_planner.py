@@ -185,6 +185,23 @@ class TurnTuning:
                                    # heading the car still turns while the wheel comes back at this speed.
 
 
+def apply_profile(tuning: "TurnTuning", profile) -> None:
+  """The driver profile's turn values into the planner's tuning (controlsd every ~10 s; drive_sim and
+  tools/profile_compare.py the same way). The junction memory is loaded by the caller."""
+  mph = 0.44704
+  tuning.stop_start_left_m = profile.turn_stop_start_left_m
+  tuning.stop_start_right_m = profile.turn_stop_start_right_m
+  tuning.v_turn = profile.junction_turn_mph * mph
+  tuning.unwind_wheel_deg_s = profile.turn_unwind_deg_s
+  tuning.turn_in_wheel_deg_s = profile.turn_in_deg_s
+  tuning.lead_s = profile.turn_start_lead_s
+  tuning.radius_left_m = profile.turn_radius_left_m
+  tuning.radius_right_m = profile.turn_radius_right_m
+  tuning.v_arm_max = profile.turn_arm_mph * mph
+  tuning.path_in = profile.turn_path_in
+  tuning.path_out = profile.turn_path_out
+
+
 def _wrap(a: float) -> float:
   return (a + 180.0) % 360.0 - 180.0
 

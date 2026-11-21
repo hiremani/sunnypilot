@@ -743,6 +743,14 @@ def path_curvature(path) -> list[float]:
   return out
 
 
+def style_from_values(p) -> dict:
+  """The style dict from a DriverProfile (driver_profile.py)."""
+  return STYLE | {"town_offset_mph": p.town_offset_mph, "fast_offset_mph": p.fast_offset_mph, "fast_zone_mph": p.fast_zone_mph,
+                  "lat_accel": p.curve_lat_accel, "decel": p.stop_decel, "gap_s": p.follow_gap_s,
+                  "accel_max": min(p.launch_accel, STYLE["accel_max"]), "limit_offsets": dict(p.limit_offsets_mph),
+                  "lead_coast_s": p.lead_coast_s, "junction_mph": p.junction_turn_mph}
+
+
 def style_from_profile(name: str | None) -> tuple[dict, str]:
   """The style dict from a named driver profile (driver_profile.py), and the name used; STYLE if there is none."""
   from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
@@ -750,14 +758,11 @@ def style_from_profile(name: str | None) -> tuple[dict, str]:
   name = name if name in names else (dp.DEFAULT_NAME if dp.DEFAULT_NAME in names else (names[0] if names else None))
   if name is None:
     return dict(STYLE), "built-in"
-  p = dp.load(name)
-  return STYLE | {"town_offset_mph": p.town_offset_mph, "fast_offset_mph": p.fast_offset_mph, "fast_zone_mph": p.fast_zone_mph,
-                  "lat_accel": p.curve_lat_accel, "decel": p.stop_decel, "gap_s": p.follow_gap_s,
-                  "accel_max": min(p.launch_accel, STYLE["accel_max"]), "limit_offsets": dict(p.limit_offsets_mph),
-                  "lead_coast_s": p.lead_coast_s, "junction_mph": p.junction_turn_mph}, name
+  return style_from_values(dp.load(name)), name
 
 
-def simulate_style(data: dict, style: dict | None = None, profile: str | None = None) -> dict:
+def simulate_style(data: dict, style: dict | None = None, profile: str | None = None, driver_profile=None,
+                   label: str | None = None) -> dict:
   """The recorded route driven by openpilot longitudinal tuned to the driver's style: the posted limit (+ offset), the
   driver's lateral accel in curves, the driver's braking to each place the driver stopped (held as long), the
   driver's gap to the lead the recording saw at that spot, and the car's accel limit. Compared with the recorded speed
@@ -766,7 +771,10 @@ def simulate_style(data: dict, style: dict | None = None, profile: str | None = 
   slow turns."""
   from openpilot.common.realtime import DT_MDL
   from openpilot.sunnypilot.selfdrive.controls.lib import profile_long as pl
-  base, profile_used = style_from_profile(profile)
+  if driver_profile is not None:   # a DriverProfile object (tools/profile_compare.py: a version or a file)
+    base, profile_used = style_from_values(driver_profile), label or "custom"
+  else:
+    base, profile_used = style_from_profile(profile)
   st = base | (style or {})
   frames = data["frames"]
   lo, hi = moving_span(frames)
