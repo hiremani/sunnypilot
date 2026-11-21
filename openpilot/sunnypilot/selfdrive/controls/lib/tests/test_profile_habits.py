@@ -25,6 +25,9 @@ class TestDefaultsAreOff(unittest.TestCase):
     self.assertEqual(dp.clamp("bump_cross_mph", 30.0), 15.0)
     self.assertEqual(dp.clamp("turn_in_deg_s", 500.0), 120.0)
     self.assertEqual(dp.clamp("turn_start_lead_s", 5.0), 1.5)
+    # the turn arming speed can only come down from the planner's own (00000128 turn 3)
+    self.assertEqual(dp.clamp("turn_arm_mph", 16.7), dp.DriverProfile().turn_arm_mph)
+    self.assertEqual(dp.clamp("turn_arm_mph", 14.0), 14.0)
 
 
 class TestStopGap(unittest.TestCase):

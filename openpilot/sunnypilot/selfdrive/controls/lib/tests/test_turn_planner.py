@@ -431,6 +431,29 @@ class TestComfort(unittest.TestCase):
     self.assertEqual(p.log.reason, "done")
     self.assertAlmostEqual(car.h, 90.0, delta=10.0)
 
+  def test_waits_for_the_driver_to_slow_rather_than_sweep_wide(self):
+    # 00000128 turn 3: signaled right, the driver at 16 mph braking to 10 before turning. Started at 16 mph the arc is
+    # v^2 / A_LAT_MAX = 20 m, begun 21.6 m before the corner: a sweep 27 m off the driver's path. Wait instead.
+    p = planner(t_junction(right=True))
+    p.tuning.radius_right_m = 11.0
+    car = Car(p, v=7.15, y0=-60.0)           # 16.0 mph: under the 16.1 mph arming speed
+    while car.y < -12.0:
+      car.step(right=True)
+    self.assertEqual(p.state, tp.ARMED)
+    self.assertTrue(all(o is None for o in car.outputs), "started a sweeping turn at 16 mph")
+    car.v = 4.5                               # the driver has slowed to turn speed: the turn happens, at its own radius
+    car.drive(20.0, right=True)
+    self.assertEqual(p.log.reason, "done")
+    self.assertLessEqual(p.radius, 11.0 + 1e-6)
+    self.assertAlmostEqual(car.h, 90.0, delta=12.0)
+
+  def test_a_turn_at_its_own_radius_still_starts_moving(self):
+    p = planner(t_junction(right=True))
+    car = Car(p, v=5.0, y0=-60.0)            # 11 mph: an 11 m arc is fine at this speed (10 m tuned, v^2/a = 10 m)
+    car.drive(25.0, right=True)
+    self.assertEqual(p.log.reason, "done")
+    self.assertAlmostEqual(car.h, 90.0, delta=10.0)
+
   def test_speeding_up_out_of_a_finished_turn_counts_as_done(self):
     p = planner(t_junction(right=True))
     car = Car(p)

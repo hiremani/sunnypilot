@@ -300,7 +300,8 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
     return sorted(xs)[min(len(xs) - 1, int(len(xs) * q))] if xs else None
 
   put("turn_arm_mph", pct(onset_mph, 0.9), len(onset_mph), MIN_SAMPLES["turn_arm"],
-      "p90 speed the driver starts a moving junction turn at (the turn planner starts no faster)")
+      "p90 speed the driver starts a moving junction turn at (the turn planner starts no faster; clamped to the "
+      + "planner's own 16.1 mph at most)")
   put("curve_entry_decel", pct(curve_decels, 0.75), len(curve_decels), MIN_SAMPLES["curve_entry"],
       "p75 slowing in the 4 s before a curve, the driver steering")
   put("signal_coast_s", statistics.median(signal_ttl) if signal_ttl else None, len(signal_ttl), MIN_SAMPLES["signal"],

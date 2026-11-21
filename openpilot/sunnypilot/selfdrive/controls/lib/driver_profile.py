@@ -187,7 +187,9 @@ BOUNDS = {
   "turn_start_lead_s": (-1.5, 1.5),
   "turn_radius_left_m": (7.0, 15.0),
   "turn_radius_right_m": (7.0, 15.0),
-  "turn_arm_mph": (12.0, 18.0),        # the turn planner aborts at 20 mph
+  "turn_arm_mph": (12.0, 16.1),        # lower only: above the planner's own 16 mph it starts turns the driver is still
+                                       # braking for, from where the car is then (00000128 turn 3: 21.6 m early at 16.2
+                                       # mph, a 21 m arc 27 m off the driver's path; the p90 measured was 16.7)
   "curve_entry_decel": (0.5, 1.5),
   "signal_coast_s": (2.0, 8.0),
   "wet_offset_mph": (-10.0, 0.0),      # never over the limit when wet

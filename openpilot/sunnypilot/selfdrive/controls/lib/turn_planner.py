@@ -98,6 +98,9 @@ UNWIND_RATE_FACTOR = 1.5        # unwinding may be this much quicker (the wheel 
 BLEND_DEG = 30.0
 BLEND_HANDOVER_DEG = 5.0      # ...and hands over (done) this far before the release point, fully on the model
 R_MIN = 6.0                     # m: tightest arc ever planned (a late start may tighten the arc down to this)
+WIDE_ARC_MAX = 1.25            # moving: no start while the speed needs an arc this much wider than the tuned one (v^2 /
+                               # A_LAT_MAX): the driver is still braking for the corner and will turn at their radius
+                               # (00000128 turn 3: armed at 16 mph, a 20.9 m arc begun 21.6 m early, 27 m off the path)
 R_FROM_STOP_MAX = 30.0          # m: widest arc a turn started early from a stop (TurnTuning.stop_start_*_m) is fitted to
 LATE_SLACK_M = 2.0              # a start so late the arc would need to be this much tighter than R_MIN is abandoned;
                                 # within the slack the R_MIN arc is flown and ends a little past the planned exit
@@ -919,6 +922,9 @@ class TurnPlanner:
     if path_start is not None:
       return path_start if path_start is not _WAIT else None
     r = self.radius_for(self.side, v)
+    r_tuned = max(self.tuning.radius_right_m if self.side == "right" else self.tuning.radius_left_m, R_MIN)
+    if r > r_tuned * WIDE_ARC_MAX:
+      return None   # still too fast for this corner's own arc: wait for the driver to slow (or it is too late)
     start = self.start_distance(r, self.planned, v)
     stop_start = self.tuning.stop_start_left_m if self.side == "left" else self.tuning.stop_start_right_m
     early = self.waited_stopped and v >= V_START_MIN and start < self.dist <= stop_start
