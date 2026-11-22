@@ -55,15 +55,27 @@ def routes_in(root: str) -> list[str]:
   return sorted({os.path.basename(p).rsplit("--", 1)[0] for p in glob.glob(os.path.join(root, "*--*--*"))})
 
 
+SETTLED_S = 3.0          # s of steady speed with the gas held before a sample counts as the driver's cruising speed
+SETTLED_ACCEL = 0.25     # m/s^2: steady
+
+
 def speed_offsets(S: list, fast_zone_mph: float) -> dict[int, list[float]]:
-  """(v - limit) in mph per posted limit (5 mph bins), on open road with the driver choosing the speed."""
+  """(v - limit) in mph per posted limit (5 mph bins), at the speed the driver settles at on open road: the gas held,
+  speed steady for SETTLED_S, no car close, no curve, ACC off. The planner caps the cruising speed with it
+  (driverSpeed), so it must be where the driver cruises, not every open-road moment: easing toward a turn or a stop
+  and rolling up to junctions pulled the old median (any |a| < 0.6) down - 65 mph roads +1.9 against +4.0 settled,
+  and 22 gas takeovers of the cap in 39 drives (2026-11-21)."""
   by: dict[int, list[float]] = defaultdict(list)
+  t_steady = None
   for s in S:
-    if s.limit <= 0 or s.v < 4.5 or s.cruise or s.brake or abs(s.a) > 0.6:
+    ok = (s.limit > 0 and s.v >= 4.5 and not s.cruise and not s.brake and s.gas and abs(s.a) < SETTLED_ACCEL
+          and not (0 < s.lead_d < OPEN_ROAD_GAP_S * s.v) and abs(s.yaw) <= LAT_CURVE_YAW)
+    if not ok:
+      t_steady = None
       continue
-    if 0 < s.lead_d < OPEN_ROAD_GAP_S * s.v or abs(s.yaw) > LAT_CURVE_YAW:
-      continue
-    by[round(s.limit * MPH / 5) * 5].append((s.v - s.limit) * MPH)
+    t_steady = s.t if t_steady is None else t_steady
+    if s.t - t_steady >= SETTLED_S:
+      by[round(s.limit * MPH / 5) * 5].append((s.v - s.limit) * MPH)
   return by
 
 
@@ -239,8 +251,8 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
   fast = [lim for lim in offsets if lim >= base.fast_zone_mph - 2]
   t_med, t_n = weighted_median(town)
   f_med, f_n = weighted_median(fast)
-  put("town_offset_mph", t_med, t_n, MIN_SAMPLES["speed"], f"median (speed - limit) on open road below {base.fast_zone_mph:.0f} mph")
-  put("fast_offset_mph", f_med, f_n, MIN_SAMPLES["speed"], f"median (speed - limit) on open road {base.fast_zone_mph:.0f} mph and up")
+  put("town_offset_mph", t_med, t_n, MIN_SAMPLES["speed"], f"median (speed - limit) settled cruising below {base.fast_zone_mph:.0f} mph")
+  put("fast_offset_mph", f_med, f_n, MIN_SAMPLES["speed"], f"median (speed - limit) settled cruising {base.fast_zone_mph:.0f} mph and up")
   meta["speed_by_limit"] = {str(lim): {"median_mph": round(statistics.median(d), 1), "samples": len(d)}
                             for lim, d in sorted(offsets.items()) if len(d) >= 50}
 
@@ -341,7 +353,8 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
                    if len(d) >= MIN_SAMPLES["limit"] and math.isfinite(statistics.median(d))}
   values["limit_offsets_mph"] = dp.clamp_limit_offsets(limit_offsets, base.fast_zone_mph)
   meta["limit_offsets_mph"] = {"measured": limit_offsets, "used": values["limit_offsets_mph"],
-                               "note": f"median (speed - limit) per posted limit with >= {MIN_SAMPLES['limit'] / 10:.0f} s of open road"}
+                               "note": f"median (speed - limit) per posted limit, settled cruising (>= {SETTLED_S:.0f} s steady on the gas), "
+                               + f">= {MIN_SAMPLES['limit'] / 10:.0f} s of it"}
 
   profile = dp.DriverProfile(**({f: getattr(base, f) for f in dp.BOUNDS} | values))
   profile.limit_offsets_mph = values["limit_offsets_mph"]
