@@ -974,3 +974,43 @@ def _test_case():
 
 TestStopSign = _test_case()
 
+
+
+def _fisker_approach(v0, stop_d, confirm_d, k=1.0, delay=0.35, tau=0.3):
+  """A stop with the Fisker's request smoothing (carcontroller.smooth_accel_step, 100 Hz) between a planner stand-in
+  (a = clip(k (target - v), -1.2, +1.0), 20 Hz) and a car following the request after `delay` with time constant
+  `tau`; the model confirms the stop `confirm_d` before the stop point. Returns m short of the stop point (- = past)."""
+  from opendbc.car.fisker.carcontroller import smooth_accel_step
+  sign_m = stop_d + STOP_MARGIN_M
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, sign_m))])
+  pos, v, a, sent, step, filt, cmd = 0.0, v0, 0.0, 0.0, 0.0, 0.0, 0.0
+  q = [0.0] * round(delay / 0.01)
+  for n in range(40000):
+    if n % 5 == 0:
+      lat, lon = north_of(LAT0, LON0, pos)
+      ctrl.update(sm_at(gps(lat, lon, speed=v), model(stop=sign_m - pos < confirm_d + STOP_MARGIN_M)), True, False, v, a, NOW)
+      tgt = ctrl.output_v_target
+      cmd = 0.0 if tgt == V_CRUISE_UNSET else max(min(k * (tgt - v), 1.0), -1.2)
+    sent, step, filt = smooth_accel_step(cmd, sent, step, filt)
+    q.append(sent)
+    a += (q.pop(0) - a) * 0.01 / tau
+    v = max(0.0, v + a * 0.01)
+    pos += v * 0.01
+    if (v == 0.0 and n > 50) or pos > sign_m + 5:
+      break
+  return stop_d - pos
+
+
+def test_stops_short_of_the_stop_point_with_the_cars_lag():
+  # 00000136 at 0:30: 10.5 mph, confirmed 23.7 m out; braking began 5.9 m before the stop point and the car crossed it
+  # at 3-4 mph. Every approach must stop clear of the point on a car that brakes late.
+  for mph, stop_d, confirm_d in ((10.5, 30.7, 23.7), (8.0, 30.0, 25.0), (13.0, 40.0, 35.0), (16.0, 50.0, 45.0), (22.0, 71.0, 71.0)):
+    for k, delay in ((1.5, 0.2), (1.0, 0.35), (0.8, 0.5)):
+      short = _fisker_approach(mph * 0.44704, stop_d, confirm_d, k, delay)
+      assert 0.8 <= short <= 4.0, (mph, k, delay, short)
+
+
+def test_confirmed_stop_coasts_then_holds_not_down_to_the_floor():
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import coast_target, COAST_FLOOR_V
+  assert coast_target(2.6, floor=False) == 2.6 - 0.4     # confirmed: no floor
+  assert coast_target(2.6) == COAST_FLOOR_V              # unconfirmed: the floor stays (never stops for a sign the model ignores)

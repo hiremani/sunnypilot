@@ -84,8 +84,14 @@ MAX_APPROACH_V = 11.2    # m/s (25 mph): above this the assist doesn't take on a
 COAST_FLOOR_V = 2.5      # m/s (~5.6 mph): coasting eases off down to here and no further. Only a confirmed stop brings
                          # the car to a halt; an unconfirmed coast used to decay to 0 and hold the car short of the sign
                          # with no way out but the gas (found with drive_sim's closed loop, 2026-11-14)
-LAG_S = 1.0              # lead the braking profile by the planner's ~1 s speed-loop time constant
+LAG_S = 1.6              # lead the braking profile by the time the car takes to brake as asked: the planner's ~1 s
+                         # speed loop plus the Fisker's request smoothing (carcontroller.smooth_accel_step, ~0.6 s to
+                         # build -1.0). With 1.0 s the car crossed the stop point at 3-4 mph from a 10 mph approach
+                         # (00000136 at 0:30, 2026-11-22; simulated with the real smoothing: 0.0 m margin at 8-10 mph)
 STOP_MARGIN_M = 6.0      # stop this far before the sign's map point
+STOP_BUFFER_M = 1.5      # ...and aim the braking profile this much shorter still: it ends at zero speed, so any lag at
+                         # the end carried the car past the stop point (00000136 at 0:37: 4.6 mph 2 m before it). With
+                         # the Fisker's request smoothing, simulated: 1.5-3.0 m short on three response models, never past
 STOP_V_TARGET = 0.0      # m/s: a complete stop. No rolling-stop option on purpose (NHTSA recall 22V-037, see above)
 PASSED_M = 10.0          # m beyond the sign's map point: dead-reckoned this far past it, the sign is behind the car
 STOPPED_V = 0.3          # m/s: at a stop
@@ -134,15 +140,19 @@ def required_decel(dist_to_stop: float, v_ego: float) -> float:
   return v_ego ** 2 / (2 * max(dist_to_stop - v_ego * LAG_S, 0.5))
 
 
-def coast_target(v_ego: float) -> float:
+def coast_target(v_ego: float, floor: bool = True) -> float:
   """Easing off the gas: a little under the current speed, but never below COAST_FLOOR_V (or below v_ego, when already
-  slower than that: no creeping to a stop on a coast)."""
+  slower than that: no creeping to a stop on a coast). floor False (the stop is confirmed): no floor, it keeps easing
+  down into the braking profile. With the floor a confirmed stop held 5.6 mph - and sped back up to it - until the
+  braking profile crossed it ~6 m before the stop point (00000136 at 0:35: +0.17 m/s^2 at 7 m, then the overshoot)."""
+  if not floor:
+    return max(v_ego - COAST_DV, 0.0)
   return max(v_ego - COAST_DV, min(v_ego, COAST_FLOOR_V))
 
 
 def braking_v_target(dist_to_stop: float, v_ego: float, a: float = A_COMFORT) -> float:
   """The braking profile's speed target: it ends at STOP_V_TARGET (zero) at the stop point, never at a rolling speed."""
-  d = max(dist_to_stop - v_ego * LAG_S, 0.0)
+  d = max(dist_to_stop - STOP_BUFFER_M - v_ego * LAG_S, 0.0)
   return max(math.sqrt(2 * a * d), STOP_V_TARGET)
 
 
@@ -213,6 +223,7 @@ class StopSignAssist:
     self.a_comfort = A_COMFORT
     self.coast_s = COAST_TIME_S
     self.a_brake = A_COMFORT       # this sign's braking: a_comfort, or more (up to A_TAKE_ON_MAX) when taken on late
+    self.coast_t = 0.0             # s of lift-off coast so far for this sign (a confirmed stop coasts coast_s, then holds)
     self.gave_up = 0               # signs left to the driver because a comfortable stop was no longer possible
     self.confirm_filter = FirstOrderFilter(0.0, CONFIRM_FILTER_S, DT_MDL)
     self.cue = StopCue()           # the last frame the confirmer read, for the log
@@ -243,6 +254,7 @@ class StopSignAssist:
     self.confirmed = False
     self.too_late = False
     self.a_brake = self.a_comfort
+    self.coast_t = 0.0          # s of lift-off coast so far for this sign (a confirmed stop coasts coast_s, then holds)
     self.confirm_filter.x = 0.0
     self.cue = StopCue()
     self.cue_lead = False
@@ -373,7 +385,16 @@ class StopSignAssist:
         # firmer, on a profile that can actually stop in the room left
         self.a_brake = max(self.a_comfort, min(required_decel(self.distance, v_ego), self.a_limit))
       # hold the speed until the time-based coast window (slow approaches start inside 150 ft), then lift off
-      coast_v = coast_target(v_ego) if self.distance <= lift_off_distance(v_ego, self.a_comfort, self.coast_s) else v_ego
+      if self.distance > lift_off_distance(v_ego, self.a_comfort, self.coast_s):
+        coast_v = v_ego                                   # engaged: no speeding up toward the sign, no decay yet
+      elif may_brake:
+        # a confirmed stop: lift off for the driver's coast time, then hold until the braking profile takes over. A
+        # coast that went on (to the floor, or without one, toward zero) rolled in slowly and braked late
+        coast_v = coast_target(v_ego, floor=False) if self.coast_t < max(self.coast_s, COAST_MIN_S) else v_ego
+        self.coast_t += DT_MDL
+      else:
+        coast_v = coast_target(v_ego)                     # not confirmed: coast, never below the floor
+
       brake_v = braking_v_target(self.distance, v_ego, self.a_brake) if may_brake else coast_v
       self.state = StopSignState.braking if brake_v < coast_v else StopSignState.coasting
       self.output_v_target = min(coast_v, brake_v)
