@@ -38,3 +38,16 @@ class TestSpeedOffsets(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestJunctionLatAccel(unittest.TestCase):
+  def test_signaled_slow_tight_turns_with_acc_off_only(self):
+    turn = [S(i * 0.1, 3.5, yaw=0.3, rb=True, limit=0.0) for i in range(20)]           # R 11.7 m, 1.05 m/s^2
+    self.assertEqual(len(g.junction_lat_accels(turn)), 20)
+    self.assertAlmostEqual(g.junction_lat_accels(turn)[0], 1.05)
+    base = {"v": 3.5, "yaw": 0.3, "rb": True, "limit": 0.0}
+    for change in ({"rb": False}, {"cruise": True}, {"yaw": 0.05}, {"v": 12.0}):   # no blinker, ACC, gentle, too fast
+      kw = base | change
+      v = kw.pop("v")
+      rows = [S(i * 0.1, v, **kw) for i in range(5)]
+      self.assertEqual(g.junction_lat_accels(rows), [], change)

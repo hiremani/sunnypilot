@@ -229,7 +229,8 @@ class LongitudinalPlannerSP:
       in_turn = profile_long.junction_turn(CS.leftBlinker, CS.rightBlinker, v_ego, sm['controlsState'].curvature)
       self.turn_exit_left = profile_long.TURN_EXIT_S if in_turn else max(0.0, self.turn_exit_left - DT_MDL)
       if in_turn:
-        v_turn = self.profile.junction_turn_mph * CV.MPH_TO_MS
+        v_turn = profile_long.junction_speed(self.profile.junction_turn_mph * CV.MPH_TO_MS, self.profile.junction_lat_accel,
+                                             sm['controlsState'].curvature)
         targets[LongitudinalPlanSource.junctionTurn] = (v_turn, profile_long.JUNCTION_ACCEL if v_ego > v_turn else a_ego)
       limit = self.resolver.speed_limit
       if self.profile_speed_on and self.resolver.speed_limit_valid:
@@ -261,7 +262,8 @@ class LongitudinalPlannerSP:
       if state == 1:
         v_turn_target = profile_long.junction_approach_v(dist, v_turn, v_ego)
       elif state == 2:
-        v_turn_target = v_turn
+        v_turn_target = profile_long.junction_speed(v_turn, self.profile.junction_lat_accel if self.profile_on else 0.0,
+                                                    sm['controlsState'].curvature)
         self.turn_exit_left = profile_long.TURN_EXIT_S   # the driver profile's pull-away after the turn
       if v_turn_target is not None:
         prev = targets.get(LongitudinalPlanSource.junctionTurn, (float('inf'), a_ego))

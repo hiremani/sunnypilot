@@ -94,6 +94,9 @@ class DriverProfile:
   # curves and turns
   curve_lat_accel: float = 2.0   # m/s^2
   junction_turn_mph: float = 10.0
+  # sideways acceleration through junction turns (m/s^2): the speed follows the turn's tightness, never below
+  # junction_turn_mph (profile_long.junction_speed); 0 = off (junction_turn_mph for the whole turn)
+  junction_lat_accel: float = 0.0
   turn_exit_accel: float = 1.0   # m/s^2, pulling away out of a junction turn
   # from a stop the turn assist starts a signaled turn as the car moves off when the junction is this close (m); 0 = off
   turn_stop_start_left_m: float = 0.0
@@ -167,6 +170,7 @@ BOUNDS = {
   "launch_accel": (0.5, 1.0),          # the car's openpilot ACCEL_MAX
   "curve_lat_accel": (1.2, 2.5),
   "junction_turn_mph": (5.0, 16.0),    # the turn planner arms at 16 mph at most
+  "junction_lat_accel": (0.0, 2.0),
   "turn_exit_accel": (0.3, 1.0),       # up to the car's openpilot ACCEL_MAX
   "turn_stop_start_left_m": (0.0, 30.0),   # turn_planner.R_FROM_STOP_MAX: no wider arc than that
   "turn_stop_start_right_m": (0.0, 30.0),

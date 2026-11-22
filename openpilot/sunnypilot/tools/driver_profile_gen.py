@@ -45,7 +45,7 @@ MIN_SAMPLES = {"speed": 300, "stops": 5, "curve": 100, "turns": 5, "gap": 200, "
                "lead_brake": 10, "stop_gap": 20, "lane_change": 20, "cruise_accel": 1000, "turn_in": 20,
                "bump": 10, "turn_arm": 20, "merge": 10, "curve_entry": 20, "signal": 20, "wet_s": 300,
                "narrow": 200,
-               "stop_start": 3}   # 10 Hz samples (narrow: 20 Hz), or events
+               "stop_start": 3, "junction_lat": 300}   # 10 Hz samples (narrow: 20 Hz), or events
 OPEN_ROAD_GAP_S = 3.0
 LAT_CURVE_YAW = 0.05      # rad/s: in a curve
 MIN_ROUTE_MOVING_MIN = 3.0
@@ -77,6 +77,17 @@ def speed_offsets(S: list, fast_zone_mph: float) -> dict[int, list[float]]:
     if s.t - t_steady >= SETTLED_S:
       by[round(s.limit * MPH / 5) * 5].append((s.v - s.limit) * MPH)
   return by
+
+
+def junction_lat_accels(S: list) -> list[float]:
+  """Sideways acceleration (m/s^2, v x |yaw rate|) at each sample of a signaled junction turn, ACC off: blinker on,
+  under profile_long.JUNCTION_V_MAX and tighter than JUNCTION_CURVATURE (what the planner treats as a junction turn)."""
+  from openpilot.sunnypilot.selfdrive.controls.lib import profile_long as pl
+  out = []
+  for s in S:
+    if (s.lb or s.rb) and not s.cruise and 1.5 <= s.v <= pl.JUNCTION_V_MAX and abs(s.yaw) / s.v >= pl.JUNCTION_CURVATURE:
+      out.append(s.v * abs(s.yaw))
+  return out
 
 
 LEAD_COAST_CLOSING = 0.5   # m/s slower than us
@@ -172,6 +183,7 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
   stop_gaps, curve_decels, lc_delays, accels, turn_ins, bumps, onsets_moving = [], [], [], [], [], [], []
   rolls = [0, 0]
   pulls, cut_ins, lane_drv, lane_op, signal_ttl, merges = [], [], [], [], [], []
+  junction_lat: list[float] = []
   wet = {"wet_offset": [], "dry_offset": [], "wet_gap": [], "dry_gap": []}
   lights = [0, 0]
   used, miles = [], 0.0
@@ -186,6 +198,7 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
     miles += ov["miles"]
     for lim, d in speed_offsets(S, base.fast_zone_mph).items():
       offsets[lim] += d
+    junction_lat += junction_lat_accels(S)
     acc_on = [s.t for s in S if s.cruise]
     for st in fds.stops(S):
       if not any(st["t"] - 20 <= t <= st["t"] for t in acc_on[::10]):
@@ -268,6 +281,8 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
   tmin = [t["min_mph"] for t in turns]
   put("junction_turn_mph", statistics.median(tmin) if tmin else None, len(tmin), MIN_SAMPLES["turns"],
       "median slowest speed through junction turns the driver steered")
+  put("junction_lat_accel", statistics.median(junction_lat) if junction_lat else None, len(junction_lat), MIN_SAMPLES["junction_lat"],
+      "median sideways acceleration (v x yaw rate) in signaled junction turns, ACC off (10 Hz)")
   exits = [t["exit_accel"] for t in turns if t.get("exit_accel") is not None and t["exit_accel"] > 0.0]
   put("turn_exit_accel", statistics.median(exits) if exits else None, len(exits), MIN_SAMPLES["turns"],
       "median pull-away over the 3 s after a junction turn the driver steered, on the accelerator, ACC off, no lead")

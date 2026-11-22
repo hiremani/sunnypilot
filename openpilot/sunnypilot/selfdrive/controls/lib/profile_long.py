@@ -216,6 +216,16 @@ def lead_coast(lead_coast_s: float, v_ego: float, lead_present: bool, d_rel: flo
   return d_rel / v_ego < lead_coast_s
 
 
+def junction_speed(v_min: float, lat_accel: float, curvature: float) -> float:
+  """m/s through a junction turn: the speed the driver's sideways acceleration allows at the turn's tightness now,
+  never below their slowest junction speed (v_min) or above a junction turn's JUNCTION_V_MAX. lat_accel 0: v_min
+  throughout (the old cap). The driver slows with the tightness (1.26 m/s^2 at 20-33 m radius, 11.8 mph; 0.56 at
+  5-8 m, 4.5 mph): holding the apex speed for the whole turn braked them on the way out (2026-11-21, 7 takeovers)."""
+  if lat_accel <= 0.0 or abs(curvature) < 1e-4:
+    return v_min
+  return max(v_min, min(JUNCTION_V_MAX, math.sqrt(lat_accel / abs(curvature))))
+
+
 def junction_turn(left_blinker: bool, right_blinker: bool, v_ego: float, curvature: float) -> bool:
   return (left_blinker or right_blinker) and v_ego < JUNCTION_V_MAX and abs(curvature) > JUNCTION_CURVATURE
 

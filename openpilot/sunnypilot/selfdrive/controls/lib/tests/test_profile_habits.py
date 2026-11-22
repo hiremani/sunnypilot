@@ -185,3 +185,32 @@ class TestMerge(unittest.TestCase):
     self.assertAlmostEqual(pl.comfort_accel_cap(v, p, merge=True), pl.comfort_accel_cap(v))     # the table's
     self.assertGreater(pl.comfort_accel_cap(v, p, merge=True), pl.comfort_accel_cap(v, p))
     self.assertAlmostEqual(pl.comfort_accel_cap(v, dp.DriverProfile(merge_accel=0.85), merge=True), 0.85)
+
+
+class TestJunctionSpeed(unittest.TestCase):
+  def test_off_by_default_the_old_cap_for_the_whole_turn(self):
+    self.assertEqual(dp.DriverProfile().junction_lat_accel, 0.0)
+    v_min = 5.9 * 0.44704
+    for k in (0.02, 0.05, 0.1, 0.2):
+      self.assertEqual(pl.junction_speed(v_min, 0.0, k), v_min)
+
+  def test_follows_the_turns_tightness_never_below_the_slowest(self):
+    v_min, a = 5.9 * 0.44704, 0.91
+    gentle, tight = pl.junction_speed(v_min, a, 1 / 25.0), pl.junction_speed(v_min, a, 1 / 10.0)
+    self.assertGreater(gentle, tight)                                  # wider part of the turn: faster
+    self.assertAlmostEqual(gentle, math.sqrt(a * 25.0))
+    self.assertEqual(pl.junction_speed(v_min, a, 1 / 4.0), v_min)      # tighter than the apex speed allows: the floor
+    self.assertEqual(pl.junction_speed(v_min, 2.0, 1 / 50.0), pl.JUNCTION_V_MAX)
+    self.assertEqual(pl.junction_speed(v_min, a, 0.0), v_min)          # straight: nothing to scale by
+
+  def test_unwinding_out_of_the_turn_raises_the_target(self):
+    # 00000128 turn 4: 8.8 mph with the wheel coming back, the fixed 5.8 mph cap braked at -1.2 m/s^2
+    v_min, a = 5.9 * 0.44704, 0.91
+    ks = [0.10, 0.08, 0.06, 0.045]                                     # curvature falling as the wheel unwinds
+    vs = [pl.junction_speed(v_min, a, k) for k in ks]
+    self.assertEqual(vs, sorted(vs))
+    self.assertGreater(vs[-1], 8.8 * 0.44704 - 1.0)
+
+  def test_bounds(self):
+    self.assertEqual(dp.clamp("junction_lat_accel", 5.0), 2.0)
+    self.assertEqual(dp.clamp("junction_lat_accel", -1.0), 0.0)
