@@ -177,7 +177,26 @@ def test_coasts_from_150ft_at_low_speed():
   ctrl = make([just_inside])
   ctrl.update(sm_at(gps(LAT0, LON0, speed=v), model()), True, False, v, 0.0, NOW)
   assert ctrl.state == StopSignState.coasting
-  assert v - 0.5 < ctrl.output_v_target < v
+  assert ctrl.output_v_target == v          # engaged (no speeding up), holding speed until the lift-off window
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import lift_off_distance
+  near = StopSign(1, *north_of(LAT0, LON0, lift_off_distance(v) + STOP_MARGIN_M - 1))
+  ctrl = make([near])
+  ctrl.update(sm_at(gps(LAT0, LON0, speed=v), model()), True, False, v, 0.0, NOW)
+  assert v - 0.5 < ctrl.output_v_target < v  # inside it: the lift-off coast
+
+
+def test_slow_confirmed_approach_does_not_crawl():
+  # 00000116 at 1:55: 7.4 mph, the stop confirmed 28 m before the stop point; it coasted 8 s, 5.6 mph most of it
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import COAST_FLOOR_V
+  v0, sign_m = 3.3, 34.0 + STOP_MARGIN_M
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, sign_m))])
+  pos, v, log = run_approach(ctrl, sign_m, v0)
+  assert ctrl.state == StopSignState.stopped and v == 0.0
+  assert 0.0 <= sign_m - pos <= STOP_MARGIN_M + 4.0
+  crawl_s = sum(1 for d, vv, s, _ in log if 0.2 < vv <= COAST_FLOOR_V + 0.1 and s == StopSignState.coasting) * DT_MDL
+  assert crawl_s < 2.5, crawl_s
+  slow_s = sum(1 for _, vv, _, _ in log if 0.2 < vv <= 2.7) * DT_MDL
+  assert slow_s < 8.0, slow_s               # was 13.4 s under 6 mph (8.7 s crawling at the coast floor)
 
 
 def test_comfortable_stop_before_the_sign():

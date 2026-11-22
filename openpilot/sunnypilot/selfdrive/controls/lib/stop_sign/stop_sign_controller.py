@@ -10,8 +10,9 @@ Stop Sign Assist: a comfortable stop at map stop signs, for cars where openpilot
     ^                                                                                                         │
     └──────────────── the driver presses the gas (that sign is then done) / the sign is passed ───────────────┘
 
-* Coast: from 150 ft out (further at speed, so the braking that follows stays gentle) the target drops just
-  under the current speed: no throttle, a lift-off slowdown.
+* Coast: from 150 ft out (further at speed, so the braking that follows stays gentle) no speeding up toward the sign;
+  from the coast window (time to brake + coast_s) the target drops just under the current speed: a lift-off
+  slowdown. Slow approaches hold their speed until that window instead of decaying to a crawl (lift_off_distance).
 * Brake: a constant-deceleration profile, v = sqrt(2 * A_COMFORT * d), ending at zero speed STOP_MARGIN before the
   sign's map point (OSM puts the sign at the junction, not at the stop line). Only once the driving model also
   plans to slow for it (the confirmer below): a map sign may belong to the crossing road, and then the car should
@@ -113,6 +114,15 @@ class StopSignState(IntEnum):
 
 def coast_distance(v_ego: float, a: float = A_COMFORT, coast_s: float = COAST_TIME_S) -> float:
   return max(COAST_START_M, braking_distance(v_ego, a) + v_ego * max(coast_s, COAST_MIN_S))
+
+
+def lift_off_distance(v_ego: float, a: float = A_COMFORT, coast_s: float = COAST_TIME_S) -> float:
+  """Where the lift-off coast starts: the time-based part of coast_distance, without the 150 ft floor. Between
+  COAST_START_M and here (slow approaches only: at 25 mph this is already ~64 m) the assist holds the speed instead -
+  no speeding up toward the sign, and no early decay to COAST_FLOOR_V followed by a crawl. At 7 mph with the stop
+  confirmed 28 m out it coasted for 8 s, crawling at 5.6 mph, because the braking profile only starts ~6 m before
+  the stop point at that speed (00000116 at 1:55, 2026-11-21: the driver pressed the gas)."""
+  return braking_distance(v_ego, a) + v_ego * max(coast_s, COAST_MIN_S)
 
 
 def braking_distance(v_ego: float, a: float = A_COMFORT) -> float:
@@ -362,7 +372,8 @@ class StopSignAssist:
         # a little late (inside the comfortable braking distance, not past A_TAKE_ON_MAX): brake for it a little
         # firmer, on a profile that can actually stop in the room left
         self.a_brake = max(self.a_comfort, min(required_decel(self.distance, v_ego), self.a_limit))
-      coast_v = coast_target(v_ego)
+      # hold the speed until the time-based coast window (slow approaches start inside 150 ft), then lift off
+      coast_v = coast_target(v_ego) if self.distance <= lift_off_distance(v_ego, self.a_comfort, self.coast_s) else v_ego
       brake_v = braking_v_target(self.distance, v_ego, self.a_brake) if may_brake else coast_v
       self.state = StopSignState.braking if brake_v < coast_v else StopSignState.coasting
       self.output_v_target = min(coast_v, brake_v)
