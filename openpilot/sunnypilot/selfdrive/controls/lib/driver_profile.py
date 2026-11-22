@@ -158,7 +158,8 @@ class DriverProfile:
 
 # (min, max) a profile may set; outside, the value is clamped
 BOUNDS = {
-  "town_offset_mph": (-10.0, 0.0),     # never over the limit in town
+  "town_offset_mph": (-10.0, 3.0),     # town: at most 3 over (the driver's choice, 2026-11-21: settled cruise is +2.4 on
+                                       # 35 mph roads, +3.4 on 40; it was capped at the limit)
   "fast_offset_mph": (-10.0, 5.0),     # at most 5 over on fast roads
   "fast_zone_mph": (45.0, 65.0),
   "stop_decel": (0.7, 1.5),            # Stop Sign Assist keeps headroom under the planner's -1.2..-3.5 floor
