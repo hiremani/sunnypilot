@@ -89,6 +89,7 @@ PARAM_ALLOWLIST: dict[str, tuple[type, Callable[[int], bool] | None]] = {
   "DriveSummary": (bool, None),   # summarize each drive once the car is off (/api/drives)
   # map caution (map_caution.py): no accelerating toward a mapped traffic light; slow for crosswalks on narrow streets
   "TrafficSignalCoast": (bool, None),
+  "RedLightAssist": (bool, None),      # red_light.py: lift off and stop for a red light the car's camera reports
   "CrosswalkCaution": (bool, None),
   "WetRoadAssist": (bool, None),
   "FiskerStopTest": (int, lambda v: v in (0, 1, 2)),

@@ -315,6 +315,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     crosswalk @9;      # map caution: a marked crosswalk ahead on a narrow street
     wetRoad @10;       # wet road: at most the posted limit (+0 wet, -5 mph heavy rain)
     leadBrake @11;     # driver profile: slowing evenly toward a slower car closing fast, from the driver's lead_brake_a
+    redLight @12;      # Red Light Assist: lifting off and slowing for a red or amber light the car's camera reports
   }
 
   struct WetRoad {
@@ -520,6 +521,8 @@ struct CarStateSP @0xb86e6369214c01c8 {
   speedLimit @0 :Float32;
   wiperSpeed @1 :UInt8;              # front wipers, wipes a minute (0 = off); wet road detection
   tractionControlActive @2 :Bool;    # traction control stepping in
+  trafficLightColor @3 :UInt8;       # the car's camera, ego lane: 0 none, 1 red, 2 amber, 3 green, 4+ mixed / unknown
+  trafficLightDistance @4 :Float32;  # m to that light's signal head (not the stop line); 0 = none
 }
 
 struct LiveMapDataSP @0xf416ec09499d9d19 {

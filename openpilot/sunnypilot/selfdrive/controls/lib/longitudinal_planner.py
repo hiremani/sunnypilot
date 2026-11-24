@@ -22,6 +22,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolve
 from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import StopSignAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.cpu_budget import CpuBudget
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_bump import SpeedBumpAssist
+from openpilot.sunnypilot.selfdrive.controls.lib.red_light import RedLightAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.map_caution import MapCaution
 from openpilot.sunnypilot.selfdrive.controls.lib.wet_road import WetRoad
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T_FOLLOW
@@ -103,6 +104,12 @@ class LongitudinalPlannerSP:
     self.turn_exit_left = 0.0     # s left of the pull-away window after a junction turn
     self.narrow_speed = narrow_street.NARROW_SPEED
     self.lead_coasting = False
+    self.follow_cap = profile_long.LeadFollowCap()     # following a car: up to the limit + 10 mph
+    self.red_light = None
+    try:   # Red Light Assist: runs and logs on every drive, sets the speed only with its param (openpilot speed control)
+      self.red_light = RedLightAssist()
+    except Exception:
+      cloudlog.exception("red light assist unavailable")
     self.lead_brake = profile_long.LeadBrake(DT_MDL)   # driver profile lead_brake_a: slowing toward a slower car closing fast
     self.lead_braking = False
     self.source = LongitudinalPlanSource.cruise
@@ -148,6 +155,14 @@ class LongitudinalPlannerSP:
         self.budget_stop_shadow.run(self.stop_sign_shadow.update, sm, True, False, sm['carState'].vEgo, a_ego, now_s)
       except Exception:
         cloudlog.exception("stop sign shadow update failed")
+    if self.red_light is not None:
+      try:   # with openpilot speed control: as engaged as it is; without: as if engaged (log-only there)
+        cs_sp = sm['carStateSP']
+        on = long_enabled if self.openpilot_long else True
+        self.red_light.update(sm, on, long_override if self.openpilot_long else False, v_ego, a_ego,
+                              int(cs_sp.trafficLightColor), float(cs_sp.trafficLightDistance))
+      except Exception:
+        cloudlog.exception("red light assist update failed")
     if self.speed_bump is not None:
       try:
         self.speed_bump.update(sm, long_enabled, long_override, v_ego, a_ego, now_s)
@@ -178,7 +193,7 @@ class LongitudinalPlannerSP:
       self._log_profile_version()
       self.profile_speed_on = self.profile_on and driver_profile.is_on(param=driver_profile.SPEED_PARAM)
       self.narrow_speed = self.profile.narrow_speed_mph * CV.MPH_TO_MS
-      for ss in (self.stop_sign, self.stop_sign_shadow):
+      for ss in (self.stop_sign, self.stop_sign_shadow, self.red_light):
         if ss is not None:
           ss.set_profile(min(self.profile.stop_decel, self.wet.stop_decel()), self.profile.coast_s)
       self.scc.vision.set_lat_accel_max(self.profile.curve_lat_accel * self.wet.curve_factor())
@@ -216,6 +231,8 @@ class LongitudinalPlannerSP:
     }
     if self.stop_sign is not None:
       targets[LongitudinalPlanSource.stopSign] = (self.stop_sign.output_v_target, self.stop_sign.output_a_target)
+    if self.red_light is not None and self.red_light.controls and self.openpilot_long:
+      targets[LongitudinalPlanSource.redLight] = (self.red_light.output_v_target, self.red_light.output_a_target)
     if self.map_caution is not None and self.map_caution.crosswalk_caution:
       targets[LongitudinalPlanSource.crosswalk] = (self.map_caution.v_target, self.map_caution.a_target)
     if self.speed_bump is not None and self.speed_bump.is_active:
@@ -233,14 +250,22 @@ class LongitudinalPlannerSP:
                                              sm['controlsState'].curvature)
         targets[LongitudinalPlanSource.junctionTurn] = (v_turn, profile_long.JUNCTION_ACCEL if v_ego > v_turn else a_ego)
       limit = self.resolver.speed_limit
+      lead = sm['radarState'].leadOne
+      # following a car: the cruising speed may rise with it, to the limit + 10 mph at most (the driver's rule). It
+      # lifts the profile's cap and the set speed alike; the MPC keeps the gap
+      v_follow = self.follow_cap.update(limit if self.resolver.speed_limit_valid else 0.0, v_ego, lead.present, lead.dRel,
+                                        lead.vRel, DT_MDL)
+      if v_follow is not None and v_follow > v_cruise:
+        targets[LongitudinalPlanSource.cruise] = (v_follow, a_ego)
       if self.profile_speed_on and self.resolver.speed_limit_valid:
         v_cap = profile_long.profile_speed(limit, self.profile.speed_offset_mph(limit * CV.MS_TO_MPH))
         v_cap = self.speed_cap.update(v_cap, limit, v_ego, bool(sm['carState'].gasPressed), DT_MDL)
         if v_cap is not None:
+          if v_follow is not None:
+            v_cap = max(v_cap, v_follow)
           targets[LongitudinalPlanSource.driverSpeed] = (v_cap, -profile_long.PROFILE_COAST_DECEL if v_ego > v_cap + 0.5 else a_ego)
       else:
         self.speed_cap.update(None, 0.0, v_ego, False, DT_MDL)
-      lead = sm['radarState'].leadOne
       lb = self.lead_brake.update(self.profile.lead_brake_a, self.profile.follow_gap_s, v_ego, lead.present, lead.dRel,
                                   lead.vRel)
       self.lead_braking = lb is not None
@@ -249,6 +274,7 @@ class LongitudinalPlannerSP:
     else:
       self.lead_brake.reset()
       self.lead_braking = False
+      self.follow_cap.v = None
 
     # map turn assist armed for a signaled turn ahead (or turning): slow to the junction speed before it
     if self.openpilot_long:

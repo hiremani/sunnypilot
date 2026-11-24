@@ -88,7 +88,13 @@ LAG_S = 1.6              # lead the braking profile by the time the car takes to
                          # speed loop plus the Fisker's request smoothing (carcontroller.smooth_accel_step, ~0.6 s to
                          # build -1.0). With 1.0 s the car crossed the stop point at 3-4 mph from a 10 mph approach
                          # (00000136 at 0:30, 2026-11-22; simulated with the real smoothing: 0.0 m margin at 8-10 mph)
-STOP_MARGIN_M = 6.0      # stop this far before the sign's map point
+STOP_MARGIN_M = 6.0      # stop this far before the sign's map point (stop_sign_map.DEFAULT_MARGIN_M; a sign whose
+                         # junction has a wider cross street carries its own, StopSign.margin_m)
+MODEL_STOP_V = 0.5       # m/s: the driving model's plan has stopped where its speed is under this
+MODEL_STOP_EARLY_MAX_M = 12.0   # the model's stop point is taken when it is this much before the map's, at most
+MODEL_STOP_MAX_DECEL = 3.0      # m/s^2: a planned stop that would need more than this from the current speed isn't read
+MODEL_STOP_TAU_S = 1.0   # s: ...smoothed over this. Never later than the map's point: 4 s before the driver's own
+                         # stops the model's point was within 3 m in 94% (95 stops, 2026-11-23), when it had one (56%)
 STOP_BUFFER_M = 1.5      # ...and aim the braking profile this much shorter still: it ends at zero speed, so any lag at
                          # the end carried the car past the stop point (00000136 at 0:37: 4.6 mph 2 m before it). With
                          # the Fisker's request smoothing, simulated: 1.5-3.0 m short on three response models, never past
@@ -178,6 +184,7 @@ class StopCue:
   shortfall: float = 0.0           # fraction of the expected distance the plan's end falls short by (0 when not read)
   slowing: bool = False            # cue (a)
   short: bool = False              # cue (b)
+  stop_x: float | None = None      # m ahead where the plan comes to a stop (MODEL_STOP_V); None when it doesn't
 
   @property
   def raw(self) -> bool:
@@ -195,7 +202,10 @@ def model_stop_cue(model, v_ego: float) -> StopCue:
   if pos is not None and len(pos) > 0 and v_ego >= CONFIRM_SHORTFALL_MIN_V:
     expected = float(np.interp(v_ego * 3.6, WMACConstants.SLOW_DOWN_BP, WMACConstants.SLOW_DOWN_DIST))
     shortfall = max(0.0, 1.0 - float(pos[-1]) / expected)
-  return StopCue(v_min, shortfall, slowing, shortfall >= CONFIRM_SHORTFALL)
+  stop_x = None
+  if vel is not None and pos is not None and len(vel) == len(pos):
+    stop_x = next((float(pos[i]) for i in range(len(vel)) if vel[i] < MODEL_STOP_V), None)
+  return StopCue(v_min, shortfall, slowing, shortfall >= CONFIRM_SHORTFALL, stop_x)
 
 
 def lead_relevant(sm, model) -> bool:
@@ -224,7 +234,10 @@ class StopSignAssist:
 
     self.state = StopSignState.disabled
     self.node_id: int | None = None
-    self.distance = 0.0            # m to the stop point (sign minus margin)
+    self.distance = 0.0            # m to the stop point (sign minus margin, minus what the model's stop point adds)
+    self.map_distance = 0.0        # m to the map's stop point (sign minus margin): what GPS and dead reckoning give
+    self.margin = STOP_MARGIN_M    # this sign's margin (wider cross street: more)
+    self.stop_early = 0.0          # m the model's stop point is before the map's, smoothed (0: the map's point)
     self.confirmed = False         # the model has planned to slow for this sign (latched until the sign changes)
     self.too_late = False          # ...but only once a comfortable stop was no longer possible: never brake for it
     self.max_approach_v = MAX_APPROACH_V
@@ -261,6 +274,9 @@ class StopSignAssist:
       self.state = StopSignState.idle
     self.node_id = None
     self.distance = 0.0
+    self.map_distance = 0.0
+    self.margin = STOP_MARGIN_M
+    self.stop_early = 0.0
     self.confirmed = False
     self.too_late = False
     self.a_brake = self.a_comfort
@@ -299,11 +315,12 @@ class StopSignAssist:
       if ahead.node_id != self.node_id:
         self._reset_sign()
         self.node_id = ahead.node_id
-      return ahead.node_id, ahead.distance - STOP_MARGIN_M
+      self.margin = getattr(ahead, "margin", STOP_MARGIN_M)
+      return ahead.node_id, ahead.distance - self.margin
     # slow or no fix: keep the current sign, counting down the distance travelled, until the car is clearly past it
     if self.node_id is not None:
-      dist = self.distance - v_ego * DT_MDL
-      if dist < -(STOP_MARGIN_M + PASSED_M):
+      dist = self.map_distance - v_ego * DT_MDL
+      if dist < -(self.margin + PASSED_M):
         self._finish_sign()
         return None
       return self.node_id, dist
@@ -322,6 +339,23 @@ class StopSignAssist:
     return {"confirm_raw": self.cue.raw, "confirm_filt": round(self.confirm_filter.x, 3),
             "plan_v_min": None if self.cue.v_min is None else round(self.cue.v_min, 2),
             "plan_shortfall": round(self.cue.shortfall, 3), "lead": self.cue_lead}
+
+  def _model_stop_point(self, sm, v_ego: float) -> None:
+    """Where the driving model's plan stops, when that is before the map's stop point (up to MODEL_STOP_EARLY_MAX_M):
+    the camera's view of the junction, a wider cross street or a set-back stop line the map's point doesn't know.
+    Only ever earlier, smoothed, and not while the plan is stopping for a car in front."""
+    try:
+      model = sm['modelV2']
+      cue = model_stop_cue(model, v_ego)
+      # no stop in the plan, a stop for a lead, or one no car could make from this speed (not a plan for this car
+      # now): keep what there is
+      if cue.stop_x is None or lead_relevant(sm, model) or cue.stop_x < v_ego ** 2 / (2 * MODEL_STOP_MAX_DECEL):
+        return
+      early = self.map_distance - cue.stop_x
+      target = early if 0.0 < early <= MODEL_STOP_EARLY_MAX_M else 0.0
+      self.stop_early += (target - self.stop_early) * min(1.0, DT_MDL / MODEL_STOP_TAU_S)
+    except Exception:
+      pass   # a test's dict without modelV2: the map's point
 
   def _confirm(self, sm, v_ego: float) -> None:
     """Feed this frame to the confirmer and latch self.confirmed for the current sign once the filter agrees."""
@@ -366,7 +400,9 @@ class StopSignAssist:
       self.state = StopSignState.idle
       self.output_v_target = V_CRUISE_UNSET
       return
-    _, self.distance = located
+    _, self.map_distance = located
+    self._model_stop_point(sm, v_ego)
+    self.distance = self.map_distance - self.stop_early
 
     if not self.confirmed:
       self._confirm(sm, v_ego)

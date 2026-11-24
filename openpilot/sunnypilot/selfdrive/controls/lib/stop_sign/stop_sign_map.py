@@ -51,6 +51,7 @@ class StopSign:
   direction: str | None = None                   # the OSM direction tag (or a synonym key's value), as mapped
   all_way: bool = False                          # stop=all: every approach, unless an explicit forward/backward resolves
   approaches: tuple[float, ...] | None = None    # bearings of the traffic it holds; None: not known
+  margin_m: float | None = None                  # m before the map point where the car stops (stop_margin); None: default
 
   @property
   def needs_geometry(self) -> bool:
@@ -59,11 +60,33 @@ class StopSign:
     return is_relative(self.direction) if self.all_way else True
 
 
+DEFAULT_MARGIN_M = 6.0   # m before a sign's map point where the car stops: a two-lane residential cross street
+MARGIN_MAX_M = 16.0
+MARGIN_SETBACK_M = 2.5   # m from the cross street's edge back to the stop line
+LANE_M = 3.5
+# half the carriageway of a cross street by its class, where OSM gives no lane count (m)
+HALF_WIDTH_M = {"motorway": 10.5, "trunk": 10.0, "primary": 8.5, "secondary": 7.0, "tertiary": 4.5}
+HALF_WIDTH_DEFAULT_M = 3.5
+
+
+def stop_margin(ways) -> float | None:
+  """m before a sign's map point to stop at, from the ways meeting at its node. OSM maps a stop at the junction node,
+  so the stop line is half the cross street's width (plus a setback) before it: 6 m on a two-lane residential
+  street, as before, and further back the wider the widest street there is (the driver, 2026-11-23: on wider cross
+  streets the stop was a few metres too far on). None (the default margin) without road tiles, or when the node is
+  not a junction (one way through it: the sign is mapped on its own approach)."""
+  if not ways or len({w.way_id for w in ways}) < 2:
+    return None
+  half = max((w.lanes * LANE_M / 2.0) if w.lanes > 0 else HALF_WIDTH_M.get(w.highway, HALF_WIDTH_DEFAULT_M) for w in ways)
+  return min(max(half + MARGIN_SETBACK_M, DEFAULT_MARGIN_M), MARGIN_MAX_M)
+
+
 @dataclass(frozen=True)
 class StopAhead:
   node_id: int
   distance: float  # m along the heading
   lateral: float   # m off the heading line
+  margin: float = DEFAULT_MARGIN_M   # m before the map point where the car stops
 
 
 def stop_signs_from_cell(cell: dict) -> list[StopSign]:
@@ -110,10 +133,14 @@ def resolve_approaches(signs: list[StopSign], geometry: RoadGeometry) -> list[St
   an explicit forward/backward only). Blocking."""
   out = []
   for s in signs:
+    ways = geometry.ways_at(s.lat, s.lon)
     if s.needs_geometry:
-      approaches = approaches_from_ways(s.direction, geometry.ways_at(s.lat, s.lon), explicit_only=s.all_way)
+      approaches = approaches_from_ways(s.direction, ways, explicit_only=s.all_way)
       if approaches is not None:
         s = replace(s, approaches=approaches)
+    margin = stop_margin(ways)
+    if margin is not None:
+      s = replace(s, margin_m=margin)
     out.append(s)
   return out
 
@@ -143,7 +170,7 @@ def find_stop_ahead(lat: float, lon: float, bearing_deg: float, signs, skip_ids=
     # close in, a few metres sideways is a big angle; only check the bearing once it's meaningful
     if along > 2 * MAX_LATERAL_M and math.degrees(math.atan2(lateral, along)) > MAX_BEARING_ERR_DEG:
       continue
-    ahead = StopAhead(s.node_id, along, lateral)
+    ahead = StopAhead(s.node_id, along, lateral, s.margin_m if s.margin_m is not None else DEFAULT_MARGIN_M)
     if s.node_id == prefer_id:
       preferred = ahead
     if best is None or along < best.distance:
@@ -184,7 +211,7 @@ class StopSignMap(CellMap):
       with open(path) as f:
         cell = json.load(f)
     signs = stop_signs_from_cell(cell) + self._local_in_cell(key)
-    if any(s.needs_geometry for s in signs):
+    if signs:   # every sign: the stop margin comes from the ways at its node, the approaches where they are needed
       try:
         signs = resolve_approaches(signs, self.geometry)
       except Exception:

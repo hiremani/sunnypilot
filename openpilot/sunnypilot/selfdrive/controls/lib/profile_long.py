@@ -42,7 +42,15 @@ LEAD_COAST_ACCEL = 0.0      # m/s^2 cap while coasting
 LEAD_BRAKE_MIN_CLOSING = 4.0    # m/s: slower than this, closing is left to the MPC (the driver and openpilot start alike);
                                 # also the closing speed lead_brake_a is measured from (driver_profile_gen)
 LEAD_BRAKE_MIN_ROOM_M = 10.0    # m outside the following gap still left when it starts: inside, it is following (MPC)
-LEAD_BRAKE_START_MAX = 1.2      # m/s^2: needing more than this already is not an early, gentle slowdown (MPC)
+LEAD_BRAKE_START_MAX = 2.0      # m/s^2: needing more than this already is no slowdown to shape (the MPC's). Was 1.2: a
+                                # stopped car first seen by vision at 80 m and 32 mph can already need 1.2-1.4
+                                # (00000129 at 3:55: the MPC alone asked 1.0 for 2 s and 2.2 at the end)
+LEAD_BRAKE_FILTER_S = 0.5       # s: the lead's distance and speed are smoothed over this before the need is worked out.
+                                # This car's leads are vision only: the same stopped car read 76, 64, 73, 63, 65 m and
+                                # 17.6 then 8.2 mph within a second
+LEAD_BRAKE_NEW_LEAD_M = 12.0    # m: a jump this large in one frame is another car: the smoothing starts again from it
+LEAD_BRAKE_MARGIN = 1.1         # slow this much more than the even need: the need then falls as the car closes, so the
+                                # slowdown ends gentler than it began, as the driver's does
 LEAD_BRAKE_ON_S = 0.5           # s the start condition must hold (radar flicker)
 LEAD_BRAKE_HOLD_CLOSING = 1.5   # m/s: once slowing, keep going until the closing speed is down to this
 LEAD_BRAKE_MAX_D = 150.0        # m
@@ -103,6 +111,42 @@ class ProfileSpeedCap:
     else:
       self.v = max(want, min(self.v, v_ego + 0.5) - PROFILE_COAST_DECEL * dt)
     return self.v
+
+FOLLOW_OVER_MPH = 10.0      # following a car, the speed may go this far over the posted limit and no further
+FOLLOW_MAX_GAP_S = 4.0      # a car further ahead than this (or FOLLOW_MAX_D) isn't being followed
+FOLLOW_MAX_D = 80.0         # m
+FOLLOW_MIN_D = 50.0         # m: ...but a car this close is, whatever the time gap (low speeds)
+FOLLOW_LEAD_MARGIN = 0.5    # m/s over the lead's own speed the cap sits (the MPC keeps the gap, not this cap)
+
+
+class LeadFollowCap:
+  """The driver's rule (2026-11-23): follow the car in front, up to FOLLOW_OVER_MPH over the posted limit; faster than
+  that, let it go. While a car is being followed the cruising speed may rise to the lead's speed, at most the limit +
+  FOLLOW_OVER_MPH: the profile's own cap (limit + the driver's offset) and the set speed held the car back from a
+  lead doing a few mph more. The MPC still keeps the following gap. Needs a posted limit; without one, nothing.
+
+  Rises with the lead at once, comes down at most PROFILE_COAST_DECEL when the lead slows, goes or the limit changes
+  (a lift-off, never a brake: the cap above the set speed is only ever an allowance)."""
+
+  def __init__(self):
+    self.v: float | None = None
+
+  def update(self, limit_ms: float, v_ego: float, lead_present: bool, d_rel: float, v_rel: float, dt: float) -> float | None:
+    """The speed (m/s) the car may cruise at while following, or None."""
+    want = None
+    if limit_ms > 0.0 and lead_present and d_rel > 0.0:
+      following = d_rel <= min(max(FOLLOW_MIN_D, FOLLOW_MAX_GAP_S * v_ego), FOLLOW_MAX_D)
+      if following:
+        want = min(max(v_ego + v_rel, 0.0) + FOLLOW_LEAD_MARGIN, limit_ms + FOLLOW_OVER_MPH * CV.MPH_TO_MS)
+    if want is not None and (self.v is None or want >= self.v):
+      self.v = want
+    elif self.v is not None:
+      floor = want if want is not None else 0.0
+      self.v = max(floor, min(self.v, v_ego + 0.5) - PROFILE_COAST_DECEL * dt)
+      if want is None and self.v <= v_ego - 2.0:    # well under the car's speed: nothing left to allow
+        self.v = None
+    return self.v
+
 
 # A gentle pull-away with openpilot speed control, whatever the profile: the most acceleration openpilot asks for, by
 # speed. Route 00000103 (2026-11-16): after every turn and stop openpilot asked for its +1.0 m/s^2 maximum (the stock
@@ -178,10 +222,24 @@ class LeadBrake:
     self.dt = dt
     self.active = False
     self.pending_s = 0.0
+    self.d_f: float | None = None   # the lead's smoothed distance and relative speed
+    self.v_f = 0.0
 
   def reset(self) -> None:
     self.active = False
     self.pending_s = 0.0
+    self.d_f = None
+
+  def _smooth(self, d_rel: float, v_rel: float) -> tuple[float, float]:
+    if self.d_f is None or abs(d_rel - self.d_f) > LEAD_BRAKE_NEW_LEAD_M:
+      self.d_f, self.v_f = d_rel, v_rel
+    else:
+      k = min(1.0, self.dt / LEAD_BRAKE_FILTER_S)
+      # the distance closes at the relative speed between frames: smooth what is left after that, not the closing
+      self.d_f += self.v_f * self.dt
+      self.d_f += (d_rel - self.d_f) * k
+      self.v_f += (v_rel - self.v_f) * k
+    return self.d_f, self.v_f
 
   def update(self, lead_brake_a: float, follow_gap_s: float, v_ego: float, lead_present: bool, d_rel: float,
              v_rel: float) -> tuple[float, float] | None:
@@ -189,6 +247,7 @@ class LeadBrake:
     if lead_brake_a < 0.1 or not lead_present or v_ego < 1.0 or not (0.0 < d_rel < LEAD_BRAKE_MAX_D):
       self.reset()
       return None
+    d_rel, v_rel = self._smooth(d_rel, v_rel)
     closing = -v_rel
     v_lead = max(v_ego + v_rel, 0.0)
     room = d_rel - (STOP_DISTANCE + follow_gap_s * v_lead) - closing * LEAD_BRAKE_LAG_S
@@ -198,12 +257,13 @@ class LeadBrake:
     else:
       starting = (closing >= LEAD_BRAKE_MIN_CLOSING and room >= LEAD_BRAKE_MIN_ROOM_M
                   and lead_brake_a <= need <= LEAD_BRAKE_START_MAX)
-      self.pending_s = self.pending_s + self.dt if starting else 0.0
+      # a frame outside the window takes time off instead of starting over (one odd reading isn't the end of it)
+      self.pending_s = self.pending_s + self.dt if starting else max(0.0, self.pending_s - self.dt)
       self.active = self.pending_s >= LEAD_BRAKE_ON_S - 1e-6
     if not self.active:
       return None
     self.pending_s = 0.0
-    a = min(need, LEAD_BRAKE_A_MAX)
+    a = min(need * LEAD_BRAKE_MARGIN, LEAD_BRAKE_A_MAX)
     v_target = v_lead + math.sqrt(2.0 * a * max(room, 0.0))
     return min(v_target, v_ego), -a
 

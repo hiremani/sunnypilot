@@ -53,6 +53,7 @@ class WayAtNode:
   backward_bearing: float | None   # deg, travel arriving against node order (i+1 -> i); None at the last node
   start_m: float | None = None     # m along the way from its first node to this one
   end_m: float | None = None       # m along the way from this node to its last one
+  lanes: int = 0                   # OSM lanes (both directions on a two-way road); 0 = not tagged
 
 
 def bearing_deg(lat0: float, lon0: float, lat1: float, lon1: float) -> float:
@@ -109,7 +110,7 @@ class RoadTile:
       bwd = bearing_deg(*pts[hit + 1], *pts[hit]) if hit < n - 1 else None
       cls = HIGHWAY_CLASSES[w.highway] if w.highway < len(HIGHWAY_CLASSES) else "unknown"
       seg = [distance_m(*pts[i], *pts[i + 1]) for i in range(n - 1)]
-      out.append(WayAtNode(int(w.id), cls, hit, n, fwd, bwd, sum(seg[:hit]), sum(seg[hit:])))
+      out.append(WayAtNode(int(w.id), cls, hit, n, fwd, bwd, sum(seg[:hit]), sum(seg[hit:]), int(getattr(w, "lanes", 0))))
     return out
 
 

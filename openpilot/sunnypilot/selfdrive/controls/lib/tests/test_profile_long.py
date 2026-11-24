@@ -126,10 +126,12 @@ class TestLeadBrake(unittest.TestCase):
   DT = 0.05
 
   def _run(self, a, v, d, vr, n=20, lb=None):
+    """n frames arriving at (v, d, vr): the distance closes at vr from frame to frame, as a real lead's does (the
+    lead's readings are smoothed along that)."""
     lb = lb or pl.LeadBrake(self.DT)
     out = None
-    for _ in range(n):
-      out = lb.update(a, self.GAP, v, True, d, vr)
+    for i in range(n):
+      out = lb.update(a, self.GAP, v, True, d - vr * self.DT * (n - 1 - i), vr)
     return out, lb
 
   def test_need(self):
@@ -156,8 +158,9 @@ class TestLeadBrake(unittest.TestCase):
   def test_needs_to_hold_half_a_second(self):
     v, d, vr = 14.0, 70.0, -10.0
     lb = pl.LeadBrake(self.DT)
-    for _ in range(round(pl.LEAD_BRAKE_ON_S / self.DT) - 1):
-      self.assertIsNone(lb.update(0.59, self.GAP, v, True, d, vr))                 # radar flicker: nothing
+    n = round(pl.LEAD_BRAKE_ON_S / self.DT)
+    for i in range(n - 1):
+      self.assertIsNone(lb.update(0.59, self.GAP, v, True, d - vr * self.DT * (n - 1 - i), vr))   # flicker: nothing
     self.assertIsNotNone(lb.update(0.59, self.GAP, v, True, d, vr))
 
   def test_following_inside_the_gap_is_left_to_the_mpc(self):
@@ -166,6 +169,39 @@ class TestLeadBrake(unittest.TestCase):
     self.assertIsNone(out)
     out, _ = self._run(0.59, 32 * CV.MPH_TO_MS, 22.0, -10.0)                       # already needs > START_MAX: MPC's
     self.assertIsNone(out)
+
+  def test_route_00000129_as_recorded_starts_within_two_seconds(self):
+    # The stop as recorded (2026-11-20, 3:42-3:54; data/lead_00000129_stopped_car.json: s before the stop, v_ego,
+    # lead dRel, vRel at 20 Hz), the day before LeadBrake existed. The comma has no radar on this car: the vision lead
+    # slid from the car being followed to one stopped at a red light, its distance reading 76, 64, 73, 63, 65 m in
+    # turn, then dropping 58 -> 28 m in 2 s. The MPC alone asked -1.0 for 2 s, then -2.2, the driver on the brake
+    # 5 mph from the car. Fed those frames, the slowdown has to start within about 2 s of the car reading as closing.
+    import json
+    import os
+    with open(os.path.join(os.path.dirname(__file__), "data", "lead_00000129_stopped_car.json")) as f:
+      rows = json.load(f)
+    lb = pl.LeadBrake(self.DT)
+    started = None
+    for t, v, d, vr, present in rows:
+      out = lb.update(0.59, 1.45, v, bool(present), d, vr)
+      if out is not None and started is None:
+        started = t
+    self.assertIsNotNone(started, "never started slowing")
+    self.assertLess(started, -9.0)            # the stopped car reads as closing from about -11 s
+
+  def test_a_new_lead_starts_the_smoothing_again(self):
+    lb = pl.LeadBrake(self.DT)
+    for _ in range(40):
+      lb.update(0.59, self.GAP, 14.0, True, 23.0, 0.0)                              # following at 23 m
+    lb.update(0.59, self.GAP, 14.0, True, 70.0, -10.0)                              # another car: stopped, 70 m on
+    self.assertAlmostEqual(lb.d_f, 70.0)
+    self.assertAlmostEqual(lb.v_f, -10.0)
+
+  def test_slows_a_little_more_than_the_even_need(self):
+    tgt, _ = self._run(0.59, 14.0, 90.0, -10.0)
+    need = pl.lead_brake_need(self.GAP, 14.0, 90.0, -10.0, pl.LEAD_BRAKE_LAG_S)
+    self.assertAlmostEqual(-tgt[1], need * pl.LEAD_BRAKE_MARGIN, places=2)
+    self.assertLess(need * pl.LEAD_BRAKE_MARGIN, pl.LEAD_BRAKE_A_MAX)
 
   def test_gentle_closing_no_lead_or_far(self):
     self.assertIsNone(self._run(0.59, 12.0, 40.0, -3.0)[0])                        # < 4 m/s closing
@@ -177,11 +213,12 @@ class TestLeadBrake(unittest.TestCase):
   def test_holds_once_slowing_and_releases_when_closed_up(self):
     on, lb = self._run(0.59, 14.0, 70.0, -10.0)
     self.assertIsNotNone(on)
-    # closing down to 2 m/s: a fresh start would not, but it keeps slowing
-    self.assertIsNotNone(lb.update(0.59, self.GAP, 8.0, True, 16.0, -2.0))
-    self.assertIsNone(pl.LeadBrake(self.DT).update(0.59, self.GAP, 8.0, True, 16.0, -2.0))
+    # closing down to 2.5 m/s: a fresh start would not, but it keeps slowing
+    self.assertIsNotNone(lb.update(0.59, self.GAP, 8.0, True, 27.0, -2.5))
+    self.assertIsNone(self._run(0.59, 8.0, 27.0, -2.5, n=30)[0])
     # closed up (closing < 1.5 m/s): the MPC follows
-    self.assertIsNone(lb.update(0.59, self.GAP, 7.0, True, 18.0, -1.0))
+    off, lb = self._run(0.59, 7.0, 18.0, -1.0, n=40, lb=lb)
+    self.assertIsNone(off)
     self.assertFalse(lb.active)
 
   def test_never_asks_more_than_the_cap_and_never_speeds_up(self):
@@ -191,3 +228,53 @@ class TestLeadBrake(unittest.TestCase):
         if tgt is not None:
           self.assertLessEqual(tgt[0], 16.0)
           self.assertGreaterEqual(tgt[1], -pl.LEAD_BRAKE_A_MAX)
+
+
+class TestLeadFollowCap(unittest.TestCase):
+  """The driver's rule: follow the car in front, up to 10 mph over the posted limit; faster than that, let it go."""
+  DT = 0.05
+  LIMIT = 35 * CV.MPH_TO_MS
+
+  def _settle(self, cap, v_ego, d, v_lead, n=40, limit=None, present=True):
+    out = None
+    for _ in range(n):
+      out = cap.update(self.LIMIT if limit is None else limit, v_ego, present, d, v_lead - v_ego, self.DT)
+    return out
+
+  def test_follows_a_car_a_few_mph_over_the_limit(self):
+    cap = pl.LeadFollowCap()
+    v = self._settle(cap, 36 * CV.MPH_TO_MS, 25.0, 41 * CV.MPH_TO_MS)
+    self.assertAlmostEqual(v, 41 * CV.MPH_TO_MS + pl.FOLLOW_LEAD_MARGIN, places=3)   # may rise to the lead's speed
+
+  def test_lets_a_car_more_than_ten_over_go(self):
+    cap = pl.LeadFollowCap()
+    v = self._settle(cap, 44 * CV.MPH_TO_MS, 30.0, 52 * CV.MPH_TO_MS)
+    self.assertAlmostEqual(v, 45 * CV.MPH_TO_MS, places=3)                           # limit + 10, no further
+
+  def test_nothing_without_a_limit_a_lead_or_with_a_far_one(self):
+    self.assertIsNone(self._settle(pl.LeadFollowCap(), 16.0, 25.0, 18.0, limit=0.0))
+    self.assertIsNone(self._settle(pl.LeadFollowCap(), 16.0, 25.0, 18.0, present=False))
+    self.assertIsNone(self._settle(pl.LeadFollowCap(), 16.0, 120.0, 18.0))             # 7.5 s ahead: not being followed
+    self.assertIsNotNone(self._settle(pl.LeadFollowCap(), 3.0, 30.0, 6.0))             # slow, 30 m: followed
+
+  def test_comes_down_gently_when_the_lead_goes(self):
+    cap = pl.LeadFollowCap()
+    v_ego = 40 * CV.MPH_TO_MS
+    top = self._settle(cap, v_ego, 25.0, 41 * CV.MPH_TO_MS)
+    one = cap.update(self.LIMIT, v_ego, False, 0.0, 0.0, self.DT)
+    self.assertIsNotNone(one)                                                        # no step back to the cap
+    self.assertLess(top - one, 0.6)
+    prev = one
+    for _ in range(400):
+      v_ego = max(v_ego - pl.PROFILE_COAST_DECEL * self.DT, 30 * CV.MPH_TO_MS)
+      cur = cap.update(self.LIMIT, v_ego, False, 0.0, 0.0, self.DT)
+      if cur is None:
+        break
+      self.assertLessEqual(prev - cur, 0.6)                                          # eased, never dropped
+      prev = cur
+
+  def test_a_slower_lead_lowers_it_gently_too(self):
+    cap = pl.LeadFollowCap()
+    self._settle(cap, 40 * CV.MPH_TO_MS, 25.0, 42 * CV.MPH_TO_MS)
+    a = cap.update(self.LIMIT, 40 * CV.MPH_TO_MS, True, 25.0, -3.0, self.DT)       # the lead now 3 m/s slower
+    self.assertGreater(a, 40 * CV.MPH_TO_MS - 3.0)                                  # the MPC brakes for it, not this cap

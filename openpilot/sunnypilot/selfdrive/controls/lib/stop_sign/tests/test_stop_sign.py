@@ -988,7 +988,9 @@ def _fisker_approach(v0, stop_d, confirm_d, k=1.0, delay=0.35, tau=0.3):
   for n in range(40000):
     if n % 5 == 0:
       lat, lon = north_of(LAT0, LON0, pos)
-      ctrl.update(sm_at(gps(lat, lon, speed=v), model(stop=sign_m - pos < confirm_d + STOP_MARGIN_M)), True, False, v, a, NOW)
+      # once it confirms, the model's plan stops at the stop point (as the real one does, within a few metres)
+      m = stopping_plan(max(v, 1.0), max(stop_d - pos, 0.5)) if sign_m - pos < confirm_d + STOP_MARGIN_M else model()
+      ctrl.update(sm_at(gps(lat, lon, speed=v), m), True, False, v, a, NOW)
       tgt = ctrl.output_v_target
       cmd = 0.0 if tgt == V_CRUISE_UNSET else max(min(k * (tgt - v), 1.0), -1.2)
     sent, step, filt = smooth_accel_step(soft_stop_accel(cmd, v, v == 0.0), sent, step, filt)
@@ -1031,3 +1033,51 @@ def test_the_stop_ends_softly():
   assert abs(braking_v_target(d_soft + STOP_BUFFER_M, 0.0) - SOFT_V) < 1e-6
   assert braking_v_target(d_soft + 10.0 + STOP_BUFFER_M, 0.0) > SOFT_V
   assert braking_distance(SOFT_V) < braking_distance(SOFT_V + 1.0)
+
+
+def stopping_plan(v0, stop_in_m):
+  """A model plan from v0 that comes to a stop stop_in_m ahead at a steady rate."""
+  return plan(v0, decel=v0 * v0 / (2 * stop_in_m))
+
+
+def test_wider_cross_street_moves_the_stop_back():
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_map import stop_margin, DEFAULT_MARGIN_M, MARGIN_MAX_M
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.road_geometry import WayAtNode
+  def way(i, cls, lanes=0):
+    return WayAtNode(i, cls, 1, 3, 0.0, 180.0, 10.0, 10.0, lanes)
+  assert stop_margin(None) is None and stop_margin([]) is None
+  assert stop_margin([way(1, "residential")]) is None                                   # not a junction node: the default
+  assert stop_margin([way(1, "residential"), way(2, "residential")]) == DEFAULT_MARGIN_M   # as before
+  assert stop_margin([way(1, "residential"), way(2, "secondary")]) == 9.5               # four lanes across: 3.5 m further back
+  assert stop_margin([way(1, "residential"), way(2, "tertiary", lanes=6)]) == 13.0      # OSM's lane count wins
+  assert stop_margin([way(1, "residential"), way(2, "primary", lanes=12)]) == MARGIN_MAX_M
+
+
+def test_a_signs_own_margin_sets_the_stop_point():
+  wide = StopSign(1, *north_of(LAT0, LON0, 100.0), margin_m=9.5)
+  ctrl = make([wide])
+  ctrl.update(sm_at(gps(LAT0, LON0, speed=8.0), model()), True, False, 8.0, 0.0, NOW)
+  assert abs(ctrl.distance - (100.0 - 9.5)) < 0.5 and ctrl.margin == 9.5
+  ctrl = make([StopSign(1, *north_of(LAT0, LON0, 100.0))])
+  ctrl.update(sm_at(gps(LAT0, LON0, speed=8.0), model()), True, False, 8.0, 0.0, NOW)
+  assert abs(ctrl.distance - (100.0 - STOP_MARGIN_M)) < 0.5
+
+
+def test_the_models_stop_point_moves_the_stop_earlier_never_later():
+  from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller import MODEL_STOP_EARLY_MAX_M
+  def settle(model_stop_in, lead=None, v=8.0, map_d=40.0):
+    ctrl = make([])
+    ctrl.map_distance = map_d
+    for _ in range(100):   # 5 s of the same frame: the smoothing settles
+      ctrl._model_stop_point(sm_at(gps(LAT0, LON0, speed=v), stopping_plan(v, model_stop_in), lead=lead), v)
+    return map_d - ctrl.stop_early
+  assert abs(settle(40.0) - 40.0) < 0.3            # the model agrees with the map
+  assert abs(settle(35.0) - 35.0) < 0.3            # the model stops 5 m before the map's point: there
+  assert abs(settle(38.0, map_d=34.0) - 34.0) < 0.3   # later than the map: the map's point
+  assert abs(settle(40.0 - MODEL_STOP_EARLY_MAX_M - 3.0) - 40.0) < 0.3   # far before it: something else, not this sign
+  assert abs(settle(35.0, lead=lead_at(30.0)) - 40.0) < 0.3              # stopping for a car in front: not about the sign
+  assert abs(settle(2.0, v=8.0, map_d=10.0) - 10.0) < 0.3                # a stop no car could make from 18 mph: not read
+  ctrl = make([])
+  ctrl.map_distance = 40.0
+  ctrl._model_stop_point(sm_at(gps(LAT0, LON0), model()), 8.0)           # a steady plan: nothing
+  assert ctrl.stop_early == 0.0

@@ -321,6 +321,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"SpeedBumpAlert", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"DriveSummary", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"TrafficSignalCoast", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"RedLightAssist", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"CrosswalkCaution", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"WetRoadAssist", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"WetRoadForce", {PERSISTENT | BACKUP, BOOL, "0"}},
