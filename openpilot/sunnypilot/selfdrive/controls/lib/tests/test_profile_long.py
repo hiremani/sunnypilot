@@ -267,6 +267,11 @@ class TestLeadTakeOff(unittest.TestCase):
       t.update(0.0, True, 8.0, 2.0, 0.5, 1.0, self.DT)
     self.assertAlmostEqual(t.update(0.0, True, 8.0, 2.0, 0.5, 1.0, self.DT), 1.0)
     self.assertAlmostEqual(t.update(1.0, True, 9.0, 2.0, 0.5, 1.0, self.DT), 0.6)
+    # the following gap: 1.45 s of this car's speed over the standing gap, or it asks nothing; it builds over 2 m
+    self.assertIsNone(t.update(2.0, True, 6.0, 4.0, 0.5, 1.0, self.DT))              # 6.0 m < 3.5 + 2.9
+    self.assertAlmostEqual(t.update(2.0, True, 7.4, 4.0, 0.5, 1.0, self.DT), 0.5)   # 1 m of room: half the pull
+    self.assertAlmostEqual(t.update(2.0, True, 9.0, 4.0, 0.5, 1.0, self.DT), 1.0)
+    self.assertIsNone(t.update(1.0, True, 9.0, 4.0, 0.5, 1.0, self.DT, gap_s=2.0, stop_gap_m=8.0))   # a longer gap asked
     self.assertIsNone(t.update(1.9, True, 9.5, 2.0, 0.5, 1.0, self.DT))      # as fast as the lead: the gap no longer opens
     self.assertIsNone(t.update(2.6, True, 12.0, 6.0, 0.5, 1.0, self.DT))     # rolling: the MPC's from here
     self.assertAlmostEqual(t.update(0.0, True, 8.0, 3.0, 0.5, 0.7, self.DT), 0.7)   # the driver's own launch

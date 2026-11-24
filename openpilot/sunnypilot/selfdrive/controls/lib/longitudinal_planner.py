@@ -26,7 +26,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.red_light import RedLightAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.red_light import STOP_COLORS as RED_LIGHT_STOP_COLORS
 from openpilot.sunnypilot.selfdrive.controls.lib.map_caution import MapCaution
 from openpilot.sunnypilot.selfdrive.controls.lib.wet_road import WetRoad
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T_FOLLOW
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE, get_T_FOLLOW
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile, narrow_street, profile_long
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
@@ -354,7 +354,9 @@ class LongitudinalPlannerSP:
       lead = sm['radarState'].leadOne
       was = self.take_off_lead.active
       a = self.take_off_lead.update(v_ego, lead.present, lead.dRel, lead.vLead, lead.aLeadK,
-                                    self.profile.launch_accel if self.profile_on else 1.0, DT_MDL)
+                                    self.profile.launch_accel if self.profile_on else 1.0, DT_MDL,
+                                    self.t_follow(v_ego) or get_T_FOLLOW(self.personality),
+                                    self.stop_distance() or STOP_DISTANCE)
       held = (self.stop_sign is not None and self.stop_sign.is_active) or (self.red_light is not None and self.red_light.controls)
       red = int(sm['carStateSP'].trafficLightColor) in RED_LIGHT_STOP_COLORS
       if a is None or not self.openpilot_long or held or red or sm['carState'].brakePressed:

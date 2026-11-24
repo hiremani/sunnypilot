@@ -126,6 +126,9 @@ TAKEOFF_LEAD_A_MIN = -0.3   # m/s^2: not while the lead is braking again (a queu
 TAKEOFF_MIN_D = 3.5         # m: never from closer than this
 TAKEOFF_GAIN = 0.6          # 1/s: the pull per m/s the lead is faster
 TAKEOFF_MIN_ACCEL = 0.15    # m/s^2: below this there is nothing to ask for
+TAKEOFF_GAP_EASE_M = 2.0    # m of room over the following gap across which the pull builds
+TAKEOFF_STOP_GAP_TOL_M = 1.0
+TAKEOFF_GAP_S = 1.45        # s: the following gap kept while moving off when the caller gives none
 
 
 class LeadTakeOff:
@@ -137,19 +140,25 @@ class LeadTakeOff:
   The driver moves off as the car in front does. So from the lead rolling for TAKEOFF_ON_S: TAKEOFF_GAIN per m/s it
   is faster than this car, up to the driver's own launch, until this car does TAKEOFF_V_EGO_MAX. It asks nothing as
   soon as the lead is no faster (the gap is then not growing) or brakes, so the MPC's braking is never overruled:
-  this only ever raises a request while the gap is opening."""
+  this only ever raises a request while the gap is opening.
+
+  The gap (the driver's rule: a reaction-time gap, growing with speed): it asks only with the lead at least the
+  standing gap plus gap_s of this car's speed away, so moving off never brings the car inside its following gap; the
+  pull also eases off over the last TAKEOFF_GAP_EASE_M of room above that."""
 
   def __init__(self):
     self.rolling_t = 0.0
     self.active = False
 
   def update(self, v_ego: float, lead_present: bool, d_rel: float, v_lead: float, a_lead: float, launch_accel: float,
-             dt: float) -> float | None:
+             dt: float, gap_s: float = TAKEOFF_GAP_S, stop_gap_m: float = TAKEOFF_MIN_D) -> float | None:
     rolling = lead_present and d_rel >= TAKEOFF_MIN_D and v_lead >= TAKEOFF_LEAD_V and a_lead >= TAKEOFF_LEAD_A_MIN
     self.rolling_t = self.rolling_t + dt if rolling else 0.0
     a = None
-    if self.rolling_t >= TAKEOFF_ON_S and v_ego < TAKEOFF_V_EGO_MAX:
-      a = min(TAKEOFF_GAIN * (v_lead - v_ego), launch_accel)
+    # m beyond the following gap at this speed (standing: a car stopped a little inside its stop gap still moves off)
+    room = d_rel - (max(stop_gap_m - TAKEOFF_STOP_GAP_TOL_M, TAKEOFF_MIN_D) + gap_s * v_ego)
+    if self.rolling_t >= TAKEOFF_ON_S and v_ego < TAKEOFF_V_EGO_MAX and room > 0.0:
+      a = min(TAKEOFF_GAIN * (v_lead - v_ego), launch_accel) * min(1.0, room / TAKEOFF_GAP_EASE_M)
       a = a if a >= TAKEOFF_MIN_ACCEL else None
     self.active = a is not None
     return a
