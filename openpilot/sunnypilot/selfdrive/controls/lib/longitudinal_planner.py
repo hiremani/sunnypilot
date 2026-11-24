@@ -23,6 +23,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.stop_sign.stop_sign_controller 
 from openpilot.sunnypilot.selfdrive.controls.lib.cpu_budget import CpuBudget
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_bump import SpeedBumpAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.red_light import RedLightAssist
+from openpilot.sunnypilot.selfdrive.controls.lib.red_light import STOP_COLORS as RED_LIGHT_STOP_COLORS
 from openpilot.sunnypilot.selfdrive.controls.lib.map_caution import MapCaution
 from openpilot.sunnypilot.selfdrive.controls.lib.wet_road import WetRoad
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T_FOLLOW
@@ -105,6 +106,7 @@ class LongitudinalPlannerSP:
     self.narrow_speed = narrow_street.NARROW_SPEED
     self.lead_coasting = False
     self.follow_cap = profile_long.LeadFollowCap()     # following a car: up to the limit + 10 mph
+    self.take_off_lead = profile_long.LeadTakeOff()    # moving off as the car in front does
     self.red_light = None
     try:   # Red Light Assist: runs and logs on every drive, sets the speed only with its param (openpilot speed control)
       self.red_light = RedLightAssist()
@@ -341,6 +343,29 @@ class LongitudinalPlannerSP:
     merge = self.resolver.speed_limit_valid and profile_long.merging(self.resolver.speed_limit, v_ego)
     return min(cap, self.wet.accel_max(), profile_long.comfort_accel_cap(v_ego, self.profile if self.profile_on else None,
                                                                           merge))
+
+  def take_off(self, sm: messaging.SubMaster, v_ego: float) -> float | None:
+    """Moving off behind a car that moves off (profile_long.LeadTakeOff): the least acceleration to ask for, or None.
+    It goes over the MPC's and the driving model's own request (experimental mode asked +0.03..0.23 for 4 s on
+    00000129 with the lead driving off), by the driver's rule: follow the car in front, except at a light that is
+    not green. So not on a red or amber light (the car's own recognition), not while Stop Sign Assist or Red Light
+    Assist holds the car, not with the driver on the brake, and only with openpilot speed control."""
+    try:
+      lead = sm['radarState'].leadOne
+      was = self.take_off_lead.active
+      a = self.take_off_lead.update(v_ego, lead.present, lead.dRel, lead.vLead, lead.aLeadK,
+                                    self.profile.launch_accel if self.profile_on else 1.0, DT_MDL)
+      held = (self.stop_sign is not None and self.stop_sign.is_active) or (self.red_light is not None and self.red_light.controls)
+      red = int(sm['carStateSP'].trafficLightColor) in RED_LIGHT_STOP_COLORS
+      if a is None or not self.openpilot_long or held or red or sm['carState'].brakePressed:
+        self.take_off_lead.active = False
+        return None
+      if not was:
+        cloudlog.event("take_off", v=round(v_ego, 2), lead_d=round(lead.dRel, 1), lead_v=round(lead.vLead, 2), a=round(a, 2))
+      return a
+    except Exception:
+      self.take_off_lead.active = False
+      return None
 
   def lead_coast_cap(self, sm: messaging.SubMaster, v_ego: float) -> float:
     """The most acceleration the driver profile allows: none toward a slower lead inside the coasting gap, and the

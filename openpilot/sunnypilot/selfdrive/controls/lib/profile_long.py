@@ -119,6 +119,42 @@ FOLLOW_MIN_D = 50.0         # m: ...but a car this close is, whatever the time g
 FOLLOW_LEAD_MARGIN = 0.5    # m/s over the lead's own speed the cap sits (the MPC keeps the gap, not this cap)
 
 
+TAKEOFF_V_EGO_MAX = 2.5     # m/s: moving off ends here, the MPC follows from then on
+TAKEOFF_LEAD_V = 0.25       # m/s: the lead is rolling (a standing lead reads within 0.02 of zero)
+TAKEOFF_ON_S = 0.3          # s of that before it counts
+TAKEOFF_LEAD_A_MIN = -0.3   # m/s^2: not while the lead is braking again (a queue creeping up)
+TAKEOFF_MIN_D = 3.5         # m: never from closer than this
+TAKEOFF_GAIN = 0.6          # 1/s: the pull per m/s the lead is faster
+TAKEOFF_MIN_ACCEL = 0.15    # m/s^2: below this there is nothing to ask for
+
+
+class LeadTakeOff:
+  """Moving off behind a car that moves off: the least acceleration to ask for, or None.
+
+  Standing behind a car the MPC only speeds up once the gap has grown past the following gap, and then by tenths:
+  00000129 at 2:36, the light green, the lead rolling at 154.6 s, the plan off its stop at 156.1 asking +0.10, +0.27
+  by 158.7 with the lead 12 m off at 7 mph, the driver on the gas at 159.2 (which drops the car's cruise control).
+  The driver moves off as the car in front does. So from the lead rolling for TAKEOFF_ON_S: TAKEOFF_GAIN per m/s it
+  is faster than this car, up to the driver's own launch, until this car does TAKEOFF_V_EGO_MAX. It asks nothing as
+  soon as the lead is no faster (the gap is then not growing) or brakes, so the MPC's braking is never overruled:
+  this only ever raises a request while the gap is opening."""
+
+  def __init__(self):
+    self.rolling_t = 0.0
+    self.active = False
+
+  def update(self, v_ego: float, lead_present: bool, d_rel: float, v_lead: float, a_lead: float, launch_accel: float,
+             dt: float) -> float | None:
+    rolling = lead_present and d_rel >= TAKEOFF_MIN_D and v_lead >= TAKEOFF_LEAD_V and a_lead >= TAKEOFF_LEAD_A_MIN
+    self.rolling_t = self.rolling_t + dt if rolling else 0.0
+    a = None
+    if self.rolling_t >= TAKEOFF_ON_S and v_ego < TAKEOFF_V_EGO_MAX:
+      a = min(TAKEOFF_GAIN * (v_lead - v_ego), launch_accel)
+      a = a if a >= TAKEOFF_MIN_ACCEL else None
+    self.active = a is not None
+    return a
+
+
 class LeadFollowCap:
   """The driver's rule (2026-11-23): follow the car in front, up to FOLLOW_OVER_MPH over the posted limit; faster than
   that, let it go. While a car is being followed the cruising speed may rise to the lead's speed, at most the limit +
