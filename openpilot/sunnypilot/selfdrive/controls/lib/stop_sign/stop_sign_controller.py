@@ -92,6 +92,10 @@ STOP_MARGIN_M = 6.0      # stop this far before the sign's map point
 STOP_BUFFER_M = 1.5      # ...and aim the braking profile this much shorter still: it ends at zero speed, so any lag at
                          # the end carried the car past the stop point (00000136 at 0:37: 4.6 mph 2 m before it). With
                          # the Fisker's request smoothing, simulated: 1.5-3.0 m short on three response models, never past
+SOFT_V = 2.25            # m/s (5 mph): from here down the stop is a soft landing at SOFT_A, as the driver's stops end
+SOFT_A = 0.5             # m/s^2 (the driver's last second: 0.7; openpilot's was 2.0-2.1, a head jolt). The Fisker's VCU
+                         # clamps the friction brakes on anything firmer below 3 mph, so its controller sends no more
+                         # than this there (opendbc fisker soft_stop_accel) and the profile has to leave room for it
 STOP_V_TARGET = 0.0      # m/s: a complete stop. No rolling-stop option on purpose (NHTSA recall 22V-037, see above)
 PASSED_M = 10.0          # m beyond the sign's map point: dead-reckoned this far past it, the sign is behind the car
 STOPPED_V = 0.3          # m/s: at a stop
@@ -132,7 +136,10 @@ def lift_off_distance(v_ego: float, a: float = A_COMFORT, coast_s: float = COAST
 
 
 def braking_distance(v_ego: float, a: float = A_COMFORT) -> float:
-  return v_ego ** 2 / (2 * a) + v_ego * LAG_S
+  """m to stop from v_ego on the braking profile: a down to SOFT_V, the soft landing below, plus the lag."""
+  if v_ego <= SOFT_V:
+    return v_ego ** 2 / (2 * SOFT_A) + v_ego * LAG_S
+  return (v_ego ** 2 - SOFT_V ** 2) / (2 * a) + SOFT_V ** 2 / (2 * SOFT_A) + v_ego * LAG_S
 
 
 def required_decel(dist_to_stop: float, v_ego: float) -> float:
@@ -153,7 +160,10 @@ def coast_target(v_ego: float, floor: bool = True) -> float:
 def braking_v_target(dist_to_stop: float, v_ego: float, a: float = A_COMFORT) -> float:
   """The braking profile's speed target: it ends at STOP_V_TARGET (zero) at the stop point, never at a rolling speed."""
   d = max(dist_to_stop - STOP_BUFFER_M - v_ego * LAG_S, 0.0)
-  return max(math.sqrt(2 * a * d), STOP_V_TARGET)
+  d_soft = SOFT_V ** 2 / (2 * SOFT_A)          # the last metres: the soft landing from SOFT_V
+  if d <= d_soft:
+    return max(math.sqrt(2 * SOFT_A * d), STOP_V_TARGET)
+  return math.sqrt(SOFT_V ** 2 + 2 * a * (d - d_soft))
 
 
 def confirm_distance(v_ego: float, a: float = A_COMFORT, coast_s: float = COAST_TIME_S) -> float:
