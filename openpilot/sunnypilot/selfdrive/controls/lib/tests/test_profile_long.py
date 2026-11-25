@@ -298,14 +298,41 @@ class TestLeadBrake(unittest.TestCase):
 
 class TestLeadTakeOff(unittest.TestCase):
   DT = 0.05
+  GAP = 1.69   # the driver's following gap (s)
 
-  def _run(self, lead, v_ego=0.0, launch=1.0):
+  def _run(self, lead, v_ego=0.0, a_max=1.0):
     """lead: [(d, v_lead, a_lead)] per frame, the car standing; the request per frame."""
     t = pl.LeadTakeOff()
-    return [t.update(v_ego, True, d, v, a, launch, self.DT) for d, v, a in lead]
+    return [t.update(v_ego, True, d, v, a, a_max, self.DT, self.GAP) for d, v, a in lead]
 
-  def test_standing_lead_asks_nothing(self):
+  def _drive(self, lead_v, d0=4.5, secs=14.0, lag=0.4):
+    """Closed loop behind a lead with speed lead_v(t): a car that gives the request after a lag. Rows of
+    (t, v, gap, request, lead speed)."""
+    t = pl.LeadTakeOff()
+    v = a = s = 0.0
+    lead_s, rows, prev = d0, [], lead_v(0.0)
+    for i in range(round(secs / self.DT)):
+      now = i * self.DT
+      vl = lead_v(now)
+      lead_s += vl * self.DT
+      req = t.update(v, True, lead_s - s, vl, (vl - prev) / self.DT, 1.0, self.DT, self.GAP) or 0.0
+      prev = vl
+      a += (req - a) * self.DT / lag
+      v = max(0.0, v + a * self.DT)
+      s += v * self.DT
+      rows.append((now, v, lead_s - s, req, vl))
+    return rows
+
+  def test_gap_is_the_drivers_while_moving_off_and_the_following_gap_at_the_end(self):
+    self.assertAlmostEqual(pl.takeoff_gap(0.0, self.GAP), pl.TAKEOFF_GAP_M - pl.TAKEOFF_STAND_TOL_M)   # standing: a little less
+    self.assertAlmostEqual(pl.takeoff_gap(5.0, self.GAP), 4.0 + 1.3 * 5.0)                             # 11 mph: 10.5 m
+    self.assertAlmostEqual(pl.takeoff_gap(pl.TAKEOFF_END_V, self.GAP), 4.0 + self.GAP * pl.TAKEOFF_END_V)
+    self.assertAlmostEqual(pl.takeoff_gap(5.0, 1.0), 4.0 + 1.0 * 5.0)                                  # never more than the following gap
+
+  def test_standing_lead_asks_nothing_however_far(self):
     self.assertTrue(all(a is None for a in self._run([(7.0, 0.02, 0.0)] * 100)))
+    self.assertTrue(all(a is None for a in self._run([(13.0, 0.1, 0.0)] * 100)))      # 13 m ahead and standing: no creeping up
+    self.assertTrue(all(a is None for a in self._run([(13.0, 0.3, 0.0)] * 100)))      # vision's noise on a standing car
     t = pl.LeadTakeOff()
     self.assertIsNone(t.update(0.0, False, 0.0, 0.0, 0.0, 1.0, self.DT))
 
@@ -314,33 +341,84 @@ class TestLeadTakeOff(unittest.TestCase):
     rec = [(6.8, 0.0), (7.0, 0.12), (6.8, 0.31), (7.4, 0.53), (8.0, 0.98), (7.6, 1.30), (8.0, 1.44), (9.9, 2.01), (10.3, 2.46), (12.3, 3.26)]
     out = self._run([(d, v, 0.5) for d, v in rec for _ in range(10)])
     first = next(i for i, a in enumerate(out) if a is not None) * self.DT
-    self.assertLess(first, 1.5)                     # by 155.6 s: 0.5 s sooner
-    at_2s = out[int(2.0 / self.DT)]                 # 156.1 s, where the old plan asked +0.10
-    self.assertGreater(at_2s, 0.5)
-    self.assertLessEqual(max(a for a in out if a is not None), 1.0)   # never over the launch
+    self.assertLess(first, 1.8)                     # 0.2 s after it reads 0.5 m/s
+    self.assertGreater(out[int(2.5 / self.DT)], 0.8)
+    self.assertLessEqual(max(a for a in out if a is not None), pl.TAKEOFF_A_MAX)
 
   def test_a_creeping_or_braking_lead_and_a_close_one(self):
-    self.assertTrue(all(a is None for a in self._run([(7.0, 0.2, 0.0)] * 60)))          # creeping under the threshold
+    self.assertTrue(all(a is None for a in self._run([(7.0, 0.4, 0.0)] * 60)))          # creeping under the threshold
     self.assertTrue(all(a is None for a in self._run([(7.0, 1.0, -0.8)] * 60)))         # rolling but braking again
     self.assertTrue(all(a is None for a in self._run([(3.0, 1.5, 0.5)] * 60)))          # too close
-    out = self._run([(7.0, 1.5, 0.5)] * 20 + [(8.0, 0.1, -1.0)] * 5)                    # it stops again: nothing at once
+    out = self._run([(7.0, 1.5, 0.5)] * 20 + [(8.0, 0.0, -1.0)] * 5)                    # it stands again: nothing more
     self.assertIsNotNone(out[19])
     self.assertIsNone(out[20])
 
-  def test_fades_as_this_car_catches_the_leads_speed_and_ends(self):
+  def test_keeps_pulling_past_walking_pace(self):
+    # 00000148 at 28:50, the drive before this rule: the take-off asked 1.0 up to 5.6 mph, then the comfort ceiling
+    # held it at 0.65 while the lead kept its 1.2-1.5; 9 s on 18 mph, the lead at 26 and 43 m off
     t = pl.LeadTakeOff()
     for _ in range(10):
-      t.update(0.0, True, 8.0, 2.0, 0.5, 1.0, self.DT)
-    self.assertAlmostEqual(t.update(0.0, True, 8.0, 2.0, 0.5, 1.0, self.DT), 1.0)
-    self.assertAlmostEqual(t.update(1.0, True, 9.0, 2.0, 0.5, 1.0, self.DT), 0.6)
-    # the following gap: 1.45 s of this car's speed over the standing gap, or it asks nothing; it builds over 2 m
-    self.assertIsNone(t.update(2.0, True, 6.0, 4.0, 0.5, 1.0, self.DT))              # 6.0 m < 3.5 + 2.9
-    self.assertAlmostEqual(t.update(2.0, True, 7.4, 4.0, 0.5, 1.0, self.DT), 0.5)   # 1 m of room: half the pull
-    self.assertAlmostEqual(t.update(2.0, True, 9.0, 4.0, 0.5, 1.0, self.DT), 1.0)
-    self.assertIsNone(t.update(1.0, True, 9.0, 4.0, 0.5, 1.0, self.DT, gap_s=2.0, stop_gap_m=8.0))   # a longer gap asked
-    self.assertIsNone(t.update(1.9, True, 9.5, 2.0, 0.5, 1.0, self.DT))      # as fast as the lead: the gap no longer opens
-    self.assertIsNone(t.update(2.6, True, 12.0, 6.0, 0.5, 1.0, self.DT))     # rolling: the MPC's from here
-    self.assertAlmostEqual(t.update(0.0, True, 8.0, 3.0, 0.5, 0.7, self.DT), 0.7)   # the driver's own launch
+      t.update(0.0, True, 6.0, 2.0, 1.0, 1.0, self.DT, self.GAP)
+    self.assertTrue(t.active)
+    self.assertAlmostEqual(t.update(4.0, True, 15.0, 7.0, 1.3, 1.0, self.DT, self.GAP), 1.0)    # 9 mph, lead at 16, 15 m
+    self.assertAlmostEqual(t.update(8.0, True, 22.0, 10.0, 1.2, 1.0, self.DT, self.GAP), 1.0)   # 18 mph
+    self.assertAlmostEqual(t.update(4.0, True, 15.0, 7.0, 1.3, 0.5, self.DT, self.GAP), 0.5)    # a wet road's ceiling
+
+  def test_never_inside_the_gap_and_never_toward_a_slower_lead(self):
+    t = pl.LeadTakeOff()
+    for _ in range(10):
+      t.update(0.0, True, 6.0, 2.0, 1.0, 1.0, self.DT, self.GAP)
+    self.assertIsNone(t.update(4.0, True, 9.0, 7.0, 1.0, 1.0, self.DT, self.GAP))       # 9.0 m < 4 + 1.3 x 4: inside
+    self.assertLess(t.update(4.0, True, 9.5, 7.0, 1.0, 1.0, self.DT, self.GAP), 0.5)    # 0.3 m of room: a fraction of it
+    self.assertIsNone(t.update(4.0, True, 14.0, 3.0, -1.0, 1.0, self.DT, self.GAP))     # the lead slower: nothing
+    self.assertTrue(t.active)
+
+  def test_ends_when_caught_up_or_moved_off_and_starts_only_from_standing(self):
+    t = pl.LeadTakeOff()
+    for _ in range(10):
+      t.update(0.0, True, 6.0, 2.0, 1.0, 1.0, self.DT, self.GAP)
+    for _ in range(round(pl.TAKEOFF_SETTLED_S / self.DT) + 1):
+      t.update(6.0, True, 14.0, 5.0, 0.0, 1.0, self.DT, self.GAP)                       # the lead 1 m/s slower for a second
+    self.assertFalse(t.active)
+    for _ in range(20):                                                                 # rolling at 13 mph: not started again
+      self.assertIsNone(t.update(6.0, True, 30.0, 9.0, 1.0, 1.0, self.DT, self.GAP))
+    for _ in range(10):
+      t.update(0.0, True, 6.0, 2.0, 1.0, 1.0, self.DT, self.GAP)
+    self.assertIsNone(t.update(pl.TAKEOFF_END_V, True, 60.0, 20.0, 1.0, 1.0, self.DT, self.GAP))   # 30 mph: the MPC's
+    self.assertFalse(t.active)
+
+  def test_closed_loop_follows_the_leads_ramp_at_the_gap(self):
+    # the lead waits 1 s, then 1.0 m/s^2 to 13 m/s (29 mph): a ramp this car can match
+    rows = self._drive(lambda t: min(max(t - 1.0, 0.0) * 1.0, 13.0))
+    at7 = next(r for r in rows if r[0] >= 7.0)
+    self.assertLess(next(r[0] for r in rows if r[1] > 0.3), 2.5)          # rolling within 1.5 s of it
+    self.assertGreater(at7[1], 0.7 * at7[4])                              # 6 s on: most of its speed ...
+    for now, v, gap, _, _ in rows:
+      if v > 1.0 and v < pl.TAKEOFF_END_V:
+        self.assertGreater(gap, pl.takeoff_gap(v, self.GAP) - 0.5)        # ... never inside the gap
+        self.assertLess(gap, pl.takeoff_gap(v, self.GAP) + 8.0, now)      # ... and not left behind
+
+  def test_closed_loop_lead_goes_then_stops(self):
+    # a queue: the lead does 3 m/s for 3 s and stands again. The request ends as it slows; nothing pulls toward it
+    rows = self._drive(lambda t: 3.0 if 1.0 <= t < 4.0 else 0.0, d0=5.0, secs=8.0)
+    self.assertEqual(max(r[3] for r in rows if r[0] >= 4.05), 0.0)
+    self.assertTrue(all(r[2] > 4.0 for r in rows if r[0] < 4.5))
+
+  def test_route_00000148_lead_drives_off(self):
+    # the lead as recorded (data/takeoff_00000148_lead_leaves.json: s from the lead leaving, v_ego, lead dRel, vLead,
+    # aLeadK, present, the request then; 20 Hz). Open loop on the recorded frames: the request stays at the ceiling
+    # where the drive dropped to 0.65
+    import json
+    import os
+    with open(os.path.join(os.path.dirname(__file__), "data", "takeoff_00000148_lead_leaves.json")) as f:
+      rows = json.load(f)
+    t = pl.LeadTakeOff()
+    asked = [(now, t.update(v, bool(present), d, vl, al, 1.0, self.DT, self.GAP), cmd) for now, v, d, vl, al, present, cmd in rows]
+    first = next(now for now, a, _ in asked if a is not None)
+    self.assertLess(first, -0.5)                                           # as early as the drive's own (-0.6 s)
+    later = [(a or 0.0, cmd) for now, a, cmd in asked if 2.5 <= now <= 8.0]
+    self.assertGreater(sum(a for a, _ in later) / len(later), 0.9)         # the drive: 0.65
+    self.assertLess(sum(cmd for _, cmd in later) / len(later), 0.7)
 
 
 class TestLeadFollowCap(unittest.TestCase):

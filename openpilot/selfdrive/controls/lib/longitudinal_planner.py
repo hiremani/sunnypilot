@@ -160,11 +160,14 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                                LongitudinalPlannerSP.map_accel_cap(self, v_ego))
     # slowing early for a car ahead, at once and a little more than needed (only ever adds braking)
     self.output_a_target = max(LongitudinalPlannerSP.lead_brake_cap(self, self.output_a_target), ACCEL_MIN)
-    # moving off as the car in front does (only while the gap opens; not on a red light or at a stop sign)
+    # moving off as one unit with the car in front (only while it is beyond the take-off gap and no slower; not on a
+    # red light or at a stop sign): over the MPC, the driving model and the comfort ceiling, under the speed targets
     a_take_off = LongitudinalPlannerSP.take_off(self, sm, v_ego)
-    if a_take_off is not None and a_take_off > self.output_a_target:
-      self.output_a_target = float(min(a_take_off, ACCEL_MAX))
-      self.output_should_stop = False
+    if a_take_off is not None:
+      a_take_off = min(a_take_off, self.a_cruise, ACCEL_MAX)
+      if a_take_off > self.output_a_target:
+        self.output_a_target = float(a_take_off)
+        self.output_should_stop = False
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 

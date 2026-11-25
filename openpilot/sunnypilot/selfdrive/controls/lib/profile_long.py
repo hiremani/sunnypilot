@@ -128,49 +128,90 @@ FOLLOW_MIN_D = 50.0         # m: ...but a car this close is, whatever the time g
 FOLLOW_LEAD_MARGIN = 0.5    # m/s over the lead's own speed the cap sits (the MPC keeps the gap, not this cap)
 
 
-TAKEOFF_V_EGO_MAX = 2.5     # m/s: moving off ends here, the MPC follows from then on
-TAKEOFF_LEAD_V = 0.25       # m/s: the lead is rolling (a standing lead reads within 0.02 of zero)
-TAKEOFF_ON_S = 0.3          # s of that before it counts
-TAKEOFF_LEAD_A_MIN = -0.3   # m/s^2: not while the lead is braking again (a queue creeping up)
+TAKEOFF_ARM_V = 2.5         # m/s: it starts only from (nearly) standing; from then on it runs until it ends
+TAKEOFF_END_V = 13.4        # m/s (30 mph): moved off; the MPC follows from here
+TAKEOFF_LEAD_V = 0.5        # m/s: the lead is rolling (a standing lead reads within 0.02 of zero). Over 30 drives this
+TAKEOFF_ON_S = 0.2          # fired 58 times standing behind a car, the car really leaving in 54; waiting for the
+                            # distance to open as well was 0.3 s later and no surer, the distance alone wrong half the time
+TAKEOFF_LEAD_FULL_V = 2.0   # m/s: the lead's speed from which the open gap counts in full (a standing car never pulls)
 TAKEOFF_MIN_D = 3.5         # m: never from closer than this
-TAKEOFF_GAIN = 0.6          # 1/s: the pull per m/s the lead is faster
+TAKEOFF_GAP_M = 4.0         # m and s: the gap the driver keeps while moving off behind a car, 4 m + 1.3 s of our speed
+TAKEOFF_GAP_S = 1.3         # (32 of their own take-offs over 30 drives: 5.6 m at 1-4 mph, 10 m at 11, 17 m at 21 mph;
+                            # rolling 1.3 s after the lead, 1.6 m/s^2 over the first 3 s against the lead's 1.5)
+TAKEOFF_STAND_TOL_M = 1.0    # m
+TAKEOFF_BLEND_V = 9.0       # m/s: above, the gap goes over to the following gap, reached at TAKEOFF_END_V
+TAKEOFF_K_GAP = 0.25        # 1/s^2: per m the lead is beyond that gap
+TAKEOFF_K_V = 0.8           # 1/s: per m/s it is faster
+TAKEOFF_K_A = 0.5           # of the lead's own acceleration (vision's, so only part of it)
+TAKEOFF_LEAD_A_MAX = 1.5    # m/s^2 of it counted at most
+TAKEOFF_GAP_EASE_M = 1.5    # m of room over the gap across which the pull builds
+TAKEOFF_A_MAX = 1.0         # m/s^2: this car takes no more from openpilot (CarControllerParams.ACCEL_MAX)
 TAKEOFF_MIN_ACCEL = 0.15    # m/s^2: below this there is nothing to ask for
-TAKEOFF_GAP_EASE_M = 2.0    # m of room over the following gap across which the pull builds
-TAKEOFF_STOP_GAP_TOL_M = 1.0
-TAKEOFF_GAP_S = 1.45        # s: the following gap kept while moving off when the caller gives none
+TAKEOFF_LEAD_BRAKING = -0.3 # m/s^2: nothing is asked while the lead brakes this much (a queue creeping up)
+TAKEOFF_SLOWER_V = 0.5      # m/s the lead is slower than us ...
+TAKEOFF_SETTLED_S = 1.0     # ... for this long: caught up (or it braked): over, until the next standstill
+
+
+def takeoff_gap(v_ego: float, follow_gap_s: float, stop_gap_m: float = TAKEOFF_GAP_M) -> float:
+  """The gap (m) to the car ahead at v_ego while moving off behind it: the standing gap plus TAKEOFF_GAP_S of our
+  speed, going over to the following gap between TAKEOFF_BLEND_V and TAKEOFF_END_V (never more than that gap).
+  Standing, TAKEOFF_STAND_TOL_M less (a car stopped a little inside its stop gap still moves off), gone by
+  TAKEOFF_ARM_V."""
+  t = float(np.interp(v_ego, [TAKEOFF_BLEND_V, TAKEOFF_END_V], [min(TAKEOFF_GAP_S, follow_gap_s), follow_gap_s]))
+  stand = max(min(stop_gap_m, TAKEOFF_GAP_M), TAKEOFF_MIN_D)
+  return max(stand - TAKEOFF_STAND_TOL_M * max(0.0, 1.0 - v_ego / TAKEOFF_ARM_V), TAKEOFF_MIN_D - 0.5) + t * v_ego
 
 
 class LeadTakeOff:
-  """Moving off behind a car that moves off: the least acceleration to ask for, or None.
+  """Moving off behind a car as one unit with it: the least acceleration to ask for, or None.
 
-  Standing behind a car the MPC only speeds up once the gap has grown past the following gap, and then by tenths:
-  00000129 at 2:36, the light green, the lead rolling at 154.6 s, the plan off its stop at 156.1 asking +0.10, +0.27
-  by 158.7 with the lead 12 m off at 7 mph, the driver on the gas at 159.2 (which drops the car's cruise control).
-  The driver moves off as the car in front does. So from the lead rolling for TAKEOFF_ON_S: TAKEOFF_GAIN per m/s it
-  is faster than this car, up to the driver's own launch, until this car does TAKEOFF_V_EGO_MAX. It asks nothing as
-  soon as the lead is no faster (the gap is then not growing) or brakes, so the MPC's braking is never overruled:
-  this only ever raises a request while the gap is opening.
+  Standing behind a car the MPC only speeds up once the gap has grown past the following gap, and then by tenths;
+  the comfort ceiling (0.5-0.6 m/s^2 in town, the driver's open-road pull) then holds the car back while the lead
+  leaves: 00000147 at 16:41, 3 s after the lead rolled 9 mph with the lead at 16 and the gap 18 m (2.8 s), the driver
+  on the gas, which drops the car's cruise control. The driver moves off with the car in front: rolling 1.3 s after
+  it, with its acceleration, at 4 m + 1.3 s of their speed behind it.
 
-  The gap (the driver's rule: a reaction-time gap, growing with speed): it asks only with the lead at least the
-  standing gap plus gap_s of this car's speed away, so moving off never brings the car inside its following gap; the
-  pull also eases off over the last TAKEOFF_GAP_EASE_M of room above that."""
+  So, from the lead moving away from a (near) standstill of ours: the gap is takeoff_gap(v); the request is
+  TAKEOFF_K_GAP per m the lead is beyond it, TAKEOFF_K_V per m/s it is faster and part of its own acceleration, up
+  to TAKEOFF_A_MAX. It asks only with the lead beyond the gap, so it never brings the car inside it, and asks nothing
+  once the lead is no faster or brakes: the MPC's and LeadBrake's braking is never overruled. It runs until the car
+  does TAKEOFF_END_V or the lead has been slower than it for TAKEOFF_SETTLED_S (caught up); then the MPC follows.
+  The open gap counts only as far as the lead is moving (in full from TAKEOFF_LEAD_FULL_V): a car that stands, however
+  far ahead, never pulls this car toward it."""
 
   def __init__(self):
-    self.rolling_t = 0.0
     self.active = False
+    self.on_t = 0.0
+    self.slower_t = 0.0
 
-  def update(self, v_ego: float, lead_present: bool, d_rel: float, v_lead: float, a_lead: float, launch_accel: float,
-             dt: float, gap_s: float = TAKEOFF_GAP_S, stop_gap_m: float = TAKEOFF_MIN_D) -> float | None:
-    rolling = lead_present and d_rel >= TAKEOFF_MIN_D and v_lead >= TAKEOFF_LEAD_V and a_lead >= TAKEOFF_LEAD_A_MIN
-    self.rolling_t = self.rolling_t + dt if rolling else 0.0
-    a = None
-    # m beyond the following gap at this speed (standing: a car stopped a little inside its stop gap still moves off)
-    room = d_rel - (max(stop_gap_m - TAKEOFF_STOP_GAP_TOL_M, TAKEOFF_MIN_D) + gap_s * v_ego)
-    if self.rolling_t >= TAKEOFF_ON_S and v_ego < TAKEOFF_V_EGO_MAX and room > 0.0:
-      a = min(TAKEOFF_GAIN * (v_lead - v_ego), launch_accel) * min(1.0, room / TAKEOFF_GAP_EASE_M)
-      a = a if a >= TAKEOFF_MIN_ACCEL else None
-    self.active = a is not None
-    return a
+  def reset(self) -> None:
+    self.active = False
+    self.on_t = self.slower_t = 0.0
+
+  def update(self, v_ego: float, lead_present: bool, d_rel: float, v_lead: float, a_lead: float, a_max: float,
+             dt: float, follow_gap_s: float = TAKEOFF_GAP_S, stop_gap_m: float = TAKEOFF_GAP_M) -> float | None:
+    if not lead_present or d_rel < TAKEOFF_MIN_D:
+      self.reset()
+      return None
+    room = d_rel - takeoff_gap(v_ego, follow_gap_s, stop_gap_m)
+    faster = v_lead - v_ego
+    if not self.active:
+      going = (v_ego < TAKEOFF_ARM_V and room > 0.0 and v_lead >= TAKEOFF_LEAD_V and faster > 0.0
+               and a_lead > TAKEOFF_LEAD_BRAKING)
+      self.on_t = self.on_t + dt if going else 0.0
+      if self.on_t < TAKEOFF_ON_S - 1e-6:
+        return None
+      self.active, self.slower_t = True, 0.0
+    self.slower_t = self.slower_t + dt if faster < -TAKEOFF_SLOWER_V else 0.0
+    if v_ego >= TAKEOFF_END_V or self.slower_t >= TAKEOFF_SETTLED_S:
+      self.reset()
+      return None
+    if room <= 0.0 or faster < 0.0 or a_lead <= TAKEOFF_LEAD_BRAKING:
+      return None
+    moving = min(max(v_lead, 0.0) / TAKEOFF_LEAD_FULL_V, 1.0)
+    a = TAKEOFF_K_GAP * room * moving + TAKEOFF_K_V * faster + TAKEOFF_K_A * min(max(a_lead, 0.0), TAKEOFF_LEAD_A_MAX)
+    a = min(a, a_max, TAKEOFF_A_MAX) * min(1.0, room / TAKEOFF_GAP_EASE_M)
+    return a if a >= TAKEOFF_MIN_ACCEL else None
 
 
 class LeadFollowCap:

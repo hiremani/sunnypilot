@@ -351,28 +351,31 @@ class LongitudinalPlannerSP:
                                                                           merge))
 
   def take_off(self, sm: messaging.SubMaster, v_ego: float) -> float | None:
-    """Moving off behind a car that moves off (profile_long.LeadTakeOff): the least acceleration to ask for, or None.
-    It goes over the MPC's and the driving model's own request (experimental mode asked +0.03..0.23 for 4 s on
-    00000129 with the lead driving off), by the driver's rule: follow the car in front, except at a light that is
-    not green. So not on a red or amber light (the car's own recognition), not while Stop Sign Assist or Red Light
-    Assist holds the car, not with the driver on the brake, and only with openpilot speed control."""
+    """Moving off behind a car as one unit with it (profile_long.LeadTakeOff): the least acceleration to ask for, or
+    None. It goes over the MPC's and the driving model's own request and the comfort ceiling (experimental mode asked
+    +0.03..0.23 for 4 s on 00000129 with the lead driving off), by the driver's rule: follow the car in front, except
+    at a light that is not green. So not on a red or amber light (the car's own recognition), not while Stop Sign
+    Assist or Red Light Assist holds the car, not with the driver on the brake, and only with openpilot speed control.
+    Never more than a wet road allows; the caller keeps it under the speed targets (set speed, limit, curve, turn)."""
+    tk = self.take_off_lead
     try:
       lead = sm['radarState'].leadOne
-      was = self.take_off_lead.active
-      a = self.take_off_lead.update(v_ego, lead.present, lead.dRel, lead.vLead, lead.aLeadK,
-                                    self.profile.launch_accel if self.profile_on else 1.0, DT_MDL,
-                                    self.t_follow(v_ego) or get_T_FOLLOW(self.personality),
-                                    self.stop_distance() or STOP_DISTANCE)
       held = (self.stop_sign is not None and self.stop_sign.is_active) or (self.red_light is not None and self.red_light.controls)
       red = int(sm['carStateSP'].trafficLightColor) in RED_LIGHT_STOP_COLORS
-      if a is None or not self.openpilot_long or held or red or sm['carState'].brakePressed:
-        self.take_off_lead.active = False
+      if not self.openpilot_long or held or red or sm['carState'].brakePressed:
+        if tk.active:
+          cloudlog.event("take_off", on=False, why="held" if held else "red" if red else "brake", v=round(v_ego, 2))
+        tk.reset()
         return None
-      if not was:
-        cloudlog.event("take_off", v=round(v_ego, 2), lead_d=round(lead.dRel, 1), lead_v=round(lead.vLead, 2), a=round(a, 2))
+      was = tk.active
+      a = tk.update(v_ego, lead.present, lead.dRel, lead.vLead, lead.aLeadK, self.wet.accel_max(), DT_MDL,
+                    self.t_follow(v_ego) or get_T_FOLLOW(self.personality), self.stop_distance() or STOP_DISTANCE)
+      if tk.active != was:
+        cloudlog.event("take_off", on=tk.active, v=round(v_ego, 2), lead_d=round(lead.dRel, 1), lead_v=round(lead.vLead, 2),
+                       a=None if a is None else round(a, 2))
       return a
     except Exception:
-      self.take_off_lead.active = False
+      tk.reset()
       return None
 
   def lead_brake_cap(self, a_target: float) -> float:
