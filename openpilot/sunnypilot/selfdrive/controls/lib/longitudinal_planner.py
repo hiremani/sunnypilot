@@ -114,6 +114,7 @@ class LongitudinalPlannerSP:
       cloudlog.exception("red light assist unavailable")
     self.lead_brake = profile_long.LeadBrake(DT_MDL)   # driver profile lead_brake_a: slowing toward a slower car closing fast
     self.lead_braking = False
+    self.lead_brake_a_cap: float | None = None
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
 
@@ -268,13 +269,18 @@ class LongitudinalPlannerSP:
           targets[LongitudinalPlanSource.driverSpeed] = (v_cap, -profile_long.PROFILE_COAST_DECEL if v_ego > v_cap + 0.5 else a_ego)
       else:
         self.speed_cap.update(None, 0.0, v_ego, False, DT_MDL)
-      lb = self.lead_brake.update(self.profile.lead_brake_a, self.profile.follow_gap_s, v_ego, lead.present, lead.dRel,
-                                  lead.vRel)
-      self.lead_braking = lb is not None
-      if lb is not None:
-        targets[LongitudinalPlanSource.leadBrake] = lb
+      # slowing early for a car ahead: an acceleration ceiling (lead_brake_cap), worked out here once a frame
+      was = self.lead_brake.active
+      gate = 1.0 if lead.radar else lead.modelProb   # only a vision lead carries a certainty
+      self.lead_brake_a_cap = self.lead_brake.update(self.profile.lead_brake_a, self.profile.follow_gap_s, v_ego, lead.present,
+                                                     lead.dRel, lead.vRel, lead.aLeadK, gate, a_ego,
+                                                     profile_long.stop_gap(self.profile.stop_gap_m) or profile_long.STOP_DISTANCE)
+      if self.lead_brake.active != was:
+        cloudlog.event("lead_brake", on=self.lead_brake.active, v=round(v_ego, 2), lead_d=round(lead.dRel, 1),
+                       lead_v=round(lead.vLead, 2), lead_a=round(lead.aLeadK, 2), need=round(min(self.lead_brake.need, 9.9), 2))
     else:
       self.lead_brake.reset()
+      self.lead_brake_a_cap = None
       self.lead_braking = False
       self.follow_cap.v = None
 
@@ -368,6 +374,15 @@ class LongitudinalPlannerSP:
     except Exception:
       self.take_off_lead.active = False
       return None
+
+  def lead_brake_cap(self, a_target: float) -> float:
+    """a_target with the early slowdown for a car ahead (profile_long.LeadBrake) applied: only ever lower."""
+    cap = self.lead_brake_a_cap
+    self.lead_braking = cap is not None and cap < a_target
+    if not self.lead_braking:
+      return a_target
+    self.source = LongitudinalPlanSource.leadBrake
+    return float(cap)
 
   def lead_coast_cap(self, sm: messaging.SubMaster, v_ego: float) -> float:
     """The most acceleration the driver profile allows: none toward a slower lead inside the coasting gap, and the

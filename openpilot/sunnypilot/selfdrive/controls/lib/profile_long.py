@@ -39,24 +39,33 @@ LEAD_COAST_CLOSING = 0.5    # m/s: the lead is this much slower (closing) before
 LEAD_COAST_MAX_D = 120.0    # m: radar leads further than this are ignored
 LEAD_COAST_ACCEL = 0.0      # m/s^2 cap while coasting
 
-LEAD_BRAKE_MIN_CLOSING = 4.0    # m/s: slower than this, closing is left to the MPC (the driver and openpilot start alike);
-                                # also the closing speed lead_brake_a is measured from (driver_profile_gen)
-LEAD_BRAKE_MIN_ROOM_M = 10.0    # m outside the following gap still left when it starts: inside, it is following (MPC)
-LEAD_BRAKE_START_MAX = 2.0      # m/s^2: needing more than this already is no slowdown to shape (the MPC's). Was 1.2: a
-                                # stopped car first seen by vision at 80 m and 32 mph can already need 1.2-1.4
-                                # (00000129 at 3:55: the MPC alone asked 1.0 for 2 s and 2.2 at the end)
-LEAD_BRAKE_FILTER_S = 0.5       # s: the lead's distance and speed are smoothed over this before the need is worked out.
-                                # This car's leads are vision only: the same stopped car read 76, 64, 73, 63, 65 m and
-                                # 17.6 then 8.2 mph within a second
+LEAD_BRAKE_MIN_CLOSING = 4.0    # m/s: the closing speed lead_brake_a is measured from (driver_profile_gen)
+LEAD_BRAKE_START_CLOSING = 2.0  # m/s: slower than this, closing is left to the MPC
+LEAD_BRAKE_MIN_ROOM_M = 10.0    # m outside the following gap still left when it starts on a moving car: inside, it is
+                                # following (MPC)
+LEAD_BRAKE_FILTER_S = 0.5       # s: the lead's distance, speed and acceleration are smoothed over this before the need
+                                # is worked out. This car's leads are vision only: the same stopped car read 76, 64, 73,
+                                # 63, 65 m and 17.6 then 8.2 mph within a second
 LEAD_BRAKE_NEW_LEAD_M = 12.0    # m: a jump this large in one frame is another car: the smoothing starts again from it
-LEAD_BRAKE_MARGIN = 1.1         # slow this much more than the even need: the need then falls as the car closes, so the
-                                # slowdown ends gentler than it began, as the driver's does
-LEAD_BRAKE_ON_S = 0.5           # s the start condition must hold (radar flicker)
-LEAD_BRAKE_HOLD_CLOSING = 1.5   # m/s: once slowing, keep going until the closing speed is down to this
+LEAD_BRAKE_MARGIN = 1.25        # slow this much more than the even need (at most LEAD_BRAKE_MARGIN_MAX more): the need
+LEAD_BRAKE_MARGIN_MAX = 0.3     # then falls as the car closes, so the slowdown ends gentler than it began. Arriving at
+                                # the last 5 mph still braking firmly is what makes this car's brakes grab (SOFT_STOP)
+LEAD_BRAKE_ON_S = 0.3           # s the start condition must hold (flicker)
+LEAD_BRAKE_HOLD_CLOSING = 1.0   # m/s: once slowing, keep going until the closing speed is down to this
 LEAD_BRAKE_MAX_D = 150.0        # m
-LEAD_BRAKE_A_MAX = 1.5          # m/s^2: the cap never asks for more (harder is the MPC's job)
-LEAD_BRAKE_LAG_S = 1.0          # s: lead the profile by the planner's ~1 s speed-loop lag
-LEAD_BRAKE_HOLD = 0.5           # once slowing, keep it while the need is at least this fraction of lead_brake_a
+LEAD_BRAKE_A_MAX = 2.5          # m/s^2: never asks for more (the MPC and the car's own emergency braking are underneath)
+LEAD_BRAKE_A_MOVE_MAX = 1.5     # m/s^2: the most toward a car that keeps moving
+LEAD_BRAKE_LAG_S = 0.6          # s the car goes on before a request is braking (measured: request -> braking)
+LEAD_BRAKE_HOLD = 0.3           # once slowing, keep it while the need is at least this fraction of lead_brake_a
+LEAD_BRAKE_JERK = 2.5           # m/s^3: how fast the request builds and fades
+LEAD_BRAKE_V_MIN = 3.0          # m/s: below, the last metres are the MPC's
+LEAD_BRAKE_PROB = 0.5           # a vision lead less certain than this is not braked for early
+LEAD_STOPPED_V = 3.0            # m/s: a lead slower than this is taken as stopping (vision reads a stopped car as
+                                # 19, 10, 5 mph in its first second: 00000144 at 8:22, seen at 112 m, braked for as if
+                                # it kept rolling, the driver on the brake at 41 m)
+LEAD_STOPPED_DECEL = 1.5        # m/s^2: how such a lead is taken to stop, at least
+LEAD_BRAKING_DECEL = 0.6        # m/s^2: a lead braking at least this much, and already slower than LEAD_BRAKING_SLOW of
+LEAD_BRAKING_SLOW = 0.7         # our speed, is taken to keep braking until it stands (00000144 at 5:06)
 
 JUNCTION_V_MAX = 9.0        # m/s (20 mph, the turn planner's abort speed): above, not a junction turn
 JUNCTION_CURVATURE = 1 / 25.0   # 1/m (R < 25 m)
@@ -253,64 +262,110 @@ def lead_brake_need(follow_gap_s: float, v_ego: float, d_rel: float, v_rel: floa
   return closing * closing / (2.0 * room) if room > 0.5 else float("inf")
 
 
-class LeadBrake:
-  """Closing fast on a slower car: once an even slowdown to the driver's following gap behind it needs the driver's
-  lead_brake_a, a speed target that slows that evenly. It only ever lowers the speed; the MPC's own lead braking stays
-  underneath, and everything outside the start window below is the MPC's.
+def lead_brake_stop_need(v_ego: float, d_rel: float, v_lead: float, lead_decel: float, stop_gap_m: float,
+                         lag_s: float = 0.0) -> float:
+  """The even braking (m/s^2) that stops stop_gap_m behind where a lead braking at lead_decel will stand, starting
+  lag_s from now; inf with no room left."""
+  room = d_rel + v_lead * v_lead / (2.0 * max(lead_decel, 0.1)) - stop_gap_m - v_ego * lag_s
+  return v_ego * v_ego / (2.0 * room) if room > 0.5 else float("inf")
 
-  Starts only where the driver starts (closing >= LEAD_BRAKE_MIN_CLOSING, still LEAD_BRAKE_MIN_ROOM_M outside the
-  following gap, the need between lead_brake_a and LEAD_BRAKE_START_MAX) for LEAD_BRAKE_ON_S: a first cut without that
-  window, replayed over 72 drives, fired 1417 times for ~0.3 s each, almost all freeway following inside the gap with
-  radar noise. Once slowing it holds while the closing speed and the need stay up."""
+
+class LeadBrake:
+  """Slowing early for a car ahead, the way the driver does: once the even braking the situation needs reaches the
+  driver's lead_brake_a, an acceleration ceiling that brakes a little more than that need, straight away, so the
+  braking is highest at the start and fades as the car closes. It only ever adds braking; the MPC's and the driving
+  model's own stay underneath.
+
+  Two situations:
+  - a car that is (nearly) stopped, or braking firmly and already much slower: taken to stop; the need is to stand
+    stop_gap_m behind where it will. This is the queue at a light.
+  - a car that keeps moving: the need is to end the closing at the following gap behind it (as before). It starts only
+    with LEAD_BRAKE_MIN_ROOM_M left outside the gap (inside is following) and asks LEAD_BRAKE_A_MOVE_MAX at most.
+
+  Before 2026-11-24 this was a speed target through the cruise path: that path ramps slowly and stops at 1.2 m/s^2,
+  so the braking started low and ran behind the need all the way (00000144 at 8:22: 0.7 rising to 1.6 over 4 s from
+  104 m at 35 mph, the need going 0.9 -> 1.8; 00000147 at 5:06: 3.4 m/s^2 at the end)."""
 
   def __init__(self, dt: float):
     self.dt = dt
     self.active = False
     self.pending_s = 0.0
-    self.d_f: float | None = None   # the lead's smoothed distance and relative speed
+    self.d_f: float | None = None   # the lead's smoothed distance, relative speed and acceleration
     self.v_f = 0.0
+    self.a_f = 0.0
+    self.out: float | None = None
+    self.need = 0.0
 
   def reset(self) -> None:
     self.active = False
     self.pending_s = 0.0
     self.d_f = None
+    self.out = None
 
-  def _smooth(self, d_rel: float, v_rel: float) -> tuple[float, float]:
+  def _smooth(self, d_rel: float, v_rel: float, a_lead: float) -> tuple[float, float, float]:
     if self.d_f is None or abs(d_rel - self.d_f) > LEAD_BRAKE_NEW_LEAD_M:
-      self.d_f, self.v_f = d_rel, v_rel
+      self.d_f, self.v_f, self.a_f = d_rel, v_rel, a_lead
     else:
       k = min(1.0, self.dt / LEAD_BRAKE_FILTER_S)
       # the distance closes at the relative speed between frames: smooth what is left after that, not the closing
       self.d_f += self.v_f * self.dt
       self.d_f += (d_rel - self.d_f) * k
       self.v_f += (v_rel - self.v_f) * k
-    return self.d_f, self.v_f
+      self.a_f += (a_lead - self.a_f) * k
+    return self.d_f, self.v_f, self.a_f
+
+  def _need(self, follow_gap_s: float, v_ego: float, d: float, v_rel: float, a_lead: float, stop_gap_m: float,
+            a_now: float, starting: bool) -> tuple[float, float]:
+    """(need, closing speed). The need is worked out from where the car will be LEAD_BRAKE_LAG_S from now at the
+    braking it already has (a request takes that long to become braking): no room is taken off twice once it brakes."""
+    v_lead = max(v_ego + v_rel, 0.0)
+    closing = v_ego - v_lead
+    if closing <= 0.0:
+      return 0.0, closing
+    lag, a_now = LEAD_BRAKE_LAG_S, min(a_now, 0.0)
+    v_then = max(v_ego + a_now * lag, 0.0)
+    gone = (v_ego + v_then) / 2.0 * lag          # our way in the lag
+    need = 0.0
+    closing_then = v_then - v_lead
+    room = d + v_lead * lag - gone - (STOP_DISTANCE + follow_gap_s * v_lead)
+    if closing_then > 0.0 and room >= (LEAD_BRAKE_MIN_ROOM_M if starting else 0.5):
+      need = min(closing_then * closing_then / (2.0 * room), LEAD_BRAKE_A_MOVE_MAX)
+    lead_decel = None
+    if v_lead < LEAD_STOPPED_V:
+      lead_decel = max(-a_lead, LEAD_STOPPED_DECEL)
+    elif a_lead <= -LEAD_BRAKING_DECEL and v_lead < LEAD_BRAKING_SLOW * v_ego:
+      lead_decel = -a_lead
+    if lead_decel is not None:
+      need = max(need, lead_brake_stop_need(v_then, d - gone, v_lead, lead_decel, stop_gap_m))
+    return need, closing
 
   def update(self, lead_brake_a: float, follow_gap_s: float, v_ego: float, lead_present: bool, d_rel: float,
-             v_rel: float) -> tuple[float, float] | None:
-    """(v_target, a_target) or None."""
-    if lead_brake_a < 0.1 or not lead_present or v_ego < 1.0 or not (0.0 < d_rel < LEAD_BRAKE_MAX_D):
+             v_rel: float, a_lead: float = 0.0, prob: float = 1.0, a_now: float = 0.0,
+             stop_gap_m: float = STOP_DISTANCE) -> float | None:
+    """The acceleration ceiling (m/s^2, negative) or None. a_now: what the planner asks now (the request builds from
+    there at LEAD_BRAKE_JERK)."""
+    if (lead_brake_a < 0.1 or not lead_present or prob < LEAD_BRAKE_PROB or v_ego < LEAD_BRAKE_V_MIN
+        or not (0.0 < d_rel < LEAD_BRAKE_MAX_D)):
       self.reset()
       return None
-    d_rel, v_rel = self._smooth(d_rel, v_rel)
-    closing = -v_rel
-    v_lead = max(v_ego + v_rel, 0.0)
-    room = d_rel - (STOP_DISTANCE + follow_gap_s * v_lead) - closing * LEAD_BRAKE_LAG_S
-    need = lead_brake_need(follow_gap_s, v_ego, d_rel, v_rel, LEAD_BRAKE_LAG_S)
+    d, v_rel, a_lead = self._smooth(d_rel, v_rel, a_lead)
+    self.need, closing = self._need(follow_gap_s, v_ego, d, v_rel, a_lead, stop_gap_m, a_now, not self.active)
     if self.active:
-      self.active = closing >= LEAD_BRAKE_HOLD_CLOSING and need >= LEAD_BRAKE_HOLD * lead_brake_a
+      self.active = closing >= LEAD_BRAKE_HOLD_CLOSING and self.need >= LEAD_BRAKE_HOLD * lead_brake_a
     else:
-      starting = (closing >= LEAD_BRAKE_MIN_CLOSING and room >= LEAD_BRAKE_MIN_ROOM_M
-                  and lead_brake_a <= need <= LEAD_BRAKE_START_MAX)
+      starting = closing >= LEAD_BRAKE_START_CLOSING and self.need >= lead_brake_a
       # a frame outside the window takes time off instead of starting over (one odd reading isn't the end of it)
       self.pending_s = self.pending_s + self.dt if starting else max(0.0, self.pending_s - self.dt)
       self.active = self.pending_s >= LEAD_BRAKE_ON_S - 1e-6
     if not self.active:
+      self.out = None
       return None
     self.pending_s = 0.0
-    a = min(need * LEAD_BRAKE_MARGIN, LEAD_BRAKE_A_MAX)
-    v_target = v_lead + math.sqrt(2.0 * a * max(room, 0.0))
-    return min(v_target, v_ego), -a
+    want = -min(self.need * LEAD_BRAKE_MARGIN, self.need + LEAD_BRAKE_MARGIN_MAX, LEAD_BRAKE_A_MAX)
+    prev = self.out if self.out is not None else min(a_now, 0.0)
+    step = LEAD_BRAKE_JERK * self.dt
+    self.out = max(want, prev - step) if want < prev else min(want, prev + step)
+    return self.out
 
 
 def lead_coast(lead_coast_s: float, v_ego: float, lead_present: bool, d_rel: float, v_rel: float) -> bool:

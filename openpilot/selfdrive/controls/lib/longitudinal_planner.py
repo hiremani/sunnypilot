@@ -158,6 +158,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     # driver profile: no accelerating toward a slower lead the driver would already coast for (never adds braking)
     self.output_a_target = min(self.output_a_target, LongitudinalPlannerSP.lead_coast_cap(self, sm, v_ego),
                                LongitudinalPlannerSP.map_accel_cap(self, v_ego))
+    # slowing early for a car ahead, at once and a little more than needed (only ever adds braking)
+    self.output_a_target = max(LongitudinalPlannerSP.lead_brake_cap(self, self.output_a_target), ACCEL_MIN)
     # moving off as the car in front does (only while the gap opens; not on a red light or at a stop sign)
     a_take_off = LongitudinalPlannerSP.take_off(self, sm, v_ego)
     if a_take_off is not None and a_take_off > self.output_a_target:
