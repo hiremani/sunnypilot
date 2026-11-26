@@ -1,4 +1,6 @@
 """The driver profile's longitudinal rules (profile_long.py)."""
+import json
+import os
 import unittest
 
 from openpilot.common.constants import CV
@@ -147,11 +149,15 @@ class TestLeadBrake(unittest.TestCase):
     self.assertEqual(pl.lead_brake_need(self.GAP, 10.0, 5.0, -10.0), float("inf"))   # no room left
 
   def test_stop_need(self):
-    # a stopped car 60 m ahead, 6 m to keep: 100 / (2 * 54)
-    self.assertAlmostEqual(pl.lead_brake_stop_need(10.0, 60.0, 0.0, 1.5, 6.0), 100.0 / 108.0, places=3)
+    # a stopped car 60 m ahead, 6 m to keep: 54 m of room, aimed at STOP_LAND_V with STOP_LAND_M still to go
+    land = (100.0 - pl.STOP_LAND_V ** 2) / (2.0 * (54.0 - pl.STOP_LAND_M))
+    self.assertAlmostEqual(pl.lead_brake_stop_need(10.0, 60.0, 0.0, 1.5, 6.0), land, places=3)
+    self.assertGreater(land, 100.0 / 108.0)          # a little firmer than the even stop ...
+    self.assertLess(land, 100.0 / 108.0 * 1.1)       # ... by a few per cent from here
     # a car at 6 m/s braking at 2: it rolls another 9 m
-    self.assertAlmostEqual(pl.lead_brake_stop_need(10.0, 60.0, 6.0, 2.0, 6.0), 100.0 / 126.0, places=3)
+    self.assertAlmostEqual(pl.lead_brake_stop_need(10.0, 60.0, 6.0, 2.0, 6.0), (100.0 - pl.STOP_LAND_V ** 2) / (2.0 * (63.0 - pl.STOP_LAND_M)), places=3)
     self.assertEqual(pl.lead_brake_stop_need(10.0, 6.2, 0.0, 1.5, 6.0), float("inf"))
+
 
   def test_off_without_the_profile_value(self):
     self.assertIsNone(self._run(0.0, 14.0, 70.0, -14.0)[0])
@@ -294,6 +300,148 @@ class TestLeadBrake(unittest.TestCase):
         if out is not None:
           self.assertLessEqual(out, 0.0)
           self.assertGreaterEqual(out, -pl.LEAD_BRAKE_A_MAX)
+
+
+class TestSoftLanding(unittest.TestCase):
+  def test_landing_need(self):
+    # followed exactly, the need brings the car to STOP_LAND_V with STOP_LAND_M to go
+    v, room, dt = 15.0, 90.0, 0.01
+    while v > pl.STOP_LAND_V:
+      a = pl.landing_need(v, room)
+      v -= a * dt
+      room -= v * dt
+    self.assertAlmostEqual(room, pl.STOP_LAND_M, delta=0.3)
+    # inside the landing, and with no room for one: the even stop
+    self.assertAlmostEqual(pl.landing_need(2.0, 3.0), 4.0 / 6.0, places=6)
+    # arriving hot: never more than STOP_LAND_EXTRA over the even stop
+    self.assertAlmostEqual(pl.landing_need(8.0, 9.0), 64.0 / 18.0 + pl.STOP_LAND_EXTRA, places=6)
+    self.assertEqual(pl.landing_need(5.0, 0.4), float("inf"))
+
+  def test_gentle_stop_fits_the_landing(self):
+    # what the landing leaves (STOP_LAND_M at STOP_LAND_V) is what the gentle stop needs plus its margin
+    self.assertLessEqual(pl.gentle_stop_distance(pl.STOP_LAND_V) + pl.LAND_MARGIN_M, pl.STOP_LAND_M)
+    self.assertAlmostEqual(pl.gentle_stop_distance(1.0), 1.0 / (2 * pl.LAND_GOT_LO), places=6)
+
+  def test_floor_only_with_room_and_only_at_landing_speed(self):
+    self.assertEqual(pl.landing_floor(pl.STOP_LAND_V, pl.STOP_LAND_M), -pl.LAND_REQ_HI)
+    self.assertEqual(pl.landing_floor(1.0, 3.0), -pl.LAND_REQ_LO)
+    self.assertIsNone(pl.landing_floor(pl.STOP_LAND_V, pl.STOP_LAND_M - 1.5))     # not enough room: the planner's request stands
+    self.assertIsNone(pl.landing_floor(1.0, 1.5))
+    self.assertIsNone(pl.landing_floor(6.0, 60.0))                                # still too fast for the landing
+    # between the two requests the floor moves over without a step
+    lo, hi = pl.landing_floor(pl.LAND_LOW_V - 0.19, 9.0), pl.landing_floor(pl.LAND_LOW_V + 0.19, 9.0)
+    self.assertTrue(-pl.LAND_REQ_HI < hi < lo < -pl.LAND_REQ_LO)
+
+  def test_gentle_requests_stop_short_of_the_point(self):
+    # the car at the floor's request, braking as it is counted on to: stops LAND_MARGIN_M short or more
+    v, room, dt = pl.STOP_LAND_V, pl.STOP_LAND_M, 0.01
+    while v > 0.01:
+      floor = pl.landing_floor(v, room)
+      self.assertIsNotNone(floor)
+      got = pl.LAND_GOT_HI if -floor > 0.8 else pl.LAND_GOT_LO
+      v -= got * dt
+      room -= max(v, 0.0) * dt
+    self.assertGreaterEqual(room, pl.LAND_MARGIN_M - 0.3)
+
+
+class TestModelStop(unittest.TestCase):
+  A = 0.59   # the driver's lead_brake_a
+
+  def approach(self, ms, v=18.0, dist=160.0, seconds=6.0, lead=(False, 0.0, 0.0), start=None):
+    """The model planning to rest `dist` ahead of where the car is at the start; the car keeps its speed."""
+    out, s = [], 0.0
+    for _ in range(int(seconds / 0.05)):
+      s += v * 0.05
+      out.append(ms.update(self.A if start is None else start, v, 0.0, 1.0, dist - s, lead[0], lead[1], lead[2], 0.3))
+    return out
+
+  def test_lift_off_then_braking(self):
+    ms = pl.ModelStop(0.05)
+    out = self.approach(ms)
+    first = next(i for i, c in enumerate(out) if c is not None)
+    self.assertAlmostEqual(first * 0.05, pl.MODEL_STOP_ON_S, delta=0.1)
+    self.assertEqual(out[first], 0.0)                               # first: no more accelerating
+    brake = next(i for i, c in enumerate(out) if c is not None and c < -0.01)
+    self.assertGreaterEqual(brake * 0.05, pl.MODEL_STOP_BRAKE_S - 0.1)
+    steps = [out[i] - out[i + 1] for i in range(brake, len(out) - 1)]
+    self.assertLessEqual(max(steps), pl.MODEL_STOP_JERK * 0.05 + 1e-9)   # gradual
+    self.assertGreaterEqual(min(c for c in out if c is not None), -pl.MODEL_STOP_A_MAX)
+
+  def test_no_braking_while_the_stop_is_far(self):
+    ms = pl.ModelStop(0.05)
+    out = self.approach(ms, v=15.0, dist=600.0, seconds=3.0)       # needs 0.19: under the driver's start level
+    self.assertEqual({c for c in out if c is not None}, {0.0})
+
+  def test_plan_end_state_gives_the_stop_distance(self):
+    # 20 m/s now, 5 m/s after 150 m: an even 1.25 m/s^2, at rest after 160 m
+    self.assertAlmostEqual(pl.model_stop_distance(20.0, 5.0, 150.0, None), 160.0, places=3)
+    self.assertIsNone(pl.model_stop_distance(20.0, 12.0, 150.0, None))     # still over half the speed: no stop planned
+    self.assertIsNone(pl.model_stop_distance(30.0, 10.0, 250.0, None))     # ends above MODEL_STOP_END_V
+    self.assertEqual(pl.model_stop_distance(20.0, 12.0, 150.0, 70.0), 70.0)  # comes to rest inside the horizon
+
+  def test_a_moving_car_ahead_short_of_the_stop_point_governs(self):
+    ms = pl.ModelStop(0.05)
+    out = self.approach(ms, lead=(True, 40.0, 12.0))
+    self.assertEqual(set(out), {None, 0.0})                        # the lift-off, no braking: the car ahead governs that
+    self.assertFalse(ms.braking)
+    ms = pl.ModelStop(0.05)                                        # a standing car: the stop is real
+    self.assertTrue(any(c is not None and c < 0 for c in self.approach(ms, lead=(True, 150.0, 0.0))))
+
+  def test_plan_changes_its_mind(self):
+    ms = pl.ModelStop(0.05)
+    self.approach(ms, seconds=3.0)
+    self.assertTrue(ms.braking)
+    out = [ms.update(self.A, 17.0, 17.0, 170.0, None, False, 0.0, 0.0, -0.8) for _ in range(20)]
+    self.assertIsNone(out[int(pl.MODEL_STOP_OFF_S / 0.05) + 1])     # let go after MODEL_STOP_OFF_S
+    self.assertIsNotNone(out[0])                                    # but not on the first doubtful frame
+    self.assertFalse(ms.active)
+
+  def test_last_metres_and_low_speed_starts(self):
+    ms = pl.ModelStop(0.05)
+    self.assertEqual(set(self.approach(ms, v=6.0, dist=40.0)), {None})    # never starts below MODEL_STOP_START_V
+    ms = pl.ModelStop(0.05)
+    self.approach(ms, seconds=3.0)
+    self.assertIsNone(ms.update(self.A, 2.5, 0.0, 1.0, 5.0, False, 0.0, 0.0, -1.0))   # below MODEL_STOP_V_MIN: no ceiling ...
+    self.assertIsNotNone(ms.room_left())                                           # ... but the stop point is kept
+    ms.update(self.A, 0.1, 0.0, 1.0, 0.2, False, 0.0, 0.0, -1.0)
+    self.assertIsNone(ms.room_left())                                              # standing: done
+
+  def test_aims_short_of_the_stop_point(self):
+    # one frame, standing start of the rule: the room it brakes for is the way to the stop point less the margin
+    # (and less the way gone before a request is braking), so the car arrives short of the line, not on it
+    ms = pl.ModelStop(0.05)
+    left = 200.0
+    for _ in range(40):
+      left -= 15.0 * 0.05                                                    # a fixed place on the road, coming closer
+      ms.update(self.A, 15.0, 0.0, left, left, False, 0.0, 0.0, 0.0)
+    self.assertAlmostEqual(ms.room, left - pl.MODEL_STOP_LINE_MARGIN_M - 15.0 * pl.MODEL_STOP_LAG_S, delta=0.05)
+    self.assertGreaterEqual(pl.MODEL_STOP_LINE_MARGIN_M, 1.5)
+
+  def test_off_without_the_profile_value(self):
+    ms = pl.ModelStop(0.05)
+    self.assertEqual(set(self.approach(ms, start=0.0)), {None})
+
+  def test_recorded_red_light(self):
+    # 0000014c at 18:09: the plan's end speed was down to half 195 m out; the car began braking 2.5 s later at 1.0,
+    # rising to 2.4
+    with open(os.path.join(os.path.dirname(__file__), "data", "modelstop_0000014c_red_light.json")) as f:
+      rows = json.load(f)["rows"]
+    ms = pl.ModelStop(0.05)
+    end = rows[-1][6]
+    lift = brake = logged_brake = None
+    for t, v, plan, v_end, x_end, d_rest, odo in rows:
+      c = ms.update(self.A, v, v_end, x_end, d_rest, False, 0.0, 0.0, min(plan, 0.0))
+      if c is not None and lift is None:
+        lift = (t, end - odo)
+      if c is not None and c < -0.05 and brake is None:
+        brake = (t, end - odo, v, ms.need)
+      if plan < -0.4 and logged_brake is None:
+        logged_brake = (t, end - odo, v)
+    self.assertIsNotNone(brake)
+    self.assertGreater(lift[1], 185.0)                       # holds back from about 195 m out
+    self.assertGreater(brake[1], 175.0)                      # brakes from about 185 m; the drive did from 147 m
+    self.assertGreater(logged_brake[0] - brake[0], 1.5)      # 1.9 s before the drive did
+    self.assertLess(brake[3], 1.3)                           # (its stop point is some 12% short here: 1.2 where 1.0 would do)
 
 
 class TestLeadTakeOff(unittest.TestCase):

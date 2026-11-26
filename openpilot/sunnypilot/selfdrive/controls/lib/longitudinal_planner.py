@@ -115,6 +115,12 @@ class LongitudinalPlannerSP:
     self.lead_brake = profile_long.LeadBrake(DT_MDL)   # driver profile lead_brake_a: slowing toward a slower car closing fast
     self.lead_braking = False
     self.lead_brake_a_cap: float | None = None
+    self.model_stop = profile_long.ModelStop(DT_MDL)   # stopping where the driving model plans to, evenly
+    self.model_stop_a_cap: float | None = None
+    self.model_stopping = False
+    self.land_room: float | None = None                # m to the stop point the soft landing may count on, or None
+    self.land_v = 0.0
+    self.landing = False
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
 
@@ -278,11 +284,15 @@ class LongitudinalPlannerSP:
       if self.lead_brake.active != was:
         cloudlog.event("lead_brake", on=self.lead_brake.active, v=round(v_ego, 2), lead_d=round(lead.dRel, 1),
                        lead_v=round(lead.vLead, 2), lead_a=round(lead.aLeadK, 2), need=round(min(self.lead_brake.need, 9.9), 2))
+      self.update_model_stop(sm, v_ego, a_ego, lead, long_enabled and not long_override)
     else:
       self.lead_brake.reset()
       self.lead_brake_a_cap = None
       self.lead_braking = False
       self.follow_cap.v = None
+      self.model_stop.reset()
+      self.model_stop_a_cap = None
+      self.land_room = None
 
     # map turn assist armed for a signaled turn ahead (or turning): slow to the junction speed before it
     if self.openpilot_long:
@@ -378,14 +388,62 @@ class LongitudinalPlannerSP:
       tk.reset()
       return None
 
+  def update_model_stop(self, sm: messaging.SubMaster, v_ego: float, a_ego: float, lead, engaged: bool) -> None:
+    """The model-stop ceiling (profile_long.ModelStop) and the room the soft landing may count on, once a frame.
+    Any problem reading the model means neither."""
+    self.land_v = v_ego
+    self.land_room = None
+    try:
+      md = sm['modelV2']
+      vx, px = list(md.velocity.x), list(md.position.x)
+      if not engaged or len(vx) < 2 or len(vx) != len(px):
+        raise ValueError
+      d_rest = next((float(px[i]) for i in range(len(vx)) if vx[i] < 0.5), None)
+      ms = self.model_stop
+      was = (ms.active, ms.braking)
+      self.model_stop_a_cap = ms.update(self.profile.lead_brake_a, v_ego, float(vx[-1]), float(px[-1]), d_rest, lead.present,
+                                        lead.dRel, lead.vLead, a_ego)
+      if (ms.active, ms.braking) != was:
+        cloudlog.event("model_stop", on=ms.active, braking=ms.braking, v=round(v_ego, 2), room=round(ms.room, 1),
+                       need=round(min(ms.need, 9.9), 2), v_end=round(float(vx[-1]), 1), lead=bool(lead.present))
+      # the soft landing's stop point: the nearest of the standing car ahead and where the model plans to rest. A stop
+      # that Stop Sign Assist or Red Light Assist is making has its own stop point: no landing there.
+      held = (self.stop_sign is not None and self.stop_sign.is_active) or (self.red_light is not None and self.red_light.controls)
+      rooms = []
+      if lead.present and lead.vLead < profile_long.LAND_LEAD_STANDING_V:
+        rooms.append(lead.dRel - (profile_long.stop_gap(self.profile.stop_gap_m) or profile_long.STOP_DISTANCE))
+      if d_rest is not None:
+        rooms.append(d_rest)
+      if rooms and not held:
+        self.land_room = min(rooms)
+    except Exception:
+      self.model_stop.reset()
+      self.model_stop_a_cap = None
+      self.land_room = None
+
   def lead_brake_cap(self, a_target: float) -> float:
-    """a_target with the early slowdown for a car ahead (profile_long.LeadBrake) applied: only ever lower."""
-    cap = self.lead_brake_a_cap
-    self.lead_braking = cap is not None and cap < a_target
-    if not self.lead_braking:
-      return a_target
-    self.source = LongitudinalPlanSource.leadBrake
-    return float(cap)
+    """a_target with the early slowdowns applied (for a car ahead, profile_long.LeadBrake; for a stop the driving model
+    plans, profile_long.ModelStop): only ever lower. Then the soft landing (profile_long.landing_floor): on the last
+    metres to a known stop point a request firmer than the gentle one the car can deliver, but not an urgent one, is
+    replaced by the gentle one while that still stops short of the point."""
+    cap, source = self.lead_brake_a_cap, LongitudinalPlanSource.leadBrake
+    if self.model_stop_a_cap is not None and (cap is None or self.model_stop_a_cap < cap):
+      cap, source = self.model_stop_a_cap, LongitudinalPlanSource.modelStop
+    acting = cap is not None and cap < a_target
+    self.lead_braking = acting and source == LongitudinalPlanSource.leadBrake
+    self.model_stopping = acting and source == LongitudinalPlanSource.modelStop
+    if acting:
+      self.source = source
+      a_target = float(cap)
+    landing = False
+    if self.land_room is not None and profile_long.LAND_URGENT < a_target < 0.0 and not getattr(self, "fcw", False):
+      floor = profile_long.landing_floor(self.land_v, self.land_room)
+      if floor is not None and floor > a_target:
+        a_target, landing = floor, True
+    if landing != self.landing:
+      self.landing = landing
+      cloudlog.event("soft_landing", on=landing, v=round(self.land_v, 2), room=round(self.land_room or 0.0, 1), a=round(a_target, 2))
+    return a_target
 
   def lead_coast_cap(self, sm: messaging.SubMaster, v_ego: float) -> float:
     """The most acceleration the driver profile allows: none toward a slower lead inside the coasting gap, and the

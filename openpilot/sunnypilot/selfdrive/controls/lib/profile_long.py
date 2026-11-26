@@ -303,12 +303,76 @@ def lead_brake_need(follow_gap_s: float, v_ego: float, d_rel: float, v_rel: floa
   return closing * closing / (2.0 * room) if room > 0.5 else float("inf")
 
 
+# A stop that ends softly. An even stop brakes as hard in its last metre as in its first, and at low speed this car
+# brakes harder than it is asked (median braking by request and speed, 2,136 steady frames, drives 00000144-0000014c):
+#   asked        under 2 mph   2-3    3-4    4-5    5-6.5   6.5-8 mph
+#   0.15-0.45        0.63      0.60   0.43   0.60   0.69    0.63
+#   0.65-0.90        2.12      1.67    -     0.97   1.06    1.03
+#   0.90-1.20        2.66      2.03   1.74   1.37   1.34    1.40
+#   1.20-1.60        3.49      2.17   1.66   1.20   1.30    1.51
+#   1.60-2.20        3.89      3.42   3.18   2.99   2.58    1.90
+# So a request over 1.6 is a jolt from 6.5 mph down, and only 0.45 or less is delivered gently below 4 mph (the car
+# controller's SOFT_STOP_* eases the request there, but not when the planner asks 1.1 or more: a stop still needing
+# 1.5 at 5 mph goes through as asked and ends at 3-4 m/s^2; 13 of 13 such stops in 30 drives, 0000014c at 2:38 and
+# 18:09). A stop is therefore aimed at STOP_LAND_V with STOP_LAND_M still to go: the braking before that is a little
+# firmer (about 6% from 80 m, more close in, at most STOP_LAND_EXTRA more than the even stop), and what is left needs
+# about 0.8 at 6.5 mph and less after, which the car delivers as asked and the soft landing can finish.
+STOP_LAND_V = 2.9           # m/s (6.5 mph)
+STOP_LAND_M = 6.0           # m still to go at that speed (gentle_stop_distance(STOP_LAND_V) + LAND_MARGIN_M)
+STOP_LAND_EXTRA = 0.4       # m/s^2: the most the landing may add to the even stop (arriving too hot to land softly)
+# The landing itself. Arriving right is not enough: on the last metres the driving model asks about 1.4 times the
+# even braking (0000014c at 2:38: 1.74 asked at 6.6 mph with 1.28 needed, 1.49 at 4.2 mph with 0.98), which the car
+# then doubles. So while the stop point is known (the standing car ahead, or the model's stop point) and the gentle
+# braking below still stops the car LAND_MARGIN_M short of it, a firmer request is replaced by the gentle one
+# (landing_floor). Checked again every frame against the measured room: if the room is not there (the car ahead
+# rolled back, the estimate moved), or the planner asks LAND_URGENT or firmer, its request goes through untouched.
+LAND_LOW_V = 1.8            # m/s (4 mph): below, only 0.45 or less is delivered gently
+LAND_REQ_HI = 1.2           # m/s^2 asked between STOP_LAND_V and LAND_LOW_V (delivered ~1.3)
+LAND_REQ_LO = 0.45          # m/s^2 asked below LAND_LOW_V (delivered ~0.6)
+LAND_GOT_HI = 1.3           # m/s^2 counted on for LAND_REQ_HI
+LAND_GOT_LO = 0.55          # m/s^2 counted on for LAND_REQ_LO
+LAND_BLEND_V = 0.2          # m/s either side of LAND_LOW_V over which the request goes from one to the other
+LAND_MARGIN_M = 1.0         # m the gentle stop must end short of the stop point for it to replace the planner's
+LAND_URGENT = -2.2          # m/s^2: a planner asking this or firmer is not landing, it is braking for something
+LAND_LEAD_STANDING_V = 1.0  # m/s: a car ahead slower than this stands (its place is a stop point)
+
+
+def gentle_stop_distance(v_ego: float) -> float:
+  """Metres the gentle landing needs to stop from v_ego (counting on LAND_GOT_*)."""
+  low = min(v_ego, LAND_LOW_V)
+  d = low * low / (2.0 * LAND_GOT_LO)
+  if v_ego > LAND_LOW_V:
+    d += (v_ego * v_ego - LAND_LOW_V * LAND_LOW_V) / (2.0 * LAND_GOT_HI)
+  return d
+
+
+def landing_floor(v_ego: float, room: float) -> float | None:
+  """The gentle request (m/s^2, negative) that may stand in for a firmer one on the last metres to a stop point
+   metres ahead, or None when it may not: too fast for the landing yet, or not enough room for it."""
+  if v_ego > STOP_LAND_V + 0.3 or room < gentle_stop_distance(v_ego) + LAND_MARGIN_M:
+    return None
+  k = min(max((v_ego - (LAND_LOW_V - LAND_BLEND_V)) / (2.0 * LAND_BLEND_V), 0.0), 1.0)
+  return -(LAND_REQ_LO + (LAND_REQ_HI - LAND_REQ_LO) * k)
+
+
+def landing_need(v_ego: float, room: float) -> float:
+  """The even braking (m/s^2) over `room` metres to the stop point that leaves the car at STOP_LAND_V with
+  STOP_LAND_M to go; inside that, or with no room for it, the even stop. inf with no room left."""
+  if room <= 0.5:
+    return float("inf")
+  even = v_ego * v_ego / (2.0 * room)
+  if v_ego <= STOP_LAND_V or room <= STOP_LAND_M:
+    return even
+  land = (v_ego * v_ego - STOP_LAND_V * STOP_LAND_V) / (2.0 * max(room - STOP_LAND_M, 1e-3))
+  return min(land, even + STOP_LAND_EXTRA)
+
+
 def lead_brake_stop_need(v_ego: float, d_rel: float, v_lead: float, lead_decel: float, stop_gap_m: float,
                          lag_s: float = 0.0) -> float:
-  """The even braking (m/s^2) that stops stop_gap_m behind where a lead braking at lead_decel will stand, starting
-  lag_s from now; inf with no room left."""
+  """The braking (m/s^2) that stops stop_gap_m behind where a lead braking at lead_decel will stand, starting lag_s
+  from now, with a soft landing (landing_need); inf with no room left."""
   room = d_rel + v_lead * v_lead / (2.0 * max(lead_decel, 0.1)) - stop_gap_m - v_ego * lag_s
-  return v_ego * v_ego / (2.0 * room) if room > 0.5 else float("inf")
+  return landing_need(v_ego, room)
 
 
 class LeadBrake:
@@ -407,6 +471,127 @@ class LeadBrake:
     step = LEAD_BRAKE_JERK * self.dt
     self.out = max(want, prev - step) if want < prev else min(want, prev + step)
     return self.out
+
+
+# Stopping where the driving model plans to stop, evenly and from the moment it says so.
+# The model's 10 s plan shows a coming stop early: in 30 drives (9.4 h) its end speed fell to half the current speed
+# (or it came to rest inside the 10 s) before 85 of 94 stops from 18 mph or more, a median 2.9 s before the braking
+# that then happened, with the even braking needed at 0.88 m/s^2 instead of 1.28; and the stop distance it implies
+# was right within about 20% (median 0.97 of the real one). The braking itself came late and rising: Dynamic
+# Experimental Control hands the speed to the model only after a while, and the model's own request starts low
+# (0000014c at 18:09, a red light from 42 mph with no car ahead: the plan's end speed began falling 250 m out and
+# was at half 195 m out; braking began at 147 m at 1.0 and rose to 2.4, then 3.9 in the last second).
+# So: an acceleration ceiling from the model's own stop point. First no more accelerating (the lift-off), then, once
+# the stop needs the driver's own start-of-braking level, the braking of a soft-landing stop there (landing_need).
+# It only ever adds braking, and only above MODEL_STOP_V_MIN: the last metres stay with the model and the MPC.
+# With a car ahead that keeps moving and is nearer than that stop point, the car ahead governs the braking (the
+# driver's rule: follow it): 39 of the 49 times the plan said stop and the car then did not were behind a lead. The
+# lift-off stays (the plan still says stop), so a lead the camera drops and finds again does not switch the request
+# between holding back and pulling (0000014c at 2:25: four times in 2 s).
+MODEL_STOP_END_FRAC = 0.5       # the plan's speed at 10 s is at most this share of the current speed ...
+MODEL_STOP_END_V = 9.0          # m/s (20 mph) ... and at most this: a stop (or a crawl) is planned
+MODEL_STOP_START_V = 8.0        # m/s (18 mph): it starts only above this
+MODEL_STOP_V_MIN = 3.0          # m/s: below, the last metres are the model's and the MPC's
+MODEL_STOP_ON_S = 0.5           # s the plan must say so before the lift-off (no more accelerating)
+MODEL_STOP_BRAKE_S = 1.0        # s it must have said so before braking is added: of 91 times it would have acted in
+                                # 1.6 h of openpilot speed control, 87 were followed by a stop or a slowdown to under
+                                # half; the others were a plan that said stop for a second or three and then did not
+                                # (a light that changed, 00000144 at 3:03; a doubtful half second, 0000013a at 6:00)
+MODEL_STOP_OFF_S = 0.3          # s without it before letting go (a frame or two of doubt is not the end of it)
+MODEL_STOP_POINT_TAU_S = 0.6    # s: the stop point (a place on the road) is smoothed over this
+MODEL_STOP_LAG_S = 0.6          # s the car goes on before a request is braking
+MODEL_STOP_JERK = 1.0           # m/s^3: how fast the request builds and fades (the comfort rate)
+MODEL_STOP_A_MAX = 2.0          # m/s^2: never asks for more (firmer stops are the model's and the MPC's own)
+MODEL_STOP_LEAD_MOVING_V = 3.0  # m/s: a car ahead at least this fast is one that keeps moving
+MODEL_STOP_LEAD_MARGIN_M = 5.0  # m: the stop point must be this far short of such a car for this to act
+# The braking aims this far short of the model's stop point. Arriving too fast moves the model's own stop point forward,
+# past the line (0000014f 13.3 min, 00000150 2.3 min, 2026-11-25: the car stopped exactly where the plan ended, over
+# the line). Stopping a little short is the cheap error: the driver creeps up with a light press of the accelerator.
+MODEL_STOP_LINE_MARGIN_M = 2.0
+
+
+def model_stop_distance(v_ego: float, v_end: float, x_end: float, d_rest: float | None) -> float | None:
+  """Metres to where the model's plan comes to rest: d_rest when it does so inside its horizon, else the even
+  slowdown its end state (speed v_end after x_end metres) implies, carried on to rest. None: no stop planned."""
+  if d_rest is not None:
+    return max(d_rest, 0.0)
+  if v_ego < 0.5 or v_end > MODEL_STOP_END_V or v_end > MODEL_STOP_END_FRAC * v_ego or x_end <= 1.0:
+    return None
+  return x_end * v_ego * v_ego / (v_ego * v_ego - v_end * v_end)
+
+
+class ModelStop:
+  def __init__(self, dt: float):
+    self.dt = dt
+    self.active = False       # the plan says stop: no accelerating
+    self.braking = False      # ... and the stop needs braking now
+    self.on_s = 0.0
+    self.off_s = 0.0
+    self.s = 0.0              # our way since the first frame (m), to hold the stop point as a place
+    self.point: float | None = None
+    self.out: float | None = None
+    self.need = 0.0
+    self.room = 0.0
+
+  def reset(self) -> None:
+    self.active = self.braking = False
+    self.on_s = self.off_s = 0.0
+    self.point = None
+    self.out = None
+
+  def room_left(self) -> float | None:
+    """Metres to the stop point while one is held (the plan says stop), else None."""
+    return self.point - self.s if self.active and self.point is not None else None
+
+  def update(self, start_need: float, v_ego: float, v_end: float, x_end: float, d_rest: float | None,
+             lead_present: bool, d_lead: float, v_lead: float, a_now: float) -> float | None:
+    """The acceleration ceiling (m/s^2, <= 0) or None. start_need: the driver's lead_brake_a (0 or less: off);
+    v_end, x_end: the plan's speed and position at the end of its horizon; d_rest: where it comes to rest inside it."""
+    self.s += v_ego * self.dt
+    dist = model_stop_distance(v_ego, v_end, x_end, d_rest) if start_need >= 0.1 else None
+    # a moving car ahead, short of the stop point: it governs the braking (follow it); the lift-off stays
+    follow = (dist is not None and lead_present and v_lead >= MODEL_STOP_LEAD_MOVING_V
+              and d_lead < dist + MODEL_STOP_LEAD_MARGIN_M)
+    if start_need < 0.1 or v_ego < 0.3:
+      self.reset()
+      return None
+    if dist is None:
+      if not self.active:
+        self.on_s = 0.0
+      self.off_s += self.dt
+      if not self.active or self.off_s >= MODEL_STOP_OFF_S - 1e-6:
+        self.reset()
+        return None
+    else:
+      self.off_s = 0.0
+      point = self.s + dist
+      if self.point is None:
+        self.point = point
+      else:
+        self.point += (point - self.point) * min(1.0, self.dt / MODEL_STOP_POINT_TAU_S)
+      self.on_s += self.dt
+      if not self.active:
+        if v_ego < MODEL_STOP_START_V or self.on_s < MODEL_STOP_ON_S - 1e-6:
+          return None
+        self.active = True
+    if self.point is None:    # (cannot be: active implies a point)
+      return None
+    if v_ego < MODEL_STOP_V_MIN:   # the last metres: no ceiling, but the stop point is kept for the landing
+      self.out = None
+      return None
+    lag = MODEL_STOP_LAG_S
+    v_then = max(v_ego + min(a_now, 0.0) * lag, 0.0)
+    self.room = self.point - self.s - MODEL_STOP_LINE_MARGIN_M - (v_ego + v_then) / 2.0 * lag
+    self.need = landing_need(v_then, self.room)
+    if follow:
+      self.braking = False
+    elif self.need >= start_need and self.on_s >= MODEL_STOP_BRAKE_S - 1e-6:
+      self.braking = True
+    want = -min(self.need, MODEL_STOP_A_MAX) if self.braking else 0.0
+    prev = self.out if self.out is not None else min(a_now, 0.0)
+    step = MODEL_STOP_JERK * self.dt
+    self.out = max(want, prev - step) if want < prev else min(want, prev + step)
+    return min(self.out, 0.0)
 
 
 def lead_coast(lead_coast_s: float, v_ego: float, lead_present: bool, d_rel: float, v_rel: float) -> bool:

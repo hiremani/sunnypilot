@@ -316,6 +316,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     wetRoad @10;       # wet road: at most the posted limit (+0 wet, -5 mph heavy rain)
     leadBrake @11;     # driver profile: slowing evenly toward a slower car closing fast, from the driver's lead_brake_a
     redLight @12;      # Red Light Assist: lifting off and slowing for a red or amber light the car's camera reports
+    modelStop @13;     # stopping where the driving model plans to, evenly and from when it says so (profile_long.ModelStop)
   }
 
   struct WetRoad {
