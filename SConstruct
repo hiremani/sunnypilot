@@ -272,6 +272,7 @@ Export('messaging')
 
 # Build other submodules
 SConscript(['panda/SConscript'])
+SConscript(['opendbc_repo/SConscript'])   # native fast paths for card (CAN parser, Fisker SecOC candidates)
 
 # Build rednose library
 SConscript(['rednose_repo/rednose/SConscript'])
