@@ -86,6 +86,45 @@ class TestCenterLineKeeper(unittest.TestCase):
     self.assertEqual(keeper.shift, 0.0)
 
 
+class TestCenterLineKeeperModelFrames(unittest.TestCase):
+  """controlsd runs at 100 Hz, the model at 20: with a stamp the model is read once per model frame."""
+
+  def run_both(self, with_stamp: bool):
+    rng, keeper, out, reads = __import__("random").Random(4), ns.CenterLineKeeper(0.01), [], 0
+    real = ns.ModelView
+    def counting(md):
+      nonlocal reads
+      reads += 1
+      return real(md)
+    ns.ModelView = counting
+    try:
+      md, frame = model(), 0
+      for tick in range(1000):
+        if tick % 5 == 0:   # a new model frame
+          md, frame = model(left_line=rng.uniform(-2.0, -0.4), right_line=rng.uniform(1.0, 3.0), lp=rng.choice([0.9, 0.9, 0.1])), frame + 1
+        out.append(keeper.update(md, 8.0, False, tick % 97 == 0, True, stamp=frame if with_stamp else None))
+    finally:
+      ns.ModelView = real
+    return out, reads
+
+  def test_same_output_a_fifth_of_the_reads(self):
+    plain, reads_plain = self.run_both(False)
+    stamped, reads_stamped = self.run_both(True)
+    self.assertEqual(plain, stamped)
+    self.assertEqual(reads_plain, 1000)
+    self.assertEqual(reads_stamped, 200)
+    self.assertTrue(any(k > 0 for k in plain))
+
+  def test_new_frame_after_a_pause_is_read(self):
+    # the keeper is not called on every tick (a turn, steering off): the next call must not use an old frame
+    keeper = ns.CenterLineKeeper(0.01)
+    for _ in range(300):
+      keeper.update(model(left_line=-0.6, right_line=2.6), 8.0, False, False, True, stamp=1)
+    self.assertGreater(keeper.target, 0.0)
+    keeper.update(model(), 8.0, False, False, True, stamp=7)   # centered now
+    self.assertEqual(keeper.target, 0.0)
+
+
 class TestNarrowStreet(unittest.TestCase):
   def narrow_model(self, **kw):
     return model(**({"lp": 0.1, "rp": 0.1, "left_edge": -3.5, "right_edge": 4.0} | kw))

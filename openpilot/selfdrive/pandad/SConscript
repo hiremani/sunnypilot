@@ -1,4 +1,7 @@
-Import('env', 'arch', 'common', 'messaging')
+Import('env', 'envCython', 'arch', 'common', 'messaging', 'cereal')
+
+# native 'can' / 'sendcan' packing and unpacking for card (pandad_api_impl.py falls back to Python without it)
+envCython.Program('can_codec_pyx.so', 'can_codec_pyx.pyx', LIBS=envCython["LIBS"] + [cereal, 'capnp', 'kj'])
 
 if arch != "Darwin":
   libs = [common, messaging, 'pthread']

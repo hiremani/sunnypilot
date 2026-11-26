@@ -83,6 +83,8 @@ class SelfdriveD(CruiseHelper):
     self.calibrated_pose: Pose | None = None
     self.excessive_actuation_check = ExcessiveActuationCheck()
     self.excessive_actuation = self.params.get("Offroad_ExcessiveActuation") is not None
+    self.chestnut_loading = self.params.get_bool("ChestnutLoading")   # kept current by params_thread
+    self.chestnut_active = self.params.get("ChestnutActive")
     self.big_model_loading = False
     self.big_model_active = False
     self.big_model_failed = False
@@ -151,6 +153,8 @@ class SelfdriveD(CruiseHelper):
     self.events_prev = []
     self.logged_comm_issue = None
     self.not_running_prev = None
+    self._not_running: set[str] = set()
+    self._not_running_frame = -1
     self.experimental_mode = False
     self.personality = get_sanitize_int_param(
       "LongitudinalPersonality",
@@ -205,7 +209,9 @@ class SelfdriveD(CruiseHelper):
       self.events.add(EventName.joystickDebug)
       self.startup_event = None
 
-    loading = self.params.get_bool("ChestnutLoading")
+    # ChestnutLoading / ChestnutActive come from params_thread (every 0.1 s): reading the two files here was 200
+    # file reads a second on the control core
+    loading = self.chestnut_loading
     if self.big_model_loading and not loading:
       self.big_model_ready_t = time.monotonic()
       self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
@@ -213,7 +219,7 @@ class SelfdriveD(CruiseHelper):
     if self.big_model_loading:
       self.events.add(EventName.bigModelLoading)
 
-    big_active = self.params.get("ChestnutActive")
+    big_active = self.chestnut_active
     chestnut_present = self.sm['deviceState'].chestnutPresent
     model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2']
     big_failed = big_active is False or model_unavailable or (self.big_model_active and not chestnut_present)
@@ -431,7 +437,11 @@ class SelfdriveD(CruiseHelper):
     if self.big_model_active and big_failed:
       self.events.add(EventName.bigModelFailed)
 
-    not_running = {p.name for p in self.sm['managerState'].processes if not p.running and p.shouldBeRunning}
+    # managerState arrives twice a second: the list is walked when it does, not on every 10 ms tick
+    if self.sm.recv_frame['managerState'] != self._not_running_frame:
+      self._not_running = {p.name for p in self.sm['managerState'].processes if not p.running and p.shouldBeRunning}
+      self._not_running_frame = self.sm.recv_frame['managerState']
+    not_running = self._not_running
     if self.sm.recv_frame['managerState'] and len(not_running):
       if not_running != self.not_running_prev:
         cloudlog.event("process_not_running", not_running=not_running, error=True)
@@ -693,6 +703,8 @@ class SelfdriveD(CruiseHelper):
   def params_thread(self, evt):
     while not evt.is_set():
       self.is_metric = self.params.get_bool("IsMetric")
+      self.chestnut_loading = self.params.get_bool("ChestnutLoading")
+      self.chestnut_active = self.params.get("ChestnutActive")
       self.speed_limit_chime = (self.params.get("SpeedLimitMode", return_default=True) or 0) > 0
       self.narrow_street_assist = self.params.get_bool("NarrowStreetAssist")
       self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")

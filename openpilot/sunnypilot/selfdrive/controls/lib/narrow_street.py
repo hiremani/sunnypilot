@@ -104,10 +104,18 @@ class CenterLineKeeper:
     self.shift = 0.0          # m, applied (rate limited)
     self.target = 0.0         # m, wanted this frame
     self.active = False
+    self._mv: ModelView | None = None    # the model's numbers, read once per model frame (see update)
+    self._mv_stamp = None
 
-  def update(self, md, v_ego: float, left_blinker: bool, steering_pressed: bool, lat_active: bool) -> float:
-    """The curvature (1/m, positive = right) to add to the model's this tick."""
-    mv = ModelView(md)
+  def update(self, md, v_ego: float, left_blinker: bool, steering_pressed: bool, lat_active: bool, stamp=None) -> float:
+    """The curvature (1/m, positive = right) to add to the model's this tick.
+    stamp: something that changes with every new modelV2 (controlsd: sm.recv_frame['modelV2']). The model is read
+    only when it changes: controlsd runs at 100 Hz, the model at 20, and reading the lines and edges from the message
+    every tick was about a fifth of controlsd's work on the control core. None: read every call."""
+    if stamp is None or stamp != self._mv_stamp or self._mv is None:
+      self._mv = ModelView(md)
+      self._mv_stamp = stamp
+    mv = self._mv
     ok = (lat_active and V_KEEP_MIN <= v_ego <= V_KEEP_MAX and not left_blinker and not steering_pressed
           and abs(mv.curvature) < TURN_CURVATURE)
     self.target = keeper_target_shift(mv) if ok else 0.0

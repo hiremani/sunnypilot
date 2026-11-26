@@ -221,7 +221,8 @@ class Controls(ControlsExt):
       elif self.narrow_street_assist and CC.latActive:
         try:
           new_desired_curvature += self.center_line_keeper.update(model_v2, CS.vEgo, CS.leftBlinker,
-                                                                   CS.steeringPressed, CC.latActive)
+                                                                   CS.steeringPressed, CC.latActive,
+                                                                   stamp=self.sm.recv_frame['modelV2'])
         except Exception:
           cloudlog.exception("center line keeper failed")
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)

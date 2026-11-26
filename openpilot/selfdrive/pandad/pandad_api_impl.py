@@ -1,5 +1,16 @@
+import os
 import time
 from openpilot.cereal import log
+
+# Native packing / unpacking (can_codec_pyx, built by scons): the same results as the Python functions below, which
+# stay as the reference (*_py) and the fallback (module not built, OPENPILOT_NO_NATIVE_CAN=1, or an input the native
+# code does not handle). Unpacking was about a fifth of card's remaining work on the control core (2026-11-25).
+_native = None
+if not os.environ.get("OPENPILOT_NO_NATIVE_CAN"):
+  try:
+    from openpilot.selfdrive.pandad import can_codec_pyx as _native
+  except ImportError:
+    pass
 
 NO_TRAVERSAL_LIMIT = 2**64 - 1
 
@@ -26,7 +37,7 @@ def _get_writer_fields(schema):
   return _cached_writer_fields
 
 
-def can_list_to_can_capnp(can_msgs, msgtype='can', valid=True):
+def can_list_to_can_capnp_py(can_msgs, msgtype='can', valid=True, log_mono_time=None):
   """Convert list of CAN messages to Cap'n Proto serialized bytes.
 
   Args:
@@ -39,7 +50,7 @@ def can_list_to_can_capnp(can_msgs, msgtype='can', valid=True):
   """
   global _cached_writer_fields
 
-  dat = log.Event.new_message(valid=valid, logMonoTime=int(time.monotonic() * 1e9))
+  dat = log.Event.new_message(valid=valid, logMonoTime=int(time.monotonic() * 1e9) if log_mono_time is None else log_mono_time)
   can_data = dat.init(msgtype, len(can_msgs))
 
   # Cache schema fields on first call
@@ -57,7 +68,7 @@ def can_list_to_can_capnp(can_msgs, msgtype='can', valid=True):
   return dat.to_bytes()
 
 
-def can_capnp_to_list(strings, msgtype='can'):
+def can_capnp_to_list_py(strings, msgtype='can'):
   """Convert Cap'n Proto serialized bytes to list of CAN messages.
 
   Args:
@@ -86,3 +97,26 @@ def can_capnp_to_list(strings, msgtype='can'):
 
       result.append((event.logMonoTime, frame_list))
   return result
+
+
+def can_list_to_can_capnp(can_msgs, msgtype='can', valid=True):
+  if _native is not None and msgtype in ('can', 'sendcan') and type(valid) is bool:
+    now = int(time.monotonic() * 1e9)
+    out = _native.list_to_event(can_msgs, msgtype == 'sendcan', valid, now)
+    if out is not None:
+      return out
+    return can_list_to_can_capnp_py(can_msgs, msgtype, valid, now)
+  return can_list_to_can_capnp_py(can_msgs, msgtype, valid)
+
+
+def can_capnp_to_list(strings, msgtype='can'):
+  if _native is not None and msgtype in ('can', 'sendcan'):
+    sendcan = msgtype == 'sendcan'
+    result = []
+    for s in strings:
+      r = _native.event_to_list(s, sendcan) if type(s) is bytes else None
+      if r is None:
+        return can_capnp_to_list_py(strings, msgtype)
+      result.append(r)
+    return result
+  return can_capnp_to_list_py(strings, msgtype)
