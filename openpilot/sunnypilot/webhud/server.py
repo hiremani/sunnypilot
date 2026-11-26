@@ -425,6 +425,13 @@ class HudServer(ThreadingHTTPServer):
 NAV_TURN = NavTurnPublisher()
 
 
+def _private_peer(addr: str) -> bool:
+  try:
+    return ipaddress.ip_address(addr).is_private
+  except ValueError:
+    return False
+
+
 MAP_TILES = MapTiles()
 MAP_FEATURES = MapFeatures()
 MAP_PREFETCH = MapPrefetch(MAP_TILES, MAP_FEATURES)
@@ -723,6 +730,10 @@ class HudHandler(BaseHTTPRequestHandler):
     kind = data.get("type")
     if kind == "replay":
       replay_command(self.server.engine, data)
+    elif kind == "routeTurn":
+      # the head unit nav app's next turn, from OceanScape (navturn.py); a write, so from the local network only
+      if _private_peer(client.peer):
+        NAV_TURN.publish(data)
     elif kind == "ping":
       client.push(json.dumps({"type": "pong", "t": data.get("t")}))
 
