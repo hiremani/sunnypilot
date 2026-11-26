@@ -169,6 +169,29 @@ class TestServer(OpenpilotTestCase):
     assert self.request("PUT", "/api/params", {"LongitudinalPersonality": 7})[0] == 400
     assert self.request("PUT", "/api/params", {"DisableUpdates": True})[0] == 400
 
+  def test_map_assist_params(self):
+    # the HUD's assist switches (Settings -> Driving): the map assists and their shadow modes are editable
+    for key in ("StopSignAssist", "StopSignAssistShadow", "NarrowStreetAssist", "MapTurnAssist", "LaneTurnDesire",
+                "SpeedBumpAssist", "TrafficSignalCoast", "WetRoadAssist"):
+      status, body, _ = self.request("PUT", "/api/params", {key: True})
+      assert status == 200 and json.loads(body)[key] is True, key
+
+  def test_buildings_routes(self):
+    from openpilot.sunnypilot.webhud.buildings import MapBuildings
+    calls = []
+    def fetch(q):
+      calls.append(q)
+      return b'{"elements":[]}'
+    with tempfile.TemporaryDirectory() as d, mock.patch.object(webhud_server, "MAP_BUILDINGS", MapBuildings(d, fetch=fetch)):
+      status, body, res = self.request("GET", "/map/buildings/3752/-12198")
+      assert status == 200 and body == b'{"elements":[]}' and res.getheader("Content-Type").startswith("application/json")
+      assert self.request("GET", "/map/buildings/3752/-12198")[0] == 200 and len(calls) == 1   # from disk the second time
+      assert self.request("GET", "/map/buildings/oops/1")[0] == 404
+      webhud_server.MAP_BUILDINGS.allow_fetch = lambda: False   # the car moving: nothing new is fetched
+      assert self.request("GET", "/map/buildings/3753/-12198")[0] == 404 and len(calls) == 1
+    status, body, _ = self.request("GET", "/map/buildings/area")
+    assert status == 200 and "ready" in json.loads(body)
+
   def test_driver_profiles(self):
     from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile as dp
     with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"DRIVER_PROFILES_DIR": d}):

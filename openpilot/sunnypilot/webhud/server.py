@@ -51,6 +51,7 @@ from openpilot.sunnypilot.webhud.state import StreamBuilder, merge_ticks
 from openpilot.sunnypilot.webhud.video import VideoHub, VideoViewer
 from openpilot.sunnypilot.webhud.websocket import WebSocket, accept_key
 from openpilot.sunnypilot.webhud.maptiles import MapFeatures, MapPrefetch, MapTiles, parse_features_path, parse_tile_path
+from openpilot.sunnypilot.webhud.buildings import AreaDownload, MapBuildings, parse_path as parse_buildings_path
 
 VERSION = "1.0"
 LANDING = f"""sunnypilot web HUD bridge {VERSION}
@@ -94,6 +95,12 @@ PARAM_ALLOWLIST: dict[str, tuple[type, Callable[[int], bool] | None]] = {
   "WetRoadAssist": (bool, None),
   "FiskerStopTest": (int, lambda v: v in (0, 1, 2)),
   "WetRoadForce": (bool, None),
+  # map assists (stop_sign/, narrow_street.py, turn_planner.py) and their shadow mode, for the HUD's assist switches
+  "StopSignAssist": (bool, None),
+  "StopSignAssistShadow": (bool, None),
+  "NarrowStreetAssist": (bool, None),
+  "MapTurnAssist": (bool, None),
+  "LaneTurnDesire": (bool, None),   # MapTurnAssist steers through it
   # sunnypilot's e2e chimes while stopped and not engaged: the car ahead pulled away / the model sees the way clear
   "LeadDepartAlert": (bool, None),
   "GreenLightAlert": (bool, None),
@@ -411,6 +418,10 @@ class HudServer(ThreadingHTTPServer):
 MAP_TILES = MapTiles()
 MAP_FEATURES = MapFeatures()
 MAP_PREFETCH = MapPrefetch(MAP_TILES, MAP_FEATURES)
+# [buildings] the page's buildings (buildings.py), and the downloads around the car / for an area
+MAP_BUILDINGS = MapBuildings()
+MAP_PREFETCH.buildings = MAP_BUILDINGS
+BUILDINGS_AREA = AreaDownload(MAP_BUILDINGS)
 
 
 class HudHandler(BaseHTTPRequestHandler):
@@ -492,9 +503,17 @@ class HudHandler(BaseHTTPRequestHandler):
         return self._map_tile(path)
       if path.startswith("/map/features/") and method == "GET":
         return self._map_features(path)
+      if path == "/map/buildings/area":   # [buildings] POST {lat, lon, radius_km}: download an area's buildings; GET: progress
+        if method == "POST":
+          body = self._json_body()
+          return self._json(BUILDINGS_AREA.start(float(body["lat"]), float(body["lon"]), float(body.get("radius_km", 3))))
+        return self._json(BUILDINGS_AREA.status())
+      if path.startswith("/map/buildings/") and method == "GET":   # [buildings]
+        return self._map_buildings(path)
       if path == "/map/prefetch" and method == "POST":   # the page's position: download the map around it (maptiles.py MapPrefetch)
         body = self._json_body()
-        return self._json(MAP_PREFETCH.request(float(body["lat"]), float(body["lon"]), float(body.get("radius_km", 25))))
+        return self._json(MAP_PREFETCH.request(float(body["lat"]), float(body["lon"]), float(body.get("radius_km", 25)),
+                                               buildings_km=body.get("buildings_km")))
       if path == "/map/status" and method == "GET":
         return self._json(MAP_PREFETCH.status())
       route = ROUTES.get((method, path))
@@ -508,6 +527,16 @@ class HudHandler(BaseHTTPRequestHandler):
     except Exception as e:
       cloudlog.exception(f"webhud: {method} {path} failed")
       self._error(500, f"{type(e).__name__}: {e}")
+
+  # [buildings] a building cell's Overpass answer (buildings.py): fetched once (never while moving), then from disk
+  def _map_buildings(self, path: str) -> None:
+    cell = parse_buildings_path(unquote(path))
+    full = MAP_BUILDINGS.cell_path(*cell) if cell else None
+    if full is None:
+      return self._error(404, "no buildings for this cell")
+    with open(full, "rb") as f:
+      body = f.read()
+    self._send(200, body, "application/json", {"Cache-Control": "max-age=86400"})
 
   # the OSM road tiles the page's map matcher reads (maptiles.py): long-lived, so cached hard
   def _map_tile(self, path: str) -> None:
@@ -1185,6 +1214,7 @@ def main(argv: list[str] | None = None) -> None:
   if args.map_root:
     MAP_TILES.root = args.map_root
     MAP_FEATURES.root = os.path.join(os.path.dirname(os.path.abspath(args.map_root)), "features")   # beside the tiles' `offline`
+    MAP_BUILDINGS.root = os.path.join(os.path.dirname(os.path.abspath(args.map_root)), "buildings")
 
   try:
     os.nice(10)  # never compete with the driving stack
@@ -1193,6 +1223,7 @@ def main(argv: list[str] | None = None) -> None:
 
   params = open_params()
   engine = Engine(params, args.replay, args.demo)
+  MAP_BUILDINGS.allow_fetch = lambda: not engine.monitor.moving   # [buildings] no Overpass fetches while driving
   overrides_api = OverridesApi(params, engine.builder, engine.monitor)
 
   video = VideoHub(params)

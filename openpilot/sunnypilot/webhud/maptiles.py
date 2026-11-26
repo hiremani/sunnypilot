@@ -243,7 +243,8 @@ def parse_features_path(path: str) -> tuple[int, int]:
 # ---- prefetch ---------------------------------------------------------------------------------------------
 
 PREFETCH_MAX_KM = 200.0
-PREFETCH_PAUSE_S = 1.0     # between Overpass fetches: polite
+PREFETCH_PAUSE_S = 1.0
+BUILDINGS_KM = 2.0         # [buildings] default radius of the buildings downloaded around the car     # between Overpass fetches: polite
 
 
 def tiles_within(lat: float, lon: float, radius_m: float) -> list[tuple[int, int]]:
@@ -281,14 +282,22 @@ class MapPrefetch:
     self._status: dict = {"center": None, "radius_km": None, "tiles": 0, "roads_ready": 0, "features_ready": 0,
                           "busy": False, "errors": 0, "updated": 0}
     self._thread: threading.Thread | None = None
+    # [buildings] the buildings (buildings.py MapBuildings) within buildings_km, after the roads and features; the
+    # server sets it. A much smaller radius than the roads': a building cell is 1/25 of a feature cell's area.
+    self.buildings = None
+    self._buildings_km = BUILDINGS_KM
 
-  def request(self, lat: float, lon: float, radius_km: float) -> dict:
+  def request(self, lat: float, lon: float, radius_km: float, buildings_km: float | None = None) -> dict:
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
       raise ValueError("bad position")
     radius_km = float(radius_km)
     if not math.isfinite(radius_km):
       raise ValueError("bad radius")
     radius_km = max(0.0, min(PREFETCH_MAX_KM, radius_km))
+    if buildings_km is not None:   # [buildings]
+      b = float(buildings_km)
+      if math.isfinite(b):
+        self._buildings_km = max(0.0, b)
     with self._lock:
       self._want = (lat, lon, radius_km)
       self._status.update(center=[round(lat, 5), round(lon, 5)], radius_km=radius_km)
@@ -307,6 +316,9 @@ class MapPrefetch:
       st["tiles"] = len(tiles)
       st["roads_ready"] = sum(1 for t in tiles if os.path.isfile(os.path.join(self.tiles.root, *self._road(t))))
       st["features_ready"] = sum(1 for t in tiles if self.features.have_tile(*t))
+      if self.buildings is not None:   # [buildings]
+        st["buildings_km"] = min(self._buildings_km, want[2])
+        st["buildings"], st["buildings_ready"] = self.buildings.ready(want[0], want[1], st["buildings_km"])
     return st
 
   @staticmethod
@@ -341,6 +353,10 @@ class MapPrefetch:
               with self._lock:
                 self._status["errors"] += 1
             time.sleep(PREFETCH_PAUSE_S)
+        if self.buildings is not None and self._want == want:   # [buildings] then the buildings near the car
+          _, errors = self.buildings.prefetch(lat, lon, min(self._buildings_km, radius_km), keep_going=lambda w=want: self._want == w)
+          with self._lock:
+            self._status["errors"] += errors
       finally:
         with self._lock:
           self._status["busy"] = False
