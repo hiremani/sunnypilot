@@ -133,6 +133,11 @@ TAKEOFF_END_V = 13.4        # m/s (30 mph): moved off; the MPC follows from here
 TAKEOFF_LEAD_V = 0.5        # m/s: the lead is rolling (a standing lead reads within 0.02 of zero). Over 30 drives this
 TAKEOFF_ON_S = 0.2          # fired 58 times standing behind a car, the car really leaving in 54; waiting for the
                             # distance to open as well was 0.3 s later and no surer, the distance alone wrong half the time
+# ... or it is slower still but clearly pulling away. At 0.5 m/s alone the rule fired 0.75 s (median) after the lead
+# first moved, and the driver was on the accelerator 0.5-1.3 s after it (0000014f 31.4 min, 00000151 1.8 min,
+# 2026-11-25). A steady 0.3-0.4 m/s is a creep or vision's noise and still asks nothing.
+TAKEOFF_LEAD_EARLY_V = 0.3  # m/s
+TAKEOFF_LEAD_EARLY_A = 0.3  # m/s^2
 TAKEOFF_LEAD_FULL_V = 2.0   # m/s: the lead's speed from which the open gap counts in full (a standing car never pulls)
 TAKEOFF_MIN_D = 3.5         # m: never from closer than this
 TAKEOFF_GAP_M = 4.0         # m and s: the gap the driver keeps while moving off behind a car, 4 m + 1.3 s of our speed
@@ -196,7 +201,8 @@ class LeadTakeOff:
     room = d_rel - takeoff_gap(v_ego, follow_gap_s, stop_gap_m)
     faster = v_lead - v_ego
     if not self.active:
-      going = (v_ego < TAKEOFF_ARM_V and room > 0.0 and v_lead >= TAKEOFF_LEAD_V and faster > 0.0
+      rolling = v_lead >= TAKEOFF_LEAD_V or (v_lead >= TAKEOFF_LEAD_EARLY_V and a_lead >= TAKEOFF_LEAD_EARLY_A)
+      going = (v_ego < TAKEOFF_ARM_V and room > 0.0 and rolling and faster > 0.0
                and a_lead > TAKEOFF_LEAD_BRAKING)
       self.on_t = self.on_t + dt if going else 0.0
       if self.on_t < TAKEOFF_ON_S - 1e-6:
@@ -212,6 +218,46 @@ class LeadTakeOff:
     a = TAKEOFF_K_GAP * room * moving + TAKEOFF_K_V * faster + TAKEOFF_K_A * min(max(a_lead, 0.0), TAKEOFF_LEAD_A_MAX)
     a = min(a, a_max, TAKEOFF_A_MAX) * min(1.0, room / TAKEOFF_GAP_EASE_M)
     return a if a >= TAKEOFF_MIN_ACCEL else None
+
+
+# The car's own sign reader lowers the set speed by itself (ACC auto speed). When its reading is far under the map's
+# limit for the road, it is most likely a sign that does not apply (a school zone's conditional 25, a side road's
+# sign): 00000150 2.9 min on Blacow Road, 2026-11-25, the car read 25 where the map says 35 and the driver does 40;
+# the set speed went 40 -> 25 and the car braked at 1.2 m/s^2 for 6 s on an open road, and again 7 min later.
+SIGN_DROP_MIN = 4.0         # m/s (9 mph): a drop of the set speed at least this large in one step (a button step is 5 mph)
+SIGN_DROP_MATCH = 1.0       # m/s: ... to the sign reader's value
+SIGN_DROP_MAP_OVER = 4.4    # m/s (10 mph): ... with the map's limit at least this far above it
+SIGN_DROP_FRAMES = 10       # frames (0.5 s) the sign reader's value may arrive after the set speed changed
+
+
+class SignDropHold:
+  """The set speed to drive by. Normally the car's. After the car's sign reader dropped it far under the map's limit
+  (SIGN_DROP_*), the set speed from before the drop, at most the map's limit + SIGN_DROP_MAP_OVER, for as long as
+  the car's set speed stays where the sign put it and the map still says the road is that much faster. Any change of
+  the set speed (the driver's buttons, the next sign) ends it, and so does the map agreeing with the sign."""
+
+  def __init__(self):
+    self.prev: float | None = None
+    self.held: float | None = None
+    self.dropped_to = 0.0
+    self.before = 0.0         # the set speed before a large drop ...
+    self.pending = 0          # ... and the frames left for the sign reader's value to show it was its doing
+
+  def update(self, v_set: float, sign: float, map_limit: float) -> float:
+    if self.held is not None:
+      if abs(v_set - self.dropped_to) > 0.3 or map_limit - v_set < SIGN_DROP_MAP_OVER:
+        self.held = None
+    else:
+      if self.prev is not None and self.prev - v_set >= SIGN_DROP_MIN:
+        self.before, self.dropped_to, self.pending = self.prev, v_set, SIGN_DROP_FRAMES
+      elif self.pending and abs(v_set - self.dropped_to) > 0.3:
+        self.pending = 0
+      if self.pending:
+        self.pending -= 1
+        if sign > 0.0 and abs(v_set - sign) <= SIGN_DROP_MATCH and map_limit - v_set >= SIGN_DROP_MAP_OVER:
+          self.held, self.pending = min(self.before, map_limit + SIGN_DROP_MAP_OVER), 0
+    self.prev = v_set
+    return max(v_set, self.held) if self.held is not None else v_set
 
 
 class LeadFollowCap:

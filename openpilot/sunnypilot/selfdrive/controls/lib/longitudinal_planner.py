@@ -116,6 +116,7 @@ class LongitudinalPlannerSP:
     self.lead_braking = False
     self.lead_brake_a_cap: float | None = None
     self.model_stop = profile_long.ModelStop(DT_MDL)   # stopping where the driving model plans to, evenly
+    self.sign_hold = profile_long.SignDropHold()       # a sign reading far under the map's limit does not lower the set speed
     self.model_stop_a_cap: float | None = None
     self.model_stopping = False
     self.land_room: float | None = None                # m to the stop point the soft landing may count on, or None
@@ -141,6 +142,18 @@ class LongitudinalPlannerSP:
 
     long_enabled = sm['carControl'].enabled
     long_override = sm['carControl'].cruiseControl.override
+
+    if self.openpilot_long:
+      try:   # the car's sign reader dropped the set speed far under the map's limit: drive by the one before
+        md = sm['liveMapDataSP']
+        was = self.sign_hold.held
+        v_set = v_cruise
+        v_cruise = self.sign_hold.update(v_set, float(sm['carStateSP'].speedLimit), float(md.speedLimit) if md.speedLimitValid else 0.0)
+        if (self.sign_hold.held is None) != (was is None):
+          cloudlog.event("sign_drop_hold", on=self.sign_hold.held is not None, set=round(v_set, 2), drive_by=round(v_cruise, 2),
+                         sign=round(float(sm['carStateSP'].speedLimit), 2), map=round(float(md.speedLimit), 2))
+      except Exception:
+        self.sign_hold = profile_long.SignDropHold()
 
     # Smart Cruise Control
     self.scc.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise)

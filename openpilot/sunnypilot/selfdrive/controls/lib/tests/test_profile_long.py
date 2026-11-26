@@ -444,6 +444,51 @@ class TestModelStop(unittest.TestCase):
     self.assertLess(brake[3], 1.3)                           # (its stop point is some 12% short here: 1.2 where 1.0 would do)
 
 
+class TestSignDropHold(unittest.TestCase):
+  MPH = 0.44704
+
+  def test_route_00000150_blacow_road(self):
+    # set 40, the car reads 25, the map says 35: drive on by 40 (at most the map's 35 + 10)
+    h = pl.SignDropHold()
+    self.assertAlmostEqual(h.update(40 * self.MPH, 40 * self.MPH, 35 * self.MPH), 40 * self.MPH)
+    for _ in range(100):
+      self.assertAlmostEqual(h.update(25 * self.MPH, 25 * self.MPH, 35 * self.MPH), 40 * self.MPH)
+    self.assertAlmostEqual(h.update(25 * self.MPH, 0.0, 35 * self.MPH), 40 * self.MPH)       # the reading gone: still held
+    self.assertAlmostEqual(h.update(30 * self.MPH, 25 * self.MPH, 35 * self.MPH), 30 * self.MPH)   # the driver's button: theirs
+    self.assertAlmostEqual(h.update(25 * self.MPH, 25 * self.MPH, 35 * self.MPH), 25 * self.MPH)   # a 5 mph step is not a sign drop
+
+  def test_the_reading_may_arrive_a_few_frames_after_the_set_speed(self):
+    h = pl.SignDropHold()
+    h.update(40 * self.MPH, 40 * self.MPH, 35 * self.MPH)
+    self.assertAlmostEqual(h.update(25 * self.MPH, 40 * self.MPH, 35 * self.MPH), 25 * self.MPH)   # not yet known why
+    self.assertAlmostEqual(h.update(25 * self.MPH, 25 * self.MPH, 35 * self.MPH), 40 * self.MPH)   # the sign reader's
+    h = pl.SignDropHold()
+    h.update(40 * self.MPH, 40 * self.MPH, 35 * self.MPH)
+    for _ in range(pl.SIGN_DROP_FRAMES + 1):
+      h.update(25 * self.MPH, 40 * self.MPH, 35 * self.MPH)
+    self.assertAlmostEqual(h.update(25 * self.MPH, 25 * self.MPH, 35 * self.MPH), 25 * self.MPH)   # too late to be the cause
+
+  def test_never_above_the_maps_limit_plus_ten(self):
+    h = pl.SignDropHold()
+    h.update(60 * self.MPH, 60 * self.MPH, 40 * self.MPH)
+    self.assertAlmostEqual(h.update(25 * self.MPH, 25 * self.MPH, 40 * self.MPH), 40 * self.MPH + pl.SIGN_DROP_MAP_OVER)
+
+  def test_the_map_agreeing_or_absent_means_the_sign_stands(self):
+    for map_limit in (25 * self.MPH, 30 * self.MPH, 0.0):
+      h = pl.SignDropHold()
+      h.update(40 * self.MPH, 40 * self.MPH, map_limit)
+      self.assertAlmostEqual(h.update(25 * self.MPH, 25 * self.MPH, map_limit), 25 * self.MPH)
+    h = pl.SignDropHold()                       # held, then the map's limit comes down to the sign: over
+    h.update(40 * self.MPH, 40 * self.MPH, 35 * self.MPH)
+    h.update(25 * self.MPH, 25 * self.MPH, 35 * self.MPH)
+    self.assertAlmostEqual(h.update(25 * self.MPH, 25 * self.MPH, 25 * self.MPH), 25 * self.MPH)
+
+  def test_a_drop_that_is_not_the_sign_readers(self):
+    h = pl.SignDropHold()                       # the driver set 25 themselves while the car reads 40
+    h.update(40 * self.MPH, 40 * self.MPH, 35 * self.MPH)
+    self.assertAlmostEqual(h.update(25 * self.MPH, 40 * self.MPH, 35 * self.MPH), 25 * self.MPH)
+
+
 class TestLeadTakeOff(unittest.TestCase):
   DT = 0.05
   GAP = 1.69   # the driver's following gap (s)
@@ -492,6 +537,12 @@ class TestLeadTakeOff(unittest.TestCase):
     self.assertLess(first, 1.8)                     # 0.2 s after it reads 0.5 m/s
     self.assertGreater(out[int(2.5 / self.DT)], 0.8)
     self.assertLessEqual(max(a for a in out if a is not None), pl.TAKEOFF_A_MAX)
+
+  def test_a_slow_lead_clearly_pulling_away_starts_it_sooner(self):
+    # 0000014f 31.4 min: the car ahead at 0.45 m/s and gaining 0.55 m/s^2, the driver already on the accelerator
+    self.assertTrue(any(a is not None for a in self._run([(7.0, 0.35, 0.6)] * 10)))
+    self.assertTrue(all(a is None for a in self._run([(7.0, 0.35, 0.0)] * 60)))         # the same speed held: a creep
+    self.assertTrue(all(a is None for a in self._run([(7.0, 0.2, 0.6)] * 60)))          # too slow to tell yet
 
   def test_a_creeping_or_braking_lead_and_a_close_one(self):
     self.assertTrue(all(a is None for a in self._run([(7.0, 0.4, 0.0)] * 60)))          # creeping under the threshold
