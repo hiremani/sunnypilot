@@ -26,7 +26,7 @@ from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
 from openpilot.sunnypilot.selfdrive.controls.lib import driver_profile
 from openpilot.sunnypilot.selfdrive.controls.lib import junction_memory
 from openpilot.sunnypilot.selfdrive.controls.lib import stop_test
-from openpilot.sunnypilot.selfdrive.controls.lib.turn_planner import TurnPlanner, apply_profile as apply_turn_profile
+from openpilot.sunnypilot.selfdrive.controls.lib.turn_planner import TurnPlanner, apply_profile as apply_turn_profile, kerb_room_from_model
 from openpilot.sunnypilot.selfdrive.controls.lib import wet_road
 from openpilot.sunnypilot.selfdrive.controls.lib.narrow_street import PARAM as NARROW_PARAM, CenterLineKeeper
 from openpilot.common.gps import get_gps_location_service
@@ -93,7 +93,7 @@ class Controls(ControlsExt):
 
     self.LaC = ControlsExt.initialize_lateral_control(self, self.LaC, self.CI, DT_CTRL)
 
-  def update_map_turn(self, CS, CC, model_curvature: float | None = None) -> float | None:
+  def update_map_turn(self, CS, CC, model_curvature: float | None = None, model_v2=None) -> float | None:
     """The map turn planner's curvature (1/m, positive turns right, as desiredCurvature) or None. Any failure means no
     turn: the model keeps steering."""
     if self._turn_param_frame % 100 == 0:
@@ -132,9 +132,13 @@ class Controls(ControlsExt):
     if not self.map_turn_wet_ok and self.turn_planner.state == "idle":
       return None   # heavy rain: no new turns (one already under way is finished, never dropped halfway)
     try:
+      kerb_room = None   # read only while one blinker is on (the far approach's kerb-lane check), not every tick
+      if model_v2 is not None and CS.leftBlinker != CS.rightBlinker:
+        kerb_room = kerb_room_from_model(model_v2, CS.leftBlinker)
       self.map_turn_curvature = self.turn_planner.update(DT_CTRL, CS.vEgo, CS.yawRate, CS.leftBlinker, CS.rightBlinker,
                                                          CC.latActive, CS.steeringPressed, self.sm[self.gps_service],
-                                                         CS.steeringTorque, model_curvature=model_curvature)
+                                                         CS.steeringTorque, model_curvature=model_curvature,
+                                                         kerb_room=kerb_room)
     except Exception:
       cloudlog.exception("map turn planner failed")
       self.map_turn_curvature = None
@@ -215,7 +219,7 @@ class Controls(ControlsExt):
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
-      turn_curvature = self.update_map_turn(CS, CC, model_v2.action.desiredCurvature)
+      turn_curvature = self.update_map_turn(CS, CC, model_v2.action.desiredCurvature, model_v2)
       if turn_curvature is not None and CC.latActive:
         new_desired_curvature = turn_curvature
       elif self.narrow_street_assist and CC.latActive:

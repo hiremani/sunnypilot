@@ -453,8 +453,9 @@ struct CarControlSP @0xa5cd762cd951a455 {
 
   struct MapTurn {
     # the map turn planner (controlsd) for the longitudinal planner (plannerd): slow down before a signaled turn
-    state @0 :UInt8;               # 0 idle, 1 armed (a junction ahead on the blinker side), 2 turning
-    junctionDistance @1 :Float32;  # m along the road to the junction while armed
+    state @0 :UInt8;               # 0 idle, 1 armed (a junction ahead on the blinker side), 2 turning,
+                                   # 3 far approach (that junction seen from road speed: speed only, not armed)
+    junctionDistance @1 :Float32;  # m along the road to the junction while armed or on the far approach
   }
 
   struct Param {

@@ -14,6 +14,7 @@ From fisker_drive_style samples (10 Hz):
   lane_change_delays   s from the blinker to the driver starting the lane change
   cruise_accels        (v, m/s^2) speeding up on open road, no car close ahead
   turn_in_rates        (turn deg, wheel deg/s) winding the wheel into a junction turn
+  turn_approaches      (mph where the wheel goes in, m/s^2 slowing down to it) for rolling turns made without the blinker
   rolling_share        share of slow-downs to a crawl that were not full stops (measured only)
 From rlogs:
   bump_crossings       mph the driver crossed mapped speed bumps at (Speed Bump Assist's shadow log)
@@ -42,6 +43,11 @@ LC_WHEEL_DEG = 1.5           # deg of wheel toward the blinker side: the lane ch
 LC_MAX_S = 6.0
 ACCEL_MIN = 0.1              # m/s^2: speeding up
 TURN_IN_LO, TURN_IN_HI = 0.2, 0.8
+APPROACH_WHEEL_DEG = 45.0    # deg of wheel toward the turn: the wheel has gone in
+APPROACH_BACK_M = 200.0      # the slow-down is looked for this far before that
+APPROACH_MIN_M = 15.0        # ...and counts when it is at least this long
+APPROACH_MIN_DV = 2.0        # ...and this much slower at the end (m/s)
+APPROACH_ROLLING_V = 1.0     # m/s: slower than this on the way in is a stop, not a rolling turn
 
 
 def _cruise_free(S, i, back_s=20.0):
@@ -147,6 +153,41 @@ def turn_in_rates(S: list) -> list[tuple[float, float]]:
     if lo is None or hi is None or seg[hi].t <= seg[lo].t:
       continue
     out.append((float(t["deg"]), (TURN_IN_HI - TURN_IN_LO) * peak / (seg[hi].t - seg[lo].t)))
+  return out
+
+
+def turn_approaches(S: list) -> list[tuple[float, float]]:
+  """For rolling junction turns the driver made WITHOUT the blinker (the reference: the turn assist never had the wheel)
+  at their own speed (the car's cruise off): (mph where the wheel passes APPROACH_WHEEL_DEG, the average m/s^2 from the
+  last fastest point in the APPROACH_BACK_M before it down to that speed)."""
+  out = []
+  for t in fds.turns(S):
+    if t["kind"] != "junction" or t["driver_steered_pct"] <= 50 or t["blinker_lead_s"] is not None:
+      continue
+    sign = 1.0 if t["side"] == "left" else -1.0
+    ks = [k for k, x in enumerate(S) if t["t"] - 40 <= x.t <= t["t"] + 15]
+    if len(ks) < 20:
+      continue
+    k_pk = max((k for k in ks if S[k].t >= t["t"] - 8), key=lambda k: S[k].steer_deg * sign, default=None)
+    if k_pk is None or S[k_pk].steer_deg * sign < 90.0:
+      continue
+    k_in = next((k for k in range(k_pk, ks[0], -1) if S[k].steer_deg * sign < APPROACH_WHEEL_DEG), None)
+    if k_in is None:
+      continue
+    # back along the road to APPROACH_BACK_M before the wheel went in
+    d, k, k_fast, d_fast = 0.0, k_in, k_in, 0.0
+    while k > ks[0] and d < APPROACH_BACK_M:
+      d += S[k - 1].v * (S[k].t - S[k - 1].t)
+      k -= 1
+      if S[k].v > S[k_fast].v:
+        k_fast, d_fast = k, d
+    app = S[k_fast:k_in + 1]
+    if any(x.cruise for x in app) or min(x.v for x in app) < APPROACH_ROLLING_V:
+      continue
+    v0, v1 = S[k_fast].v, S[k_in].v
+    if d_fast < APPROACH_MIN_M or v0 - v1 < APPROACH_MIN_DV:
+      continue
+    out.append((v1 * MPH, (v0 * v0 - v1 * v1) / (2.0 * d_fast)))
   return out
 
 

@@ -103,6 +103,7 @@ class LongitudinalPlannerSP:
     self.profile_speed_on = False
     self.speed_cap = profile_long.ProfileSpeedCap()   # the driverSpeed target: coasts down, keeps the driver's choice
     self.turn_exit_left = 0.0     # s left of the pull-away window after a junction turn
+    self.turn_approach = profile_long.TurnApproach()   # the slow-down before a signaled turn: one rate per approach
     self.narrow_speed = narrow_street.NARROW_SPEED
     self.lead_coasting = False
     self.follow_cap = profile_long.LeadFollowCap()     # following a car: up to the limit + 10 mph
@@ -316,16 +317,28 @@ class LongitudinalPlannerSP:
         state, dist = 0, 0.0
       v_turn = self.profile.junction_turn_mph * CV.MPH_TO_MS if self.profile_on else profile_long.V_TURN_DEFAULT
       v_turn_target = None
-      if state == 1:
-        v_turn_target = profile_long.junction_approach_v(dist, v_turn, v_ego)
-      elif state == 2:
+      a_turn = profile_long.JUNCTION_ACCEL
+      if state in (1, 3):   # armed, or the junction seen from road speed (the far approach): the same slow-down
+        # the driver's own speed where the wheel goes in and how they slow down to it (the profile; else as before)
+        v_in = max(self.profile.turn_in_mph * CV.MPH_TO_MS, v_turn) if self.profile_on and self.profile.turn_in_mph > 0.0 else v_turn
+        decel = self.profile.turn_approach_decel if self.profile_on and self.profile.turn_approach_decel > 0.0 else -profile_long.JUNCTION_ACCEL
+        v_turn_target = self.turn_approach.update(dist, v_in, v_ego, decel)
+        a_turn = -self.turn_approach.decel
+        if self.turn_approach.started:
+          cloudlog.event("junction_approach", state=state, dist=round(dist, 1), v=round(v_ego, 2), v_in=round(v_in, 2),
+                         decel=round(self.turn_approach.decel, 2))
+      else:
+        self.turn_approach.reset()
+      if state == 2:
         v_turn_target = profile_long.junction_speed(v_turn, self.profile.junction_lat_accel if self.profile_on else 0.0,
                                                     sm['controlsState'].curvature)
         self.turn_exit_left = profile_long.TURN_EXIT_S   # the driver profile's pull-away after the turn
       if v_turn_target is not None:
         prev = targets.get(LongitudinalPlanSource.junctionTurn, (float('inf'), a_ego))
         if v_turn_target < prev[0]:
-          targets[LongitudinalPlanSource.junctionTurn] = (v_turn_target, profile_long.JUNCTION_ACCEL if v_ego > v_turn_target else a_ego)
+          targets[LongitudinalPlanSource.junctionTurn] = (v_turn_target, a_turn if v_ego > v_turn_target else a_ego)
+    else:
+      self.turn_approach.reset()
 
     # wet road: cruise no faster than the posted limit + the level's offset
     wet_offset = self.wet.speed_offset_mph()

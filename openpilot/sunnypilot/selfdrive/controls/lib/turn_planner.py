@@ -53,6 +53,24 @@ JUNCTION_LOOKAHEAD_MAX_M = 100.0  # ...up to this. The driver signals 60-80 m (7
 # the street 5-18 m ahead at 20 mph three times; the driver turned at the next one, 60-80 m on.
 APPROACH_SKIP_DECEL = 1.5       # m/s^2: firmer than anyone slows for a turn
 V_TURN_DEFAULT = 4.5            # m/s (10 mph): the turn speed when the driver profile gives none
+
+# ---- slowing down early for a signaled turn (speed only: nothing here steers) ----
+# Above V_ARM_APPROACH the planner is not armed, so nothing told the speed control about the turn: 0000014c-00000151
+# (2026-11-25), 39 signaled junction turns, openpilot slowed the car in 4; the others were signaled at 31-47 mph (Blacow
+# Rd, 00000151 at 9.5 min: right blinker 146 m before at 35 mph, green light, the car held 35 mph and the driver braked
+# from 70 m). The far approach finds the junction on the blinker side from road speed and gives the longitudinal planner
+# its distance (approach() state 3). It never arms or steers: below V_ARM_APPROACH the planner arms as before.
+# A blinker at road speed is as often a lane change. 112 drives, blinkers switched on above 25 mph: with a junction turn
+# following, the road edge on that side was within 4.65 m of the car's centre in 90% of 98 right turns (the kerb lane);
+# with no turn following (160 right blinkers), in 10%. So: only with the road edge on the blinker side that close in
+# the first second of the blinker, and decided once per blinker (after a lane change into the kerb lane the edge is
+# close too). Left turns are mostly made from a lane with room on the left, so few of them qualify.
+APPROACH_LOOKAHEAD_S = 12.0     # the far approach looks this many seconds ahead...
+APPROACH_LOOKAHEAD_MAX_M = 250.0  # ...up to this (45 mph down to a turn at the driver's own 0.6-0.8 m/s^2: 190-220 m)
+KERB_ROOM_MAX_M = 4.6           # m from the car's centre to the road edge on the blinker side: the kerb lane
+KERB_STD_MAX = 1.0              # m: a road edge less certain than this is not used (then no far approach)
+KERB_LATCH_S = 1.0              # s after the blinker comes on: the decision is made from the room over this time
+KERB_MIN_SAMPLES = 10           # ...with at least this many readings (the model runs at 20 Hz)
 DONE_FRACTION = 0.75            # a turn released (too fast, blinker) this far through counts as done
 
 # ---- the lane the turn ends in ----
@@ -204,6 +222,18 @@ def apply_profile(tuning: "TurnTuning", profile) -> None:
   tuning.v_arm_max = profile.turn_arm_mph * mph
   tuning.path_in = profile.turn_path_in
   tuning.path_out = profile.turn_path_out
+
+
+def kerb_room_from_model(model_v2, left: bool) -> float | None:
+  """m from the car's centre to the road edge on that side at the car, from modelV2; None when the model is unsure of it
+  (KERB_STD_MAX) or anything is missing."""
+  try:
+    i = 0 if left else 1
+    if model_v2.roadEdgeStds[i] > KERB_STD_MAX:
+      return None
+    return abs(float(model_v2.roadEdges[i].y[0]))
+  except Exception:
+    return None
 
 
 def _wrap(a: float) -> float:
@@ -711,6 +741,17 @@ class TurnPlanner:
     self._turn_side = ""                 # the blinker side _side_turned counts for
     self._prefer_way: int | None = None
     self.pos: tuple[float, float] | None = None   # car position in the current roads' frame at the last fix
+    # the far approach (speed only): the junction ahead on the blinker side found from road speed
+    self.far: Junction | None = None
+    self.far_side = ""
+    self.far_dist = 0.0
+    self._far_xy = (0.0, 0.0)
+    self._far_roads: LocalRoads | None = None
+    self._far_done = False               # this blinker's far approach is over: none again until the blinker goes off
+    self._kerb_side = ""                 # the blinker side the kerb-lane decision is for
+    self._kerb_t = 0.0
+    self._kerb_rooms: list[float] = []
+    self._kerb_ok: bool | None = None    # None: not decided yet
     # what the planner did goes to the log ("map_turn" on every state change, "map_turn_tick" while armed or turning),
     # so an incident is a log lookup, not a replay. log_event(name, **fields); None: cloudlog.event
     self.log_event = None
@@ -779,7 +820,7 @@ class TurnPlanner:
 
   def update(self, dt: float, v_ego: float, yaw_rate: float, left_blinker: bool, right_blinker: bool, lat_active: bool,
              steering_pressed: bool, gps, steering_torque: float = 0.0,
-             model_curvature: float | None = None) -> float | None:
+             model_curvature: float | None = None, kerb_room: float | None = None) -> float | None:
     """
     dt: s since the last call. v_ego: m/s. yaw_rate: carState.yawRate, rad/s, positive = left.
     left_blinker / right_blinker: carState (held through the flash). lat_active: carControl.latActive.
@@ -787,6 +828,8 @@ class TurnPlanner:
     (latitude, longitude, bearingDeg, speed, hasFix, horizontalAccuracy, unixTimestampMillis) or None.
     model_curvature: the driving model's desired curvature this tick (1/m, positive = RIGHT); the end of the turn blends
     into it (BLEND_DEG). None: the end only tapers.
+    kerb_room: m from the car's centre to the road edge on the blinker side as the driving model sees it now
+    (kerb_room_from_model); None: not seen, or not given - then nothing slows the car for a turn from road speed.
     Returns the curvature to command (1/m, positive = RIGHT) while turning, None otherwise.
     """
     self._k_meas = -yaw_rate / max(v_ego, 0.5)   # the car's own curvature now (positive = right)
@@ -821,16 +864,88 @@ class TurnPlanner:
       out = None
       if self.state == IDLE and side and lat_active and v_ego <= V_ARM_APPROACH and new_fix and self.heading is not None:
         self._try_arm(side, v_ego, gps)
+    try:   # speed only: a problem here must never take a turn under way down with it
+      self._update_far(dt, v_ego, side, gps, new_fix, kerb_room)
+    except Exception:
+      self.far, self.far_side, self._far_roads, self._far_done = None, "", None, True
     self._fill_log()
     self._emit_log(dt, v_ego, left_blinker, right_blinker, lat_active, steering_pressed, steering_torque, out)
     return out
 
+  def _far_event(self, what: str, v: float, **extra) -> None:
+    fields = {"what": what, "side": self.far_side, "junction_dist": round(self.far_dist, 1), "v": round(v, 2), **extra}
+    try:
+      if self.log_event is not None:
+        self.log_event("map_turn_far", **fields)
+      else:
+        from openpilot.common.swaglog import cloudlog
+        cloudlog.event("map_turn_far", **fields)
+    except Exception:
+      pass
+
+  def _far_end(self, why: str, v: float, done: bool = True) -> None:
+    if self.far is not None:
+      self._far_event("end", v, reason=why)
+    self.far, self.far_side, self.far_dist, self._far_roads = None, "", 0.0, None
+    self._far_done = self._far_done or done
+
+  def _update_far(self, dt: float, v: float, side: str, gps, new_fix: bool, kerb_room: float | None) -> None:
+    """The far approach: a junction ahead on the blinker side, found from road speed, for the speed control only."""
+    if side != self._kerb_side:   # a blinker came on, changed side or went off: decide again
+      self._kerb_side, self._kerb_t, self._kerb_rooms, self._kerb_ok = side, 0.0, [], None
+      self._far_done = False
+      if self.far is not None:
+        self._far_end("blinker off", v, done=False)
+    if not side:
+      return
+    if self._kerb_ok is None:
+      self._kerb_t += dt
+      if kerb_room is not None:
+        self._kerb_rooms.append(kerb_room)
+      if self._kerb_t >= KERB_LATCH_S:
+        rooms = sorted(self._kerb_rooms)
+        self._kerb_ok = len(rooms) >= KERB_MIN_SAMPLES and rooms[len(rooms) // 2] <= KERB_ROOM_MAX_M
+        self._kerb_rooms = []
+    if self.state != IDLE:   # armed, turning or done: the planner's own turn (or the driver's) has it from here
+      if self.far is not None:
+        self._far_end(self.state, v)
+      return
+    if self.far is not None:
+      self.far_dist -= v * dt
+      if new_fix and self._far_roads is not None:
+        x, y = self._far_roads.to_xy(gps.latitude, gps.longitude)
+        h = math.radians(self.far.arrival_bearing)
+        self.far_dist = (self._far_xy[0] - x) * math.sin(h) + (self._far_xy[1] - y) * math.cos(h)
+      if self.far_dist < -PASSED_M:
+        self._far_end("passed the junction", v)
+      return
+    if not (self._kerb_ok and not self._far_done and v > V_ARM_APPROACH and new_fix and self.heading is not None):
+      return
+    roads = self.roads_src.get(gps.latitude, gps.longitude)
+    if roads is None:
+      return
+    x, y = roads.to_xy(gps.latitude, gps.longitude)
+    m = roads.match(x, y, self.heading, self._prefer_way)
+    if m is None:
+      return
+    lookahead = min(max(JUNCTION_LOOKAHEAD_MAX_M, v * APPROACH_LOOKAHEAD_S), APPROACH_LOOKAHEAD_MAX_M)
+    j = roads.junction_ahead(m, x, y, side, lookahead, min_junction_distance(v, self.tuning.v_turn))
+    if j is None:
+      return
+    self.far, self.far_side, self._far_roads, self._far_xy = j, side, roads, (j.x, j.y)
+    h = math.radians(j.arrival_bearing)
+    self.far_dist = (j.x - x) * math.sin(h) + (j.y - y) * math.cos(h)
+    self._far_event("start", v, way=roads.ways[m.way].way_id, branch=j.branch.way_id, planned_deg=round(j.branch.change, 1))
+
   def approach(self) -> tuple[int, float]:
-    """For the longitudinal planner: (1, m to the junction) while armed, (2, 0) while turning, else (0, 0)."""
+    """For the longitudinal planner: (1, m to the junction) while armed, (2, 0) while turning, (3, m to the junction)
+    on the far approach (a signaled turn ahead seen from road speed: speed only, nothing armed), else (0, 0)."""
     if self.state == ARMED and self.junction is not None:
       return 1, max(float(self.dist), 0.0)
     if self.state == TURNING:
       return 2, 0.0
+    if self.state == IDLE and self.far is not None:
+      return 3, max(float(self.far_dist), 0.0)
     return 0, 0.0
 
   def _emit_log(self, dt, v_ego, left_blinker, right_blinker, lat_active, pressed, torque, out) -> None:

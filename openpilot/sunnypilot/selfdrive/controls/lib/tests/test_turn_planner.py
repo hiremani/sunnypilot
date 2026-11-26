@@ -42,12 +42,12 @@ class Car:
     self.outputs: list[float | None] = []
     self.states: list[str] = []
 
-  def step(self, left=False, right=False, lat_active=True, pressed=False, torque=0.0, model=None) -> float | None:
+  def step(self, left=False, right=False, lat_active=True, pressed=False, torque=0.0, model=None, kerb=None) -> float | None:
     lat, lon = _ll(self.x, self.y)
     gps = SimpleNamespace(latitude=lat, longitude=lon, bearingDeg=self.h % 360.0, speed=self.v, hasFix=True,
                           horizontalAccuracy=1.0, unixTimestampMillis=int(self.t * 1000))
     yaw = -self.v * self.k   # yawRate is positive to the left; curvature is positive to the right
-    out = self.p.update(DT, self.v, yaw, left, right, lat_active, pressed, gps, torque, model_curvature=model)
+    out = self.p.update(DT, self.v, yaw, left, right, lat_active, pressed, gps, torque, model_curvature=model, kerb_room=kerb)
     self.queue.append(out if out is not None else 0.0)
     target = self.queue.pop(0)
     rate = tp.curvature_rate(self.v, unwind=abs(target) < abs(self.k)) * DT
@@ -713,3 +713,97 @@ class TestDoorwayPath(unittest.TestCase):
     _, _, used = self._drive("right", False)
     self.assertFalse(used)
 
+
+
+class TestFarApproach(unittest.TestCase):
+  """A signaled turn seen from road speed: the junction's distance for the speed control (approach() state 3), nothing
+  armed and nothing steered. 00000151 at 9.5 min: right blinker 146 m before the turn at 35 mph, and nothing slowed."""
+
+  def _car(self, v=15.6, y0=-170.0):
+    p = planner(t_junction(right=True, left=True))
+    return p, Car(p, v=v, y0=y0)
+
+  def test_the_kerb_lane_with_the_blinker_on_gives_the_distance(self):
+    p, car = self._car()
+    car.drive(0.5, right=True, kerb=3.0)
+    self.assertEqual(p.approach(), (0, 0.0))            # not before the first second of the blinker is over
+    car.drive(1.0, right=True, kerb=3.0)
+    state, dist = p.approach()
+    self.assertEqual(state, 3)
+    self.assertAlmostEqual(dist, -car.y, delta=3.0)
+    car.drive(4.0, right=True, kerb=3.0)
+    self.assertAlmostEqual(p.approach()[1], -car.y, delta=3.0)   # counts down with the car
+    self.assertEqual(p.state, tp.IDLE)                   # never armed at this speed...
+    self.assertTrue(all(o is None for o in car.outputs))   # ...and never steered
+
+  def test_a_lane_on_that_side_means_a_lane_change(self):
+    p, car = self._car()
+    car.drive(6.0, right=True, kerb=7.1)                 # the road edge a lane further out
+    self.assertEqual(p.approach(), (0, 0.0))
+
+  def test_no_road_edge_seen_means_nothing(self):
+    p, car = self._car()
+    car.drive(6.0, right=True, kerb=None)
+    self.assertEqual(p.approach(), (0, 0.0))
+
+  def test_decided_once_per_blinker(self):
+    p, car = self._car(v=12.0, y0=-190.0)
+    car.drive(1.5, right=True, kerb=7.1)                 # the lane change...
+    car.drive(4.0, right=True, kerb=3.5)                 # ...ends in the kerb lane with the blinker still on
+    self.assertEqual(p.approach(), (0, 0.0))
+    car.drive(0.5)                                       # blinker off, then on again: decided again
+    car.drive(1.5, right=True, kerb=3.5)
+    self.assertEqual(p.approach()[0], 3)
+
+  def test_blinker_off_ends_it(self):
+    p, car = self._car()
+    car.drive(2.0, right=True, kerb=3.0)
+    self.assertEqual(p.approach()[0], 3)
+    car.drive(0.2)
+    self.assertEqual(p.approach(), (0, 0.0))
+
+  def test_driving_past_the_junction_ends_it_for_this_blinker(self):
+    p, car = self._car(y0=-150.0)
+    car.drive(14.0, right=True, kerb=3.0)                # 218 m at 35 mph: past the junction, a wide road ahead
+    self.assertGreater(car.y, 20.0)
+    self.assertEqual(p.approach(), (0, 0.0))
+
+  def test_a_junction_too_close_to_slow_down_for_is_not_taken(self):
+    p, car = self._car(y0=-60.0)                         # 60 m at 35 mph: more than 1.5 m/s^2
+    car.drive(2.0, right=True, kerb=3.0)
+    self.assertEqual(p.approach(), (0, 0.0))
+
+  def test_slowed_down_the_planner_arms_as_before(self):
+    p, car = self._car()
+    car.drive(2.0, right=True, kerb=3.0)
+    self.assertEqual(p.approach()[0], 3)
+    car.v, car.y = 10.0, -70.0                           # under 25 mph, 70 m out
+    car.drive(1.0, right=True, kerb=3.0)
+    self.assertEqual(p.state, tp.ARMED)
+    state, dist = p.approach()
+    self.assertEqual(state, 1)
+    self.assertAlmostEqual(dist, -car.y, delta=3.0)
+    self.assertIsNone(p.far)
+
+  def test_works_without_openpilot_steering(self):
+    p, car = self._car()
+    car.drive(2.0, right=True, kerb=3.0, lat_active=False)
+    self.assertEqual(p.approach()[0], 3)
+
+  def test_left_side_the_same_rule(self):
+    p, car = self._car()
+    car.drive(2.0, left=True, kerb=3.5)
+    self.assertEqual(p.approach()[0], 3)
+
+
+class TestKerbRoom(unittest.TestCase):
+  def _model(self, left=-5.2, right=3.1, stds=(0.4, 0.4)):
+    return SimpleNamespace(roadEdges=[SimpleNamespace(y=[left]), SimpleNamespace(y=[right])], roadEdgeStds=list(stds))
+
+  def test_the_side_asked_for(self):
+    self.assertAlmostEqual(tp.kerb_room_from_model(self._model(), left=False), 3.1)
+    self.assertAlmostEqual(tp.kerb_room_from_model(self._model(), left=True), 5.2)
+
+  def test_an_unsure_edge_or_a_missing_one_is_none(self):
+    self.assertIsNone(tp.kerb_room_from_model(self._model(stds=(0.4, 1.4)), left=False))
+    self.assertIsNone(tp.kerb_room_from_model(SimpleNamespace(roadEdges=[], roadEdgeStds=[]), left=False))

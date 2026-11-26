@@ -668,3 +668,59 @@ class TestLeadFollowCap(unittest.TestCase):
     self._settle(cap, 40 * CV.MPH_TO_MS, 25.0, 42 * CV.MPH_TO_MS)
     a = cap.update(self.LIMIT, 40 * CV.MPH_TO_MS, True, 25.0, -3.0, self.DT)       # the lead now 3 m/s slower
     self.assertGreater(a, 40 * CV.MPH_TO_MS - 3.0)                                  # the MPC brakes for it, not this cap
+
+
+class TestJunctionApproachRate(unittest.TestCase):
+  """Slowing down before a signaled turn: at the driver's own rate, or the one steady rate that still fits."""
+
+  def test_in_good_time_it_is_the_drivers_rate(self):
+    self.assertEqual(pl.junction_approach_decel(400.0, 3.4, 15.6, 0.47), 0.47)
+
+  def test_a_late_signal_gets_the_steady_rate_that_fits(self):
+    # 00000151 at 9.5 min: 35 mph, about 158 m to the junction
+    a = pl.junction_approach_decel(158.0, 3.4, 15.6, 0.47)
+    self.assertGreater(a, 0.47)
+    self.assertLess(a, 1.0)
+    # the curve starts at the car's own speed: no step in the target when the approach begins
+    self.assertAlmostEqual(pl.junction_approach_v(158.0, 3.4, 15.6, a), 15.6, delta=0.05)
+
+  def test_never_more_than_the_cap(self):
+    self.assertEqual(pl.junction_approach_decel(60.0, 3.4, 20.0, 0.47), pl.APPROACH_DECEL_MAX)
+
+  def test_the_curve_ends_at_the_turn_in_speed_before_the_junction(self):
+    self.assertAlmostEqual(pl.junction_approach_v(pl.APPROACH_MARGIN_M, 3.4, 3.4, 0.8), 3.4)
+    self.assertGreater(pl.junction_approach_v(80.0, 3.4, 10.0, 0.8), pl.junction_approach_v(40.0, 3.4, 10.0, 0.8))
+
+  def test_default_rate_is_the_old_one(self):
+    self.assertEqual(pl.junction_approach_v(60.0, 2.6, 8.0), pl.junction_approach_v(60.0, 2.6, 8.0, -pl.JUNCTION_ACCEL))
+
+
+class TestTurnApproach(unittest.TestCase):
+  def test_one_rate_for_the_whole_approach(self):
+    ap = pl.TurnApproach()
+    v, d, targets = 15.6, 158.0, []
+    for _ in range(400):                       # 20 s at 20 Hz, the car following the target with a 1 s lag
+      target = ap.update(d, 3.4, v, 0.47)
+      targets.append(target)
+      v += (min(target, v) - v) * 0.05
+      d -= v * 0.05
+      if d < pl.APPROACH_MARGIN_M:
+        break
+    rate = ap.decel
+    self.assertGreater(rate, 0.47)             # signaled too late for the driver's own rate...
+    self.assertLess(rate, 1.0)                 # ...so the steady rate that fits, chosen once
+    self.assertTrue(all(b <= a + 1e-6 for a, b in zip(targets, targets[1:], strict=False)))   # the target only comes down
+    self.assertLess(v, 5.5)                    # near the turn-in speed at the junction
+
+  def test_starts_once_and_again_for_another_junction(self):
+    ap = pl.TurnApproach()
+    ap.update(158.0, 3.4, 15.6, 0.47)
+    self.assertTrue(ap.started)
+    first = ap.decel
+    ap.update(157.0, 3.4, 15.6, 0.47)
+    self.assertFalse(ap.started)
+    ap.update(60.0, 3.4, 12.0, 0.47)           # the planner armed for a nearer junction
+    self.assertTrue(ap.started)
+    self.assertGreater(ap.decel, first)
+    ap.reset()
+    self.assertIsNone(ap.decel)

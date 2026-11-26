@@ -214,3 +214,49 @@ class TestJunctionSpeed(unittest.TestCase):
   def test_bounds(self):
     self.assertEqual(dp.clamp("junction_lat_accel", 5.0), 2.0)
     self.assertEqual(dp.clamp("junction_lat_accel", -1.0), 0.0)
+
+
+class TestTurnApproach(unittest.TestCase):
+  """The driver's own way into a turn (habits_extra.turn_approaches): where the wheel goes in and how they slowed to it,
+  from rolling turns made without the blinker; the planner's approach curve reads both from the profile."""
+
+  def _drive(self, blinker=False, cruise=False, decel=0.6):
+    from openpilot.sunnypilot.tools import fisker_drive_style as fds
+    S, t, v, steer = [], 0.0, 12.0, 0.0
+    def add(yaw=0.0, a=0.0, pressed=False):
+      S.append(fds.Sample(t, v, a, yaw, False, blinker, False, False, pressed, cruise, False, 0.0, 0.0, 0.0, 37.5, -121.9, "r", steer))
+    for _ in range(100):            # 10 s cruising at 27 mph
+      add()
+      t += 0.1
+    while v > 4.0:                  # slowing to 9 mph
+      v -= decel * 0.1
+      add(a=-decel)
+      t += 0.1
+    for k in range(60):             # a right turn: the wheel goes in over 1.5 s, held, and comes back
+      steer = -min(200.0, 13.3 * (k + 1), 13.3 * (60 - k))
+      add(yaw=-math.radians(20.0) if 8 <= k < 52 else 0.0, pressed=True)
+      t += 0.1
+    steer = 0.0
+    for _ in range(50):
+      add()
+      t += 0.1
+    return S
+
+  def test_measures_the_turn_in_speed_and_the_slowing(self):
+    from openpilot.sunnypilot.tools import habits_extra as hx
+    out = hx.turn_approaches(self._drive())
+    self.assertEqual(len(out), 1)
+    mph, decel = out[0]
+    self.assertAlmostEqual(mph, 4.0 * hx.MPH, delta=0.5)
+    self.assertAlmostEqual(decel, 0.6, delta=0.08)
+
+  def test_only_turns_without_the_blinker_at_the_drivers_own_speed(self):
+    from openpilot.sunnypilot.tools import habits_extra as hx
+    self.assertEqual(hx.turn_approaches(self._drive(blinker=True)), [])
+    self.assertEqual(hx.turn_approaches(self._drive(cruise=True)), [])
+
+  def test_off_by_default_and_bounded(self):
+    p = dp.DriverProfile()
+    self.assertEqual((p.turn_in_mph, p.turn_approach_decel), (0.0, 0.0))
+    self.assertEqual(dp.clamp("turn_in_mph", 14.0), 12.0)        # the turn assist starts a turn at 16 mph at most
+    self.assertEqual(dp.clamp("turn_approach_decel", 2.0), 1.2)

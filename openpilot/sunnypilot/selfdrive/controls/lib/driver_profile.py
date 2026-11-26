@@ -141,6 +141,10 @@ class DriverProfile:
   turn_radius_right_m: float = 10.0
   # junction turns: the speed the driver still starts a turn at (p90, mph); the turn planner starts no faster
   turn_arm_mph: float = 16.1
+  # a signaled turn ahead: the driver's speed where the wheel goes in (mph), and how they slow down to it (m/s^2, the
+  # average from where they start slowing); 0 = off (junction_turn_mph before the junction, at 0.8 m/s^2)
+  turn_in_mph: float = 0.0
+  turn_approach_decel: float = 0.0
   # curves ahead: the most the curve-speed controller slows by while entering one (m/s^2, the driver's p75)
   curve_entry_decel: float = 1.0
   # mapped traffic lights: stop accelerating this many seconds before one (the driver lifts off at reds)
@@ -195,6 +199,8 @@ BOUNDS = {
   "turn_arm_mph": (12.0, 16.1),        # lower only: above the planner's own 16 mph it starts turns the driver is still
                                        # braking for, from where the car is then (00000128 turn 3: 21.6 m early at 16.2
                                        # mph, a 21 m arc 27 m off the driver's path; the p90 measured was 16.7)
+  "turn_in_mph": (0.0, 12.0),          # under turn_arm_mph, so the turn assist can still start the turn
+  "turn_approach_decel": (0.0, 1.2),
   "curve_entry_decel": (0.5, 1.5),
   "signal_coast_s": (2.0, 8.0),
   "wet_offset_mph": (-10.0, 0.0),      # never over the limit when wet

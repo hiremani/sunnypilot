@@ -81,10 +81,49 @@ APPROACH_LAG_S = 1.0
 V_TURN_DEFAULT = 4.5        # m/s (10 mph) without a driver profile
 
 
-def junction_approach_v(dist_m: float, v_turn: float, v_ego: float) -> float:
-  """The speed target (m/s) dist_m before an armed junction turn."""
+# The driver's own approach to a turn (112 drives, rolling junction turns at their own speed): slowing starts 120-150 m
+# before the wheel goes in, at 0.55-0.6 m/s^2 on average (0.75 from above 30 mph), and the firmest moment is 1.6-1.7
+# (median). The curve slows at the driver profile's turn_approach_decel; a signal that comes too late for that gets the
+# one steady rate that still fits the distance left, up to APPROACH_DECEL_MAX, chosen once when the approach starts
+# (junction_approach_decel) so the car never brakes first and eases off after. Replayed on 112 drives: 109 approaches
+# from road speed, a turn followed in 106; the rate was 1.1 at the median (the driver signals 60-190 m before).
+APPROACH_DECEL_MAX = 1.2    # m/s^2: the planner slows for no speed target harder than this (its A_CRUISE_MIN)
+
+
+def junction_approach_decel(dist_m: float, v_turn: float, v_ego: float, decel: float) -> float:
+  """m/s^2 for this approach's speed curve: decel, or the steady rate that takes v_ego down to v_turn in the distance
+  left when that needs more (never above APPROACH_DECEL_MAX)."""
+  d = max(dist_m - APPROACH_MARGIN_M - v_ego * APPROACH_LAG_S, 1.0)
+  need = max(v_ego * v_ego - v_turn * v_turn, 0.0) / (2.0 * d)
+  return min(max(decel, need), max(decel, APPROACH_DECEL_MAX))
+
+
+def junction_approach_v(dist_m: float, v_turn: float, v_ego: float, decel: float = -JUNCTION_ACCEL) -> float:
+  """The speed target (m/s) dist_m before a signaled junction turn (armed, or seen from road speed)."""
   d = max(dist_m - APPROACH_MARGIN_M - v_ego * APPROACH_LAG_S, 0.0)
-  return (v_turn * v_turn + 2.0 * abs(JUNCTION_ACCEL) * d) ** 0.5
+  return (v_turn * v_turn + 2.0 * decel * d) ** 0.5
+
+
+class TurnApproach:
+  """One approach to a signaled turn: its rate is chosen when it starts (junction_approach_decel) and kept to the
+  junction, also when the turn planner arms on the way (the same junction: the distance carries on). Another junction
+  (the distance jumps by more than APPROACH_MARGIN_M) is a new approach."""
+
+  def __init__(self):
+    self.decel: float | None = None
+    self.dist = 0.0
+    self.started = False     # True for the one update that started an approach (for the log)
+
+  def reset(self) -> None:
+    self.decel, self.started = None, False
+
+  def update(self, dist_m: float, v_turn: float, v_ego: float, decel: float) -> float:
+    """The speed target (m/s) now; self.decel is the rate of the curve it is on."""
+    self.started = self.decel is None or abs(dist_m - self.dist) > APPROACH_MARGIN_M
+    if self.started:
+      self.decel = junction_approach_decel(dist_m, v_turn, v_ego, decel)
+    self.dist = dist_m
+    return junction_approach_v(dist_m, v_turn, v_ego, self.decel)
 
 
 PROFILE_SPEED_ACCEL = -0.5  # m/s^2 to get down to a lower cap (a new, lower limit)

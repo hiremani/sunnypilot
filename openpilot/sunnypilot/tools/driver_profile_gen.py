@@ -44,7 +44,7 @@ MPH = fds.MPH
 MIN_SAMPLES = {"speed": 300, "stops": 5, "curve": 100, "turns": 5, "gap": 200, "limit": 1200, "coast": 8,
                "lead_brake": 10, "stop_gap": 20, "lane_change": 20, "cruise_accel": 1000, "turn_in": 20,
                "bump": 10, "turn_arm": 20, "merge": 10, "curve_entry": 20, "signal": 20, "wet_s": 300,
-               "narrow": 200,
+               "narrow": 200, "turn_approach": 15,
                "stop_start": 3, "junction_lat": 300}   # 10 Hz samples (narrow: 20 Hz), or events
 OPEN_ROAD_GAP_S = 3.0
 LAT_CURVE_YAW = 0.05      # rad/s: in a curve
@@ -181,6 +181,7 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
   unwind_turns: list[dict] = []
   stop_starts: dict[str, list[float]] = {"left": [], "right": []}
   stop_gaps, curve_decels, lc_delays, accels, turn_ins, bumps, onsets_moving = [], [], [], [], [], [], []
+  approaches: list[tuple[float, float]] = []
   rolls = [0, 0]
   pulls, cut_ins, lane_drv, lane_op, signal_ttl, merges = [], [], [], [], [], []
   junction_lat: list[float] = []
@@ -217,6 +218,7 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
     lc_delays += hx.lane_change_delays(S)
     accels += hx.cruise_accels(S)
     turn_ins += hx.turn_in_rates(S)
+    approaches += hx.turn_approaches(S)
     pulls += hx.pull_away_gaps(S)
     merges += hx.freeway_merges(S)
     cut_ins += hx.cut_in_reactions(S)
@@ -321,6 +323,10 @@ def measure(routes: list[str], root: str, narrow: bool = True, turns_from_stop: 
       "median wheel speed winding into junction turns the driver steered (20% to 80% of the peak)")
   put("bump_cross_mph", statistics.median(bumps) if bumps else None, len(bumps), MIN_SAMPLES["bump"],
       "median slowest speed within 5 m of mapped speed bumps, ACC off" + ("" if narrow else " (skipped)"))
+  put("turn_in_mph", statistics.median(v for v, _ in approaches) if approaches else None, len(approaches),
+      MIN_SAMPLES["turn_approach"], "median speed where the wheel goes in (45 deg), rolling turns made without the blinker, ACC off")
+  put("turn_approach_decel", statistics.median(a for _, a in approaches) if approaches else None, len(approaches),
+      MIN_SAMPLES["turn_approach"], "median average slowing from the last fastest point (within 200 m) to there, same turns")
   leads, onset_mph = hx.turn_start_leads(onsets_moving, values.get("turn_in_deg_s", 0.0))
 
   def pct(xs, q):
