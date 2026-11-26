@@ -31,7 +31,7 @@ class ControlsExt(ModelStateBase):
     self.CP_SP = messaging.log_from_bytes(params.get("CarParamsSP", block=True), custom.CarParamsSP)
     cloudlog.info("controlsd_ext got CarParamsSP")
 
-    self.sm_services_ext = ['radarState', 'selfdriveStateSP']
+    self.sm_services_ext = ['radarState', 'selfdriveStateSP', 'carStateSP']
     self.pm_services_ext = ['carControlSP']
 
   def initialize_lateral_control(self, lac, CI, dt):
@@ -57,7 +57,7 @@ class ControlsExt(ModelStateBase):
       self._param_update_time = time.monotonic()
 
   def get_lat_active(self, sm: messaging.SubMaster) -> bool:
-    if self.blinker_pause_lateral.update(sm['carState']):
+    if self.blinker_pause_lateral.update(sm['carState'], route_turn=sm['carStateSP'].routeTurn):
       return False
 
     ss_sp = sm['selfdriveStateSP']

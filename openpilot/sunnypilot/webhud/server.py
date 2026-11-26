@@ -45,6 +45,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.car.fisker_takeover import valid as takeover_torque_valid
 from openpilot.sunnypilot.webhud.demo import DemoSource
 from openpilot.sunnypilot.webhud.mdns import MdnsPublisher, ipv4_interfaces
+from openpilot.sunnypilot.webhud.navturn import NavTurnPublisher
 from openpilot.sunnypilot.webhud.paths import STATIC_DIR, STATIC_FILES, STATIC_ROOTS
 from openpilot.sunnypilot.webhud.sources import LiveSource, ReplaySource, list_routes
 from openpilot.sunnypilot.webhud.state import StreamBuilder, merge_ticks
@@ -119,6 +120,10 @@ PARAM_ALLOWLIST: dict[str, tuple[type, Callable[[int], bool] | None]] = {
   "FiskerOverrideTorque": (float, lambda v: takeover_torque_valid(v)),
   # phone remote-control steering: off at every boot; turning it on starts the server (process_config.remote_control)
   "RemoteControlEnabled": (bool, None),
+  # route turns (route_turn.py), m from the turn point; OceanScape's Driving > Nav
+  "RouteTurnPromptDistance": (float, lambda v: 30 <= v <= 500),
+  "RouteTurnStartDistance": (float, lambda v: 5 <= v <= 100),
+  "RouteTurnEndDistance": (float, lambda v: 0 <= v <= 50),
 }
 
 
@@ -415,6 +420,9 @@ class HudServer(ThreadingHTTPServer):
   hostname: str
   port: int
   mdns: MdnsPublisher | None
+
+
+NAV_TURN = NavTurnPublisher()
 
 
 MAP_TILES = MapTiles()
@@ -815,6 +823,14 @@ def api_upload(h: HudHandler, q) -> None:
   h._json({"ok": True, "route": route})
 
 
+def api_route_turn(h: HudHandler, q) -> None:
+  # the head unit nav app's next turn, from OceanScape's Android app, for card (navturn.py); a write, so local only
+  body = h._json_body()
+  if not isinstance(body, dict):
+    return h._error(400, "expected an object")
+  h._json({"ok": NAV_TURN.publish(body)})
+
+
 def api_params_get(h: HudHandler, q) -> None:
   out = {}
   for key, (typ, _) in PARAM_ALLOWLIST.items():
@@ -1173,6 +1189,7 @@ ROUTES = {
   ("POST", "/api/replay"): api_replay,
   ("PUT", "/api/upload"): api_upload,
   ("GET", "/api/params"): api_params_get,
+  ("POST", "/api/route_turn"): api_route_turn,
   ("PUT", "/api/params"): api_params_put,
   ("GET", "/api/overrides"): api_overrides_get,
   ("PUT", "/api/overrides"): api_overrides_put,
