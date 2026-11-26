@@ -49,6 +49,7 @@ from openpilot.sunnypilot.webhud.paths import STATIC_DIR, STATIC_FILES, STATIC_R
 from openpilot.sunnypilot.webhud.sources import LiveSource, ReplaySource, list_routes
 from openpilot.sunnypilot.webhud.state import StreamBuilder, merge_ticks
 from openpilot.sunnypilot.webhud.video import VideoHub, VideoViewer
+from openpilot.sunnypilot.webhud.replay_video import ReplayVideoHub
 from openpilot.sunnypilot.webhud.websocket import WebSocket, accept_key
 from openpilot.sunnypilot.webhud.maptiles import MapFeatures, MapPrefetch, MapTiles, parse_features_path, parse_tile_path
 
@@ -403,6 +404,7 @@ class HudServer(ThreadingHTTPServer):
   params: object
   overrides_api: "OverridesApi"
   video: VideoHub
+  replay_video: ReplayVideoHub
   hostname: str
   port: int
   mdns: MdnsPublisher | None
@@ -655,7 +657,9 @@ class HudHandler(BaseHTTPRequestHandler):
     if ws is None:
       return
     viewer = VideoViewer(ws, (query.get("camera") or ["road"])[0])
-    hub = self.server.video
+    # replaying a route with its recorded cameras next to the log: those (replay_video.py), else the live encoder
+    replay = getattr(self.server, "replay_video", None)
+    hub = replay if replay is not None and replay.available() else self.server.video
     hub.add(viewer)
     try:
       while True:
@@ -1162,6 +1166,7 @@ def make_server(host: str, port: int, engine: Engine, params, overrides_api: Ove
                 video: VideoHub | None = None) -> HudServer:
   server = HudServer((host, port), HudHandler)
   server.video = video if video is not None else VideoHub(params)
+  server.replay_video = ReplayVideoHub(engine)
   server.engine = engine
   server.params = params
   server.overrides_api = overrides_api
